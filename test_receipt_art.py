@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """Avatars, weather icons, and a receipt that uses both."""
 
+import math
 import os
 from pathlib import Path
+import re
+import subprocess
 import tempfile
 import unittest
 from unittest import mock
@@ -14,6 +17,7 @@ for _name in list(os.environ):
         "DIGEST_BOT_UPDATES_DIR",
         "DIGEST_AVATARS_DIR",
         "DIGEST_AVATAR_THRESHOLD",
+        "DIGEST_BOT_UPDATES_STYLE",
         "DIGEST_HISTORY_PATH",
     }:
         os.environ.pop(_name, None)
@@ -24,7 +28,7 @@ import digest_settings as settings
 import receipt_art as art
 import receipt_digest as rd
 import test_receipt_digest as fixtures
-from PIL import Image
+from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageOps
 from test_digest_picker import bot_document
 
 
@@ -34,6 +38,113 @@ NOW = __import__("datetime").datetime(2026, 11, 26, 11, 0, tzinfo=__import__("da
 def _black(image: Image.Image) -> int:
     histogram = image.histogram()
     return sum(histogram[:185])
+
+
+def _dither_opaque_reference(image: Image.Image, size: int) -> Image.Image:
+    """The pre-outline pipeline: square crop, contrast, Floyd-Steinberg. No ring."""
+    fitted = art._cover_square(image.convert("RGB"), size)
+    gray = ImageOps.autocontrast(ImageOps.grayscale(fitted), cutoff=1)
+    gray = ImageEnhance.Contrast(gray).enhance(1.85)
+    return gray.convert("1", dither=Image.Dither.FLOYDSTEINBERG).convert("L")
+
+
+def _balloon_fill_mask(svg_text: str, width: int, height: int, directory: Path) -> Image.Image:
+    paths = re.findall(
+        rf'<path d="([^"]+)" fill="white" stroke="black" stroke-width="{art.BUBBLE_STROKE}"',
+        svg_text,
+    )
+    if not paths:
+        raise AssertionError("rendered svg has no balloon path")
+    body = "".join(f'<path d="{path}" fill="black"/>' for path in paths)
+    svg = (
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" '
+        f'viewBox="0 0 {width} {height}">'
+        f'<rect width="{width}" height="{height}" fill="white"/>{body}</svg>'
+    )
+    svg_path = directory / "balloon-fill.svg"
+    png_path = directory / "balloon-fill.png"
+    svg_path.write_text(svg, encoding="utf-8")
+    subprocess.run(
+        ["rsvg-convert", "-w", str(width), "-h", str(height), "-o", str(png_path), str(svg_path)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return Image.open(png_path).convert("L")
+
+
+def _assert_names_under_avatars(test: unittest.TestCase, marks: list) -> None:
+    names = sorted((mark for mark in marks if mark["type"] == "name"), key=lambda mark: mark["y"])
+    faces = sorted((mark for mark in marks if mark["type"] in {"avatar", "fallback"}), key=lambda mark: mark["y"])
+    test.assertEqual(len(names), len(faces))
+    test.assertGreaterEqual(len(names), 1)
+    for name, face in zip(names, faces):
+        size = face.get("size", art.AVATAR_PX)
+        test.assertGreaterEqual(name["y"], face["y"] + size)
+        face_center = face["x"] + size / 2
+        name_center = name["x"] + name["w"] / 2
+        test.assertLessEqual(abs(name_center - face_center), 2)
+        test.assertLessEqual(name["x"] + name["w"], face["x"] + size + 2)
+    for name, later in zip(names, faces[1:]):
+        test.assertLessEqual(name["y"] + name["h"], later["y"])
+
+
+def _assert_balloon_ink(test: unittest.TestCase, image: Image.Image, svg_text: str, bubbles: list, directory: Path) -> None:
+    """White rows between strokes, and text ink inset from the balloon stroke."""
+    width, height = image.size
+    mask = _balloon_fill_mask(svg_text, width, height, directory)
+    filled = mask.point(lambda value: 255 if value < 128 else 0)
+    allowed = filled.filter(ImageFilter.MaxFilter(art.BUBBLE_STROKE * 2 + 1))
+    # 4 dots clears the centered stroke. 18 dots is the air the words must keep.
+    past_stroke = filled.filter(ImageFilter.MinFilter(art.BUBBLE_STROKE * 2 + 1))
+    deep = filled.filter(ImageFilter.MinFilter(18 * 2 + 1))
+    page = image.tobytes()
+    keep = allowed.tobytes()
+    inner = past_stroke.tobytes()
+    core = deep.tobytes()
+    for bubble in bubbles:
+        x0 = max(0, bubble["x"] - art.TAIL_W - art.BUBBLE_STROKE)
+        y0 = max(0, bubble["y"] - art.BUBBLE_STROKE)
+        x1 = min(width, bubble["x"] + bubble["w"] + art.BUBBLE_STROKE)
+        y1 = min(height, bubble["y"] + bubble["h"] + art.BUBBLE_STROKE)
+        outside = 0
+        crowded = 0
+        text = 0
+        for y in range(y0, y1):
+            row = y * width
+            for x in range(max(0, bubble["x"]), min(width, bubble["x"] + bubble["w"])):
+                index = row + x
+                if inner[index] < 128:
+                    continue
+                if page[index] >= 185:
+                    continue
+                if core[index] < 128:
+                    crowded += 1
+                else:
+                    text += 1
+            for x in range(x0, x1):
+                if page[row + x] < 185 and keep[row + x] < 128:
+                    outside += 1
+        test.assertEqual(outside, 0)
+        test.assertEqual(crowded, 0)
+        test.assertGreater(text, 20)
+    ordered = sorted(bubbles, key=lambda mark: mark["y"])
+    for earlier, later in zip(ordered, ordered[1:]):
+        x0 = earlier["x"]
+        x1 = earlier["x"] + earlier["w"]
+        y0 = earlier["y"] + earlier["h"]
+        y1 = later["y"]
+        best = run = 0
+        span = x1 - x0
+        for y in range(y0, y1):
+            row = page[y * width + x0 : y * width + x1]
+            if len(row) == span and all(pixel >= 185 for pixel in row):
+                run += 1
+                if run > best:
+                    best = run
+            else:
+                run = 0
+        test.assertGreaterEqual(best, 12)
 
 
 class AvatarFileTests(unittest.TestCase):
@@ -280,10 +391,14 @@ class ReceiptArtRenderTests(unittest.TestCase):
                         )
                     )
                     self.assertGreater(_black(icon_crop), 10)
+                    self.assertNotIn("(reader", svg)
+                    self.assertNotIn("Listener:", svg)
+                    _assert_names_under_avatars(self, metadata["geometry"]["art"])
+                    _assert_balloon_ink(self, image, svg, bubbles, root)
                     # The long garden note has to wrap inside the bubble, so that bubble is taller than the avatar.
                     self.assertGreater(bubbles[-1]["h"], art.AVATAR_PX)
             self.assertNotEqual(icons[0], icons[1])
-            self.assertLess(max(heights), rd.MAX_HEIGHT_DOTS // 2)
+            self.assertLess(max(heights), rd.MAX_HEIGHT_DOTS)
 
     def test_four_max_length_notes_stay_under_the_length_cap(self):
         sentence = "I am writing a long first person note so the bubble has to wrap this line. "
@@ -308,6 +423,79 @@ class ReceiptArtRenderTests(unittest.TestCase):
             self.assertGreaterEqual(text_width, 340)
             self.assertLess(bubble_w, rd.WIDTH_DOTS)
             self.assertGreater(bubbles[-1]["h"], art.AVATAR_PX)
+
+    def test_transparent_sprite_gains_a_ring_and_opaque_rgb_is_unchanged(self):
+        canvas = Image.new("RGBA", (144, 144), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(canvas)
+        draw.ellipse((8, 8, 136, 136), fill=(255, 255, 255, 255))
+        draw.ellipse((48, 52, 66, 70), fill=(0, 0, 0, 255))
+        draw.ellipse((84, 52, 102, 70), fill=(0, 0, 0, 255))
+        dithered = art.dither_for_thermal(canvas, art.AVATAR_PX)
+        ink = 1 - (dithered.histogram()[255] / (art.AVATAR_PX * art.AVATAR_PX))
+        self.assertGreater(ink, 0.08)
+        pixels = dithered.load()
+        center = art.AVATAR_PX // 2
+        hits = 0
+        for step in range(36):
+            angle = step * math.tau / 36
+            for radius in range(art.AVATAR_PX // 2 - 1, art.AVATAR_PX // 3, -1):
+                x = int(round(center + radius * math.cos(angle)))
+                y = int(round(center + radius * math.sin(angle)))
+                if pixels[x, y] == 0:
+                    hits += 1
+                    break
+        self.assertEqual(hits, 36)
+
+        opaque = Image.new("RGB", (80, 60), (180, 40, 40))
+        ImageDraw.Draw(opaque).rectangle((10, 10, 50, 40), fill=(20, 20, 20))
+        self.assertEqual(
+            art.dither_for_thermal(opaque, 48).tobytes(),
+            _dither_opaque_reference(opaque, 48).tobytes(),
+        )
+
+    def test_printed_name_is_the_first_word_under_the_picture(self):
+        self.assertEqual(art.bot_display_name("Popcorn · Movie Goblin"), "Popcorn")
+        self.assertEqual(art.bot_display_name("Night Owl"), "Night")
+        self.assertEqual(art.bot_topic("Listener: Morning queue (reader-a)"), "Morning queue")
+        self.assertEqual(settings.bot_updates_style(), "bubble")
+        with mock.patch.dict(os.environ, {"DIGEST_BOT_UPDATES_STYLE": "comic"}):
+            self.assertEqual(settings.bot_updates_style(), "bubble")
+        with mock.patch.dict(os.environ, {"DIGEST_BOT_UPDATES_STYLE": " PLAIN "}):
+            self.assertEqual(settings.bot_updates_style(), "plain")
+
+    def test_plain_style_centers_a_dash_between_notes(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            avatars = root / "avatars"
+            avatars.mkdir()
+            fixtures.portrait(avatars / "popcorn.png", (220, 140, 60))
+            value = fixtures.showcase_payload(
+                "sun",
+                "Thursday: high 70°F, low 48°F. Sunny",
+                "Clear and mild through the afternoon.",
+            )
+            with mock.patch.dict(
+                os.environ,
+                {"DIGEST_AVATARS_DIR": str(avatars), "DIGEST_BOT_UPDATES_STYLE": "plain"},
+            ):
+                metadata = fixtures.ReceiptDigestTests().render_payload(value, root / "plain")
+            marks = metadata["geometry"]["art"]
+            self.assertEqual([mark for mark in marks if mark["type"] == "bubble"], [])
+            notes = [mark for mark in marks if mark["type"] == "note"]
+            separators = [mark for mark in marks if mark["type"] == "separator"]
+            self.assertEqual(len(notes), 4)
+            self.assertEqual(len(separators), 3)
+            page_center = rd.WIDTH_DOTS / 2
+            for earlier, dash, later in zip(notes, separators, notes[1:]):
+                self.assertEqual(dash["y"], earlier["bottom"] + (later["top"] - earlier["bottom"]) // 2)
+                self.assertEqual(dash["y"], earlier["bottom"] + art.SEPARATOR_GAP // 2)
+                self.assertLess(earlier["bottom"], dash["y"])
+                self.assertLess(dash["y"] + 2, later["top"])
+                self.assertEqual(dash["x"] + dash["w"] / 2, page_center)
+            svg = Path(metadata["svg"]).read_text(encoding="utf-8")
+            self.assertIn('stroke-dasharray="8 6"', svg)
+            self.assertNotIn('stroke-linejoin="round"', svg)
+            _assert_names_under_avatars(self, marks)
 
 
 if __name__ == "__main__":

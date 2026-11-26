@@ -14,6 +14,7 @@ for _name in list(os.environ):
         "DIGEST_READER_IDS",
         "DIGEST_SECTION_ORDER",
         "DIGEST_BOT_UPDATES_DIR",
+        "DIGEST_BOT_UPDATES_STYLE",
         "DIGEST_HISTORY_PATH",
     }:
         os.environ.pop(_name, None)
@@ -274,6 +275,17 @@ class ReceiptDigestTests(unittest.TestCase):
             rd.validate_payload(renamed)
             self.assertEqual(rd.settings.section_by_id("companies").title, "COMPANIES")
 
+    def test_weather_icon_is_centered_on_the_forecast(self):
+        with tempfile.TemporaryDirectory() as temp:
+            metadata = self.render_payload(sample_payload(bots=False), Path(temp))
+        icon = next(mark for mark in metadata["geometry"]["art"] if mark["type"] == "weather")
+        weather = next(section for section in metadata["geometry"]["sections"] if section["name"] == "WEATHER")
+        center = rd.weather_text_center(weather["lines"])
+        self.assertIsNotNone(center)
+        self.assertLessEqual(abs((icon["y"] + icon["size"] / 2) - center), 3)
+        source = [line for line in weather["lines"] if line["kind"] == "source"]
+        self.assertGreaterEqual(source[0]["y"], icon["y"])
+
 
 def sample_story(section: str, index: int) -> dict:
     stories = {
@@ -396,13 +408,14 @@ def sample_payload(*, bots: bool) -> dict:
 
 
 def portrait(path: Path, rgb: tuple[int, int, int]) -> None:
-    image = Image.new("RGB", (160, 160), rgb)
+    """Light blob on a clear background, with about 12% padding so the ring shows."""
+    image = Image.new("RGBA", (160, 160), (0, 0, 0, 0))
     draw = ImageDraw.Draw(image)
-    shade = tuple(max(0, channel - 40) for channel in rgb)
-    draw.ellipse((16, 16, 144, 144), fill=shade)
-    draw.ellipse((52, 58, 74, 80), fill=(20, 20, 20))
-    draw.ellipse((96, 58, 118, 80), fill=(20, 20, 20))
-    draw.arc((58, 84, 112, 124), 15, 165, fill=(30, 20, 20), width=5)
+    tint = tuple(min(255, 180 + channel // 4) for channel in rgb)
+    draw.ellipse((20, 20, 140, 140), fill=tint + (255,))
+    draw.ellipse((58, 64, 76, 82), fill=(20, 20, 20, 255))
+    draw.ellipse((96, 64, 114, 82), fill=(20, 20, 20, 255))
+    draw.arc((66, 90, 106, 122), 20, 160, fill=(30, 20, 20, 255), width=4)
     image.save(path, format="PNG")
 
 
@@ -504,11 +517,15 @@ def write_showcase_pngs(directory: Path) -> dict[str, Path]:
         for name, icon, headline, summary in forecasts:
             source = root / f"{name}.json"
             source.write_text(json.dumps(showcase_payload(icon, headline, summary), indent=2), encoding="utf-8")
-            with mock.patch.dict(os.environ, {"DIGEST_AVATARS_DIR": str(avatars)}):
-                metadata = rd.render(source, root / name)
-            target = directory / f"{name}.png"
-            target.write_bytes(Path(metadata["png"]).read_bytes())
-            written[name] = target
+            for style, suffix in (("bubble", ""), ("plain", "-plain")):
+                with mock.patch.dict(
+                    os.environ,
+                    {"DIGEST_AVATARS_DIR": str(avatars), "DIGEST_BOT_UPDATES_STYLE": style},
+                ):
+                    metadata = rd.render(source, root / f"{name}{suffix}")
+                target = directory / f"{name}{suffix}.png"
+                target.write_bytes(Path(metadata["png"]).read_bytes())
+                written[f"{name}{suffix}"] = target
     return written
 
 

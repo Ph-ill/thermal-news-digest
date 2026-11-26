@@ -429,6 +429,14 @@ def avatars_dir() -> Path:
     return project_dir() / "avatars"
 
 
+def bot_updates_style() -> str:
+    """``bubble`` (default) or ``plain``. Anything else stays on the balloon."""
+    raw = os.environ.get("DIGEST_BOT_UPDATES_STYLE", "bubble").strip().lower()
+    if raw in {"bubble", "plain"}:
+        return raw
+    return "bubble"
+
+
 def avatar_threshold() -> int | None:
     """Optional 0–255 dither midpoint. Unset keeps the contrast-boosted default."""
     raw = os.environ.get("DIGEST_AVATAR_THRESHOLD", "").strip()

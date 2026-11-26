@@ -10,11 +10,12 @@ from __future__ import annotations
 import io
 import math
 import os
+from pathlib import Path
 import re
 import stat
 import warnings
 
-from PIL import Image, ImageChops, ImageDraw, ImageEnhance, ImageFilter, ImageOps
+from PIL import Image, ImageChops, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageOps
 
 import digest_picker
 import digest_settings as settings
@@ -23,20 +24,32 @@ import digest_settings as settings
 # 144 dots is 18 mm on the 8 dot/mm head. A dithered face needs that much
 # before eyes and hair survive; 72 dots (9 mm) printed as noise.
 AVATAR_PX = 144
+AVATAR_OUTLINE_FRAC = 0.028
 AVATAR_MAX_BYTES = 512 * 1024
 AVATAR_MAX_PIXELS = 1024 * 1024
 AVATAR_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp")
 TAIL_W = 22
 TAIL_GAP = 8
-BUBBLE_PAD_X = 16
-BUBBLE_PAD_Y = 28
-BUBBLE_RADIUS = 48
+# Padding is measured from the path. The 4-dot stroke sits 2 dots inside it,
+# so the words still have about 26 dots of air past the ink.
+BUBBLE_PAD_X = 28
+BUBBLE_PAD_Y = 36
+BUBBLE_RADIUS = 22
 # Gap under the last baseline so descenders clear the stroke.
-BUBBLE_INK_BELOW = 8
-# White space between one note's outline and the next.
-NOTE_GAP = 28
+BUBBLE_INK_BELOW = 12
+# White space between one note and the next.
+NOTE_GAP = 32
+# Right edge of a balloon. The page border sits near x=626, so 20 leaves a gap.
+BUBBLE_RIGHT = 20
 # Dots. Slightly heavier than the section rules so the balloon reads on thermal paper.
 BUBBLE_STROKE = 4
+NAME_GAP = 8
+NAME_FONT_SIZE = 16
+NAME_FONT_PATH = Path(__file__).resolve().parent / "fonts" / "PressStart2P-Regular.ttf"
+# Plain style: air between the picture column and the words, and between notes.
+PLAIN_GAP = 16
+SEPARATOR_W = 96
+SEPARATOR_GAP = 36
 WEATHER_ICON_PX = 64
 WEATHER_GAP = 12
 
@@ -95,10 +108,15 @@ def _coord(value: float) -> str:
 
 
 def bubble_radius(width: int, height: int, bulge: int) -> int:
-    """Comic corner. Leave a straight left waist so the tail can sit mid-bubble."""
+    """Comic corner that finishes inside the text padding.
+
+    The first and last lines then sit on the straight wall, so their ends
+    are not pushed into the arch.
+    """
     room = max(16, height // 2 - 18)
     cap = max(12, room - bulge)
-    return max(12, min(BUBBLE_RADIUS, width // 2, height // 2, cap))
+    pad_limit = max(14, BUBBLE_PAD_Y - bulge - 8)
+    return max(12, min(BUBBLE_RADIUS, width // 2, height // 2, cap, pad_limit))
 
 
 def bubble_path(
@@ -119,7 +137,7 @@ def bubble_path(
     """
     x, y, w, h = int(x), int(y), int(w), int(h)
     tail = max(8, int(tail))
-    bulge = max(8, min(16, h // 10))
+    bulge = max(6, min(8, h // 16))
     if radius is None:
         radius = bubble_radius(w, h, bulge)
     else:
@@ -190,6 +208,42 @@ def bot_initial(item: dict) -> str:
     return "?"
 
 
+def bot_display_name(label: str) -> str:
+    """First word of a bot name. ``Popcorn · Movie Goblin`` prints as ``Popcorn``."""
+    parts = [part for part in re.split(r"[\s·•]+", label.strip()) if part]
+    return parts[0] if parts else ""
+
+
+def bot_topic(title: str) -> str:
+    """Topic half of ``Name: Topic``, without a trailing ``(reader)`` tag."""
+    text = re.sub(r"\s*\([^)]*\)\s*$", "", title.strip())
+    if ":" in text:
+        text = text.split(":", 1)[1].strip()
+    return text
+
+
+def render_bot_name(name: str, max_width: int = AVATAR_PX) -> Image.Image:
+    """1-bit name in Press Start 2P. Size 16 sits on the pixel grid, so it stays crisp."""
+    label = name.strip() or "?"
+    size = NAME_FONT_SIZE
+    font = ImageFont.truetype(str(NAME_FONT_PATH), size)
+    while size > 8:
+        bbox = font.getbbox(label)
+        if bbox[2] - bbox[0] <= max_width:
+            break
+        size -= 8
+        font = ImageFont.truetype(str(NAME_FONT_PATH), size)
+    bbox = font.getbbox(label)
+    while bbox[2] - bbox[0] > max_width and len(label) > 1:
+        label = label[:-1]
+        bbox = font.getbbox(label)
+    width = max(1, bbox[2] - bbox[0])
+    height = max(1, bbox[3] - bbox[1])
+    image = Image.new("L", (width, height), 255)
+    ImageDraw.Draw(image).text((-bbox[0], -bbox[1]), label, font=font, fill=0)
+    return image.point(lambda value: 0 if value < 128 else 255)
+
+
 def _cover_square(image: Image.Image, size: int) -> Image.Image:
     width, height = image.size
     side = min(width, height)
@@ -202,10 +256,26 @@ def _cover_square(image: Image.Image, size: int) -> Image.Image:
 
 
 def _flatten_rgb(image: Image.Image) -> Image.Image:
+    """Composite onto white. A transparent silhouette gets a black ring first.
+
+    A bright face on a clear background would otherwise dither away into the
+    paper. Fully opaque pictures are not touched.
+    """
     if image.mode in {"RGBA", "LA"} or (image.mode == "P" and "transparency" in image.info):
         rgba = image.convert("RGBA")
-        background = Image.new("RGBA", rgba.size, (255, 255, 255, 255))
-        return Image.alpha_composite(background, rgba).convert("RGB")
+        alpha = rgba.getchannel("A")
+        low, _high = alpha.getextrema()
+        plate = Image.new("RGBA", rgba.size, (255, 255, 255, 255))
+        if low < 255:
+            # Width tracks the shorter side, so a later square resize keeps the
+            # same fraction. MaxFilter's kernel is odd; cap it so a large
+            # source does not build a huge rank filter.
+            w = max(1, round(min(rgba.size) * AVATAR_OUTLINE_FRAC))
+            kernel = min(2 * w + 1, 61)
+            ring = alpha.point(lambda v: 255 if v > 32 else 0).filter(ImageFilter.MaxFilter(kernel))
+            black = Image.new("RGBA", rgba.size, (0, 0, 0, 255))
+            plate.paste(black, (0, 0), ring)
+        return Image.alpha_composite(plate, rgba).convert("RGB")
     return image.convert("RGB")
 
 

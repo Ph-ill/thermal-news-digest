@@ -29,7 +29,7 @@ Each update object uses these keys. `url` and `avatar` are optional. A file that
 
 | Field | Type | Rule |
 | --- | --- | --- |
-| `bot` | string | 1–40 characters. Printed in the bubble heading and used as the source line. |
+| `bot` | string | 1–40 characters. The source line, and the first word is printed under the picture. |
 | `topic` | string | 1–48 characters. |
 | `text` | string | 8–360 characters, one line, written in first person by the bot. This is the receipt summary inside the speech bubble. |
 | `for` | string | `both`, or one id from `DIGEST_READER_IDS`. |
@@ -63,17 +63,17 @@ Each update object uses these keys. `url` and `avatar` are optional. A file that
 }
 ```
 
-With the default reader ids, the second note is headed `Listener: Morning queue (reader-a)`. A `both` note is headed `Popcorn: Film picks`. The source line is the bot name. `text` is what the bot would say out loud, so write it in first person.
+With the default reader ids, the stored title of the second note is `Listener: Morning queue (reader-a)`. A `both` note is stored as `Popcorn: Film picks`. On the receipt the reader tag is left off. The topic is the small heading, and the first word of the bot name is printed under the picture. The source line stays the full bot name. `text` is what the bot would say out loud, so write it in first person.
 
 ## Pictures
 
-Each note is printed as a square picture on the left, 144 dots (18 mm), and a speech bubble on the right. The bubble is a rounded comic balloon with an arched top and bottom and a curved, tapered tail pointing at the picture. The heading and the first-person text sit inside the bubble, with space above and below the words and between notes, and wrap to the bubble width.
+Each note is a square picture on the left, 144 dots (18 mm), with the bot's first name centered underneath in a pixel font. `DIGEST_BOT_UPDATES_STYLE` chooses the words beside it. `bubble` (the default) draws a rounded comic balloon with an arched top and bottom and a curved, tapered tail pointing at the picture. The topic and the first-person text sit inside, with padding past the stroke and a gap between notes. `plain` skips the balloon. The same words sit beside the picture, and a short dashed line, centered on the page, sits halfway between one note and the next. Any other value of the setting is treated as `bubble`.
 
 Pictures live in `DIGEST_AVATARS_DIR` (default `avatars/` inside the project directory). That directory is gitignored. The file name is the slug plus `.png`, `.jpg`, `.jpeg`, or `.webp`, for example `avatars/popcorn.png`. The loader tries those extensions in that order and uses the first one that decodes.
 
 A picture has to be a regular file. Symlinks are ignored. The file must be at most 512 KiB, and Pillow must decode it as at most one megapixel. Anything else — missing, truncated, too big, or not an image — is skipped. The note then uses a drawn circle with the bot's initial.
 
-Before printing, the picture is cropped to a square, contrast-boosted, and dithered to 1-bit with Floyd-Steinberg so the thermal head can hold a face. `DIGEST_AVATAR_THRESHOLD` (0–255) is optional. Set it to slide the dither midpoint; a higher value prints more black. Leave it unset for the default midpoint after the contrast boost.
+Before printing, the picture is cropped to a square, contrast-boosted, and dithered to 1-bit with Floyd-Steinberg so the thermal head can hold a face. Use a square PNG with a transparent background and about 12% padding on each side, so the face is not cut by the crop. A picture with any transparency gets a thin black ring around its silhouette. That keeps a bright face, such as a white render, from vanishing into the paper. A fully opaque file is left unchanged. `DIGEST_AVATAR_THRESHOLD` (0–255) is optional. Set it to slide the dither midpoint; a higher value prints more black. Leave it unset for the default midpoint after the contrast boost.
 
 The section heading is `GROK BOT UPDATES` unless `DIGEST_SECTION_TITLE_BOT_UPDATES` sets another title. `DIGEST_BOT_UPDATES_DIR` and the `YYYY-MM-DD.json` file name are unchanged. `avatar` is optional, so an older file that does not have it still loads.
 
