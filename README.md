@@ -10,7 +10,7 @@ Personal values stay in the environment. See `.env.example`. Do not commit names
 
 | Piece | Role |
 | --- | --- |
-| `digest_generator.py` | Fetches weather, news, and nearby shows. Writes `output/digest-source-YYYY-MM-DD.json` once. |
+| `digest_generator.py` | Fetches weather, news, and nearby shows. Writes `output/digest-source-YYYY-MM-DD.json` once. `--export-candidates` writes the model view and does not call a model. |
 | `digest_settings.py` | Reads env settings: feeds, section order, titles, model, history, bot updates. |
 | `digest_picker.py` | Scores candidates, calls the model, validates JSON, and remembers recent URLs and titles. |
 | `receipt_digest.py` | Checks the section list, draws an SVG, rasterizes it, and packs a TSPL2 bitmap. |
@@ -18,6 +18,7 @@ Personal values stay in the environment. See `.env.example`. Do not commit names
 | `receipt_digest_trigger.py` | Listens on `127.0.0.1` only. `POST /v1/digest/dry-run` or `POST /v1/digest/submit`. |
 | `digest-history.json` | URLs and normalized titles from recent editions. Gitignored. |
 | `bot-updates/YYYY-MM-DD.json` | Optional notes from household bots. Gitignored. Contract in [docs/bot-updates.md](docs/bot-updates.md). |
+| `picks/YYYY-MM-DD.json` | Optional picks and nearby shows from an external bot. Gitignored. Contract in [docs/picks.md](docs/picks.md). |
 
 Pillow wraps text and measures the bitmap. `rsvg-convert` (librsvg) turns the SVG into a PNG. DejaVu Sans Mono is the face on the strip. No other third-party Python packages are required.
 
@@ -31,7 +32,7 @@ Pillow wraps text and measures the bitmap. `rsvg-convert` (librsvg) turns the SV
    - Up to 16 candidates from each news feed. Stories older than about 36 hours are dropped when the section has anything newer.
    - Nearby shows, only when a Ticketmaster key and an artist file are set and a concert matches. See [docs/shows.md](docs/shows.md).
    - The bot-updates file, if it is valid and newer than about 30 hours.
-   - One chat-completions call to pick and summarize the news. Any failure uses the fallback picker.
+   - A picks file for today, if a valid one was written ahead of the run. Otherwise one chat-completions call when `DIGEST_LLM_API_KEY` is set. Any other case uses the fallback picker. The source file records which of those three ran.
    - Recent URLs and titles are skipped, then today's picks are appended to `digest-history.json`.
 5. `receipt_digest.py` checks the section order and draws a strip whose height follows the text, up to 6000 dots. Past that, lines are shortened until the strip fits. Characters XML cannot carry are removed, so a damaged source file can still print. A bitmap that touches the edge, or is almost blank or almost solid, is still refused.
 6. `--submit` sends the `.tspl` file with `lp -d "$DIGEST_PRINTER_QUEUE" -o raw`. The job id is stored in `state.json`. A `completed` or still-`submitted` job is not sent again. A `failed` job is sent on the next `--submit`.
@@ -157,11 +158,21 @@ These failures all fall back to the deterministic picker, and the source file re
 - JSON that is not the schema above
 - picks that do not match the candidates
 
-The fallback is deliberately minimal. It runs when the model is unavailable or the call fails. BASTROP prints one fixed line, `Local picks unavailable today (AI offline).`, and does not choose a story. Every other news section prints the newest items from its feeds that are not repeats and that do not contain a death or violence word in the title or the summary (`killed`, `killing`, `dies`, `dead`, `shooting`, `crash`, and the same family of words). There is no idiom exemption and no taste ranking, so a headline such as "the band killed it" is dropped. Likes, dislikes, and prefer terms still order the candidates sent to the model. They do not reorder the fallback. NEARBY SHOWS stays a separate deterministic check (Ticketmaster, the artist list, and the radius) and does not use the model or this fallback. A summary that only repeats the headline plus the outlet is replaced with `From {outlet}, {date}.` Google News titles that end in ` - Outlet` use the outlet as the source line instead of `news.google.com`.
+About 15 minutes before 05:00, export the candidate list and let an external bot write `picks/YYYY-MM-DD.json`. The generator does not call a model for that export. See [docs/picks.md](docs/picks.md).
+
+```bash
+python3 digest_generator.py --export-candidates output/candidates-YYYY-MM-DD.json --date YYYY-MM-DD
+```
+
+The fallback is deliberately minimal. It runs when no valid picks file is present and the model is unavailable or the call fails. BASTROP prints one fixed line, `Local picks unavailable today (AI offline).`, and does not choose a story. Every other news section prints the newest items from its feeds that are not repeats and that do not contain a death or violence word in the title or the summary (`killed`, `killing`, `dies`, `dead`, `shooting`, `crash`, and the same family of words). There is no idiom exemption and no taste ranking, so a headline such as "the band killed it" is dropped. Likes, dislikes, and prefer terms still order the candidates sent to the model. They do not reorder the fallback. NEARBY SHOWS does not use the model or this fallback. It uses Ticketmaster when a key is set, and the shows array in the picks file otherwise. A summary that only repeats the headline plus the outlet is replaced with `From {outlet}, {date}.` Google News titles that end in ` - Outlet` use the outlet as the source line instead of `news.google.com`.
 
 The same story from another outlet is treated as a repeat when the headlines are the same event after filler and attribution are removed. "Set to open" matches "opening", and "lifts off" matches "launches". That check also applies when the headlines only overlap. Headlines split when both name a business or a town and those names differ (Round Rock against Bastrop, a brewery against the bakery on the same street, an unnumbered Starship flight against flight 3), and also when the longer headline adds a business the shorter one does not have. When both headlines already share a venue, a generic add-on (shop, music, band, live, patio, or menu) does not split them, so a brewery and that brewery's shop, live music, or band are one story. A coffee shop beside the brewery stays a different story. An extra Texas or Street on one side still matches. The words first and second count as numbers only beside a flight, a launch, or another count word. Exact URLs and exact normalized titles still match. A story printed yesterday is skipped. The model sees the newest history titles, not the oldest, and is told that titles, summaries, and the profile are untrusted data. The same calendar day can be rebuilt. A timestamp with no timezone is read in `DIGEST_TZ`. An unknown zone name falls back to America/Chicago.
 
 The API key is sent only as an `Authorization` header. It is not written into the digest, the history file, or the error strings. Stored URLs have any username or password removed. The taste note and the interests profile are sent to the model and are not copied into the source file. Picker failures are stored as a short code. A broken `state.json` is moved aside as `state.json.corrupt-<time>` and the run starts from an empty state. The rename happens under the print lock and only if the file is still the one that was read. Old `.corrupt-*` copies are deleted after 14 days. A digest entry that is not an object is treated as a broken file. "Died in committee", "killed in committee", and "killed by the storm", the rain, the weather, or the council are not obituaries.
+
+## External picks
+
+See [docs/picks.md](docs/picks.md). The short version: `python3 digest_generator.py --export-candidates <path>` writes the sections, rubrics, up to 12 candidates each, the newest 40 history titles, and the taste note and interests profile. The bot writes `picks/YYYY-MM-DD.json` with the same `picks` objects the model would return, plus `generated_at` and an optional `shows` array. At 05:00 a valid file for today in `DIGEST_TZ` is used instead of the model. A URL that is not one of today's candidates is skipped. A stale, symlinked, or invalid file is ignored. With no Ticketmaster key, NEARBY SHOWS prints the `shows` entries that fall in the usual date window and have not already been mentioned. A Ticketmaster key ignores that array.
 
 ## Bot updates
 

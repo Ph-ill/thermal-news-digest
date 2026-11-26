@@ -69,8 +69,9 @@ _KILLED_BY_EVENT = re.compile(
 # The model path still uses the narrower obituary and crime checks above.
 _FALLBACK_VIOLENCE = re.compile(
     r"\b(?:kill(?:ed|ing|s)?|dies|died|dead|deaths?|"
-    r"shoot(?:ings|ing|s)?|shot|slain|"
-    r"drown(?:ed|ings|ing|s)?|suicid(?:e|es|al)|wound(?:ed|ing)|assault(?:ed|ing|s)?|"
+    r"shoot(?:ings|ing|s)?|shot|shooter|slain|"
+    r"drown(?:ed|ings|ing|s)?|suicid(?:e|es|al)|wound(?:ed|ing|s)|assault(?:ed|ing|s)?|"
+    r"bomb(?:ing|ed|s)?|"
     r"crash(?:es|ed|ing)?|"
     r"stab(?:bed|bing|s)?|murder(?:ers|er|ed|ing|ous|s)?|homicid(?:e|es|al)|"
     r"gunman|gunfire|overdos(?:e|es|ed|ing)|fatal(?:ly|ity|ities)?|"
@@ -1531,6 +1532,62 @@ def shows_from_ticketmaster(
     return found
 
 
+def _supplied_show_id(artist: str, venue: str, day: str) -> str:
+    slug = fold(f"{artist}|{venue}|{day}")
+    slug = re.sub(r"[^a-z0-9]+", "-", slug).strip("-")
+    return ("file-" + slug)[:80]
+
+
+def shows_from_supplied(
+    entries: list[dict],
+    digest_date: str,
+    history: list[dict],
+    horizon_days: int,
+) -> list[dict]:
+    """Shows named in the picks file. The same date window and repeat rules as Ticketmaster."""
+    try:
+        edition = dt.date.fromisoformat(digest_date)
+    except ValueError:
+        return []
+    found: list[dict] = []
+    for row in entries:
+        if not isinstance(row, dict):
+            continue
+        try:
+            day = dt.date.fromisoformat(str(row.get("date") or ""))
+        except ValueError:
+            continue
+        delta = (day - edition).days
+        if delta < 0 or delta > horizon_days:
+            continue
+        url = row.get("url") or ""
+        if not isinstance(url, str) or not url.startswith("http"):
+            continue
+        url = strip_userinfo(url)
+        artist = clean_spaces(str(row.get("artist") or ""))
+        venue = clean_spaces(str(row.get("venue") or "Venue TBA"))
+        city = clean_spaces(str(row.get("city") or ""))
+        if not artist:
+            continue
+        phase = "week" if delta <= 7 else "early"
+        show_id = _supplied_show_id(artist, venue, day.isoformat())
+        if show_already_mentioned(history, show_id, phase, digest_date):
+            continue
+        label = f"{day.strftime('%a').upper()} {day.strftime('%b').upper()} {day.day}"
+        place = ", ".join(part for part in (venue, city) if part)
+        found.append(
+            {
+                "title": clean_spaces(f"{label} · TIME TBA · {artist}")[:240],
+                "summary": (place + ".") if place else "Venue to be announced.",
+                "url": url,
+                "event_start": day.isoformat(),
+                "show_id": show_id,
+                "phase": phase,
+            }
+        )
+    return found
+
+
 def is_spam(text: str) -> bool:
     if _SPAM.search(text or ""):
         return True
@@ -1856,13 +1913,15 @@ def local_offline_item(feed_url: str) -> dict:
 
 
 def placeholder_item(feed_url: str) -> dict:
-    return {
-        "title": PLACEHOLDER_TITLE,
-        "summary": PLACEHOLDER_SUMMARY,
-        "url": feed_url,
-        "published_at": None,
-        "rationale": PLACEHOLDER_SUMMARY,
-    }
+    return _public_item(
+        {
+            "title": PLACEHOLDER_TITLE,
+            "summary": PLACEHOLDER_SUMMARY,
+            "url": feed_url or "https://example.invalid/feed",
+            "published_at": None,
+            "rationale": PLACEHOLDER_SUMMARY,
+        }
+    )
 
 
 def fallback_pick(
@@ -2173,32 +2232,12 @@ def _picker_error(code: str) -> dict:
     }
 
 
-def pick_news(
+def rank_sections(
     requests: list[dict],
-    *,
-    digest_date: str,
-    history: list[dict],
-    has_bots: bool,
-    taste: str | None = None,
-    opener=None,
-    item_count: int | None = None,
-    summary_chars: int | None = None,
-    deadline: float | None = None,
-    profile: dict | None = None,
-    crowded: bool = False,
-) -> tuple[dict[str, list[dict]], dict, list[dict], list[dict]]:
-    """Pick items for each news section.
-
-    ``requests`` entries need section_id, title, purpose, feed_url, prefer_terms,
-    and candidates. Returns items by section id, picker metadata, source errors,
-    and history records.
-    """
-    count = item_count if item_count is not None else settings.news_item_count(has_bots, crowded=crowded)
-    max_chars = summary_chars if summary_chars is not None else settings.summary_limit(has_bots, crowded=crowded)
-    profile = profile or empty_profile()
-    interests = profile_brief(profile)
-    seen = Seen(history, digest_date, settings.history_days())
-    printed = recent_history_titles(history, digest_date, settings.history_days())
+    seen: Seen,
+    profile: dict,
+) -> list[tuple[dict, list[dict]]]:
+    """Eligible candidates in the order the model would see, newest ties kept stable."""
     prepared: list[tuple[dict, list[dict]]] = []
     for request in requests:
         section_id = str(request.get("section_id") or "")
@@ -2221,12 +2260,84 @@ def pick_news(
             )
         ]
         prepared.append((request, eligible))
+    return prepared
+
+
+def candidate_document(
+    requests: list[dict],
+    history: list[dict],
+    digest_date: str,
+    *,
+    profile: dict | None = None,
+    taste: str | None = None,
+    has_bots: bool = False,
+    crowded: bool = False,
+) -> dict:
+    """The JSON an external picker reads. No model call."""
+    profile = profile or empty_profile()
+    count = settings.news_item_count(has_bots, crowded=crowded)
+    max_chars = settings.summary_limit(has_bots, crowded=crowded)
+    seen = Seen(history, digest_date, settings.history_days())
+    printed = recent_history_titles(history, digest_date, settings.history_days())
+    prepared = rank_sections(requests, seen, profile)
+    groups = [
+        (request["title"], request.get("purpose") or "", eligible) for request, eligible in prepared
+    ]
+    body = json.loads(
+        _user_payload(
+            groups,
+            taste if taste is not None else settings.taste(),
+            count,
+            max_chars,
+            profile_brief(profile),
+            printed,
+        )
+    )
+    body["schema_version"] = "1"
+    body["digest_date"] = digest_date
+    return body
+
+
+def pick_news(
+    requests: list[dict],
+    *,
+    digest_date: str,
+    history: list[dict],
+    has_bots: bool,
+    taste: str | None = None,
+    opener=None,
+    item_count: int | None = None,
+    summary_chars: int | None = None,
+    deadline: float | None = None,
+    profile: dict | None = None,
+    crowded: bool = False,
+    external_picks: list[dict] | None = None,
+) -> tuple[dict[str, list[dict]], dict, list[dict], list[dict]]:
+    """Pick items for each news section.
+
+    ``requests`` entries need section_id, title, purpose, feed_url, prefer_terms,
+    and candidates. ``external_picks`` is a validated picks file. When it is
+    present the model is not called. Returns items by section id, picker
+    metadata, source errors, and history records.
+    """
+    count = item_count if item_count is not None else settings.news_item_count(has_bots, crowded=crowded)
+    max_chars = summary_chars if summary_chars is not None else settings.summary_limit(has_bots, crowded=crowded)
+    profile = profile or empty_profile()
+    interests = profile_brief(profile)
+    seen = Seen(history, digest_date, settings.history_days())
+    printed = recent_history_titles(history, digest_date, settings.history_days())
+    prepared = rank_sections(requests, seen, profile)
 
     opener = opener or _default_opener
     llm_picks = None
+    source = "fallback"
     reason = "no_api_key" if not settings.llm_api_key() else "no_candidates"
     errors: list[dict] = []
-    if settings.llm_api_key() and any(eligible for _request, eligible in prepared):
+    if external_picks is not None:
+        llm_picks = external_picks
+        reason = "ok"
+        source = "picks"
+    elif settings.llm_api_key() and any(eligible for _request, eligible in prepared):
         groups = [
             (request["title"], request.get("purpose") or "", eligible)
             for request, eligible in prepared
@@ -2244,14 +2355,17 @@ def pick_news(
                 recent_titles=printed,
             )
             reason = "ok"
+            source = "llm"
         except LLMError as exc:
             reason = exc.code
             llm_picks = None
+            source = "fallback"
             if exc.code != "no_api_key":
                 errors.append(_picker_error(exc.code))
         except Exception:
             reason = "network"
             llm_picks = None
+            source = "fallback"
             errors.append(_picker_error("network"))
 
     picks_by_title: dict[str, list[dict]] = {}
@@ -2317,7 +2431,18 @@ def pick_news(
                 public.append(_public_item(item))
         items_by_id[request["section_id"]] = public
 
-    if llm_picks is None:
+    if source == "picks":
+        if used_llm and used_fallback:
+            mode = "mixed"
+            reason = "ok"
+        elif used_llm:
+            mode = "picks"
+            reason = "ok"
+        else:
+            mode = "fallback"
+            if reason == "ok":
+                reason = "no_accepted_picks"
+    elif llm_picks is None:
         mode = "fallback"
     elif used_llm and used_fallback:
         mode = "mixed"
@@ -2330,7 +2455,12 @@ def pick_news(
         if reason == "ok":
             reason = "no_accepted_picks"
             errors.append(_picker_error("no_accepted_picks"))
-    meta = {"mode": mode, "model": settings.llm_model() if settings.llm_api_key() else None, "reason": reason}
+    model = None
+    if source == "llm" and settings.llm_api_key():
+        model = settings.llm_model()
+    elif source == "fallback" and settings.llm_api_key() and external_picks is None:
+        model = settings.llm_model()
+    meta = {"mode": mode, "model": model, "reason": reason, "source": source}
     return items_by_id, meta, errors, records
 
 
@@ -2569,6 +2699,135 @@ def _read_regular_nofollow(path: Path, limit: int) -> bytes:
         return b"".join(chunks)
     finally:
         os.close(fd)
+
+
+PICKS_MAX_BYTES = 65536
+
+
+class PicksFileError(Exception):
+    def __init__(self, code: str) -> None:
+        self.code = code
+        super().__init__(code)
+
+
+def _plain_pick_text(value: object, minimum: int, maximum: int) -> str:
+    if not isinstance(value, str):
+        raise PicksFileError("invalid")
+    text = clean_spaces(value)
+    if not minimum <= len(text) <= maximum or any(ord(char) < 32 for char in text):
+        raise PicksFileError("invalid")
+    return text
+
+
+def _normalize_pick_entries(picks: object) -> list[dict]:
+    if not isinstance(picks, list):
+        raise PicksFileError("invalid")
+    seen_sections: set[str] = set()
+    normalized: list[dict] = []
+    for pick in picks:
+        if not isinstance(pick, dict) or set(pick) != {"section", "items"}:
+            raise PicksFileError("invalid")
+        section = pick["section"]
+        items = pick["items"]
+        if not isinstance(section, str) or not section.strip() or section in seen_sections:
+            raise PicksFileError("invalid")
+        if not isinstance(items, list):
+            raise PicksFileError("invalid")
+        seen_sections.add(section)
+        cleaned_items = []
+        for item in items:
+            if not isinstance(item, dict) or set(item) != {"url", "summary"}:
+                raise PicksFileError("invalid")
+            if not isinstance(item["url"], str) or not isinstance(item["summary"], str):
+                raise PicksFileError("invalid")
+            cleaned_items.append({"url": item["url"], "summary": item["summary"]})
+        normalized.append({"section": section, "items": cleaned_items})
+    return normalized
+
+
+def _normalize_show_entries(shows: object) -> list[dict]:
+    if not isinstance(shows, list) or len(shows) > 8:
+        raise PicksFileError("invalid")
+    cleaned: list[dict] = []
+    for row in shows:
+        if not isinstance(row, dict):
+            raise PicksFileError("invalid")
+        keys = set(row)
+        if not {"artist", "venue", "city", "date"} <= keys <= {"artist", "venue", "city", "date", "url"}:
+            raise PicksFileError("invalid")
+        artist = _plain_pick_text(row["artist"], 1, 80)
+        venue = _plain_pick_text(row["venue"], 1, 80)
+        city = _plain_pick_text(row["city"], 1, 60)
+        day = row["date"]
+        if not isinstance(day, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", day):
+            raise PicksFileError("invalid")
+        try:
+            dt.date.fromisoformat(day)
+        except ValueError as exc:
+            raise PicksFileError("invalid") from exc
+        url = row.get("url")
+        if url is not None:
+            if not isinstance(url, str) or len(url) > 300 or any(char.isspace() for char in url):
+                raise PicksFileError("invalid")
+            if not url.startswith("http://") and not url.startswith("https://"):
+                raise PicksFileError("invalid")
+            url = strip_userinfo(url)
+        cleaned.append({"artist": artist, "venue": venue, "city": city, "date": day, "url": url})
+    return cleaned
+
+
+def _validate_picks_document(value: object, digest_date: str) -> dict:
+    if not isinstance(value, dict):
+        raise PicksFileError("invalid")
+    if set(value) - {"generated_at", "picks", "shows"} or "generated_at" not in value or "picks" not in value:
+        raise PicksFileError("invalid")
+    try:
+        generated = _parse_generated_at(value["generated_at"])
+    except BotUpdatesError as exc:
+        raise PicksFileError("invalid") from exc
+    if generated.astimezone(_digest_zone()).date().isoformat() != digest_date:
+        raise PicksFileError("stale")
+    return {
+        "picks": _normalize_pick_entries(value["picks"]),
+        "shows": _normalize_show_entries(value["shows"]) if "shows" in value else [],
+    }
+
+
+def load_picks(directory: Path, digest_date: str) -> tuple[dict | None, str | None]:
+    """Read today's picks file. A missing file is quiet. A bad file is ignored."""
+    try:
+        return _load_picks(directory, digest_date)
+    except Exception:
+        return None, "picks ignored: unreadable"
+
+
+def _load_picks(directory: Path, digest_date: str) -> tuple[dict | None, str | None]:
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", digest_date):
+        return None, "picks ignored: invalid"
+    path = directory / f"{digest_date}.json"
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return None, None
+    except OSError:
+        return None, "picks ignored: unreadable"
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        return None, "picks ignored: unreadable"
+    try:
+        raw = _read_regular_nofollow(path, PICKS_MAX_BYTES + 1)
+    except OSError:
+        return None, "picks ignored: unreadable"
+    if len(raw) > PICKS_MAX_BYTES:
+        return None, "picks ignored: file is too large"
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except Exception:
+        return None, "picks ignored: invalid"
+    try:
+        return _validate_picks_document(value, digest_date), None
+    except PicksFileError as exc:
+        label = "picks ignored: stale" if exc.code == "stale" else "picks ignored: invalid"
+        return None, label
 
 
 def load_bot_updates(

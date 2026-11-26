@@ -29,3 +29,5 @@ Names are compared after lowercasing, stripping punctuation, and dropping a lead
 A show is printed once when it is first seen, and once more when it is within seven days. History stores the Ticketmaster id and which of those two mentions already ran. The same morning can be rebuilt after a crash. Past dates are skipped.
 
 No key, no artist file, or no matching show: the section is not printed and no placeholder is invented.
+
+When `DIGEST_TICKETMASTER_KEY` is empty, the same section can be filled from the optional `shows` array in `picks/YYYY-MM-DD.json`. Each entry names an artist, a venue, a city, a date, and an optional event URL. The date window and the once-plus-seven-days repeat rule are the same as Ticketmaster. Usernames and passwords are removed from the URL. A show with no URL is left out, because the receipt needs a link. If a Ticketmaster key is set, Ticketmaster is the only source and the array is ignored. The file contract is [picks.md](picks.md).
