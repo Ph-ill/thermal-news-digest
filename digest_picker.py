@@ -1452,6 +1452,25 @@ def _coord(value: object) -> float | None:
         return None
 
 
+def _has_control_char(value: str) -> bool:
+    return any(ord(char) < 32 or ord(char) == 0x7F for char in value)
+
+
+def acceptable_show_url(url: object) -> str | None:
+    """Return a show URL safe to print, or None when it must be left out.
+
+    A control character, or any character ``xml_text`` would remove, rejects the URL.
+    """
+    if not isinstance(url, str) or not url.startswith("http"):
+        return None
+    if _has_control_char(url) or xml_text(url) != url:
+        return None
+    cleaned = strip_userinfo(url)
+    if _has_control_char(cleaned) or xml_text(cleaned) != cleaned:
+        return None
+    return cleaned
+
+
 def shows_from_ticketmaster(
     raw: bytes | str,
     artist: str,
@@ -1503,10 +1522,9 @@ def shows_from_ticketmaster(
         phase = "week" if delta <= 7 else "early"
         if show_already_mentioned(history, show_id, phase, digest_date):
             continue
-        url = event.get("url")
-        if not isinstance(url, str) or not url.startswith("http"):
+        url = acceptable_show_url(event.get("url"))
+        if url is None:
             continue
-        url = strip_userinfo(url)
         venues = [row for row in (inner.get("venues") or []) if isinstance(row, dict)]
         venue = venues[0] if venues else {}
         if not _venue_in_range(venue):
@@ -1560,10 +1578,9 @@ def shows_from_supplied(
         delta = (day - edition).days
         if delta < 0 or delta > horizon_days:
             continue
-        url = row.get("url") or ""
-        if not isinstance(url, str) or not url.startswith("http"):
+        url = acceptable_show_url(row.get("url") or "")
+        if url is None:
             continue
-        url = strip_userinfo(url)
         artist = clean_spaces(str(row.get("artist") or ""))
         venue = clean_spaces(str(row.get("venue") or "Venue TBA"))
         city = clean_spaces(str(row.get("city") or ""))
@@ -1647,7 +1664,28 @@ def sentence_pieces(text: str) -> list[str]:
     return [_restore_abbreviations(part).strip() for part in parts if part.strip()]
 
 
-def fit_summary(title: str, summary: str, max_chars: int) -> str | None:
+def _clip_at_word(text: str, max_chars: int) -> str | None:
+    """Shorten text at a word boundary so it still ends as a sentence."""
+    body = text[:max_chars].rstrip()
+    if " " in body:
+        body = body.rsplit(" ", 1)[0]
+    body = body.rstrip(" ,;:-")
+    if body and body[-1] not in ".!?":
+        if len(body) + 1 <= max_chars:
+            body += "."
+        elif " " in body:
+            body = body.rsplit(" ", 1)[0].rstrip(" ,;:-")
+            if not body:
+                return None
+            body += "."
+        else:
+            return None
+    if len(body) < 30 or len(body) > max_chars:
+        return None
+    return body
+
+
+def fit_summary(title: str, summary: str, max_chars: int, *, clip: bool = False) -> str | None:
     text = echo_stripped(title, summary)
     if not text:
         return None
@@ -1661,9 +1699,15 @@ def fit_summary(title: str, summary: str, max_chars: int) -> str | None:
         else:
             window = _protect_abbreviations(text[:max_chars])
             ends = [match.end() for match in re.finditer(r"[.!?]", window)]
-            if not ends or ends[-1] < 30:
+            if ends and ends[-1] >= 30:
+                text = _restore_abbreviations(window[: ends[-1]]).strip()
+            elif clip:
+                clipped = _clip_at_word(_restore_abbreviations(window), max_chars)
+                if clipped is None:
+                    return None
+                text = clipped
+            else:
                 return None
-            text = _restore_abbreviations(window[: ends[-1]]).strip()
     if text and text[-1] not in ".!?":
         if len(text) + 1 <= max_chars:
             text += "."
@@ -2276,7 +2320,8 @@ def candidate_document(
     """The JSON an external picker reads. No model call."""
     profile = profile or empty_profile()
     count = settings.news_item_count(has_bots, crowded=crowded)
-    max_chars = settings.summary_limit(has_bots, crowded=crowded)
+    # The bot writes summaries before anyone knows whether shows will crowd the strip.
+    max_chars = settings.summary_limit(True, crowded=True)
     seen = Seen(history, digest_date, settings.history_days())
     printed = recent_history_titles(history, digest_date, settings.history_days())
     prepared = rank_sections(requests, seen, profile)
@@ -2298,6 +2343,45 @@ def candidate_document(
     return body
 
 
+def _match_supplied_picks(
+    eligible: list[dict],
+    picks: list[dict],
+    seen: Seen,
+    max_chars: int,
+    section_count: int,
+    *,
+    clip: bool = False,
+) -> list[dict]:
+    """Accept picks whose URL is a candidate, comparing the raw string and normalize_url."""
+    by_url: dict[str, dict] = {}
+    by_norm: dict[str, dict] = {}
+    for item in eligible:
+        by_url.setdefault(item["url"], item)
+        by_norm.setdefault(normalize_url(item["url"]), item)
+    chosen: list[dict] = []
+    for pick in picks:
+        if len(chosen) >= section_count:
+            break
+        url = pick.get("url")
+        if not isinstance(url, str):
+            continue
+        candidate = by_url.get(url)
+        if candidate is None:
+            candidate = by_norm.get(normalize_url(url))
+        if candidate is None or seen.repeat(candidate):
+            continue
+        summary = fit_summary(candidate["title"], str(pick.get("summary") or ""), max_chars, clip=clip)
+        if summary is None:
+            continue
+        picked = dict(candidate)
+        picked["summary"] = summary
+        picked["rationale"] = "LLM pick: newsworthy for this section and the configured taste."
+        picked["record_history"] = True
+        seen.mark(picked)
+        chosen.append(picked)
+    return chosen
+
+
 def pick_news(
     requests: list[dict],
     *,
@@ -2316,9 +2400,10 @@ def pick_news(
     """Pick items for each news section.
 
     ``requests`` entries need section_id, title, purpose, feed_url, prefer_terms,
-    and candidates. ``external_picks`` is a validated picks file. When it is
-    present the model is not called. Returns items by section id, picker
-    metadata, source errors, and history records.
+    and candidates. ``external_picks`` is a validated picks file. A section
+    the file fills is not sent to the model. A section it leaves empty is,
+    when an API key is set. Returns items by section id, picker metadata,
+    source errors, and history records.
     """
     count = item_count if item_count is not None else settings.news_item_count(has_bots, crowded=crowded)
     max_chars = summary_chars if summary_chars is not None else settings.summary_limit(has_bots, crowded=crowded)
@@ -2333,9 +2418,77 @@ def pick_news(
     source = "fallback"
     reason = "no_api_key" if not settings.llm_api_key() else "no_candidates"
     errors: list[dict] = []
-    if external_picks is not None:
-        llm_picks = external_picks
-        reason = "ok"
+    file_mode = external_picks is not None
+    prechosen: dict[str, list[dict]] = {}
+    model_attempted: set[str] = set()
+    file_hit: set[str] = set()
+    model_hit: set[str] = set()
+
+    def section_limit(request: dict) -> int:
+        if isinstance(request.get("item_count"), int) and request["item_count"] > 0:
+            return request["item_count"]
+        return count
+
+    if file_mode:
+        file_by_title = {pick["section"]: pick["items"] for pick in external_picks}
+        missed: list[tuple[dict, list[dict]]] = []
+        for request, eligible in prepared:
+            section_id = str(request.get("section_id") or "")
+            chosen = _match_supplied_picks(
+                eligible,
+                file_by_title.get(request["title"], []),
+                seen,
+                max_chars,
+                section_limit(request),
+                clip=True,
+            )
+            if chosen:
+                prechosen[section_id] = chosen
+                file_hit.add(section_id)
+            else:
+                missed.append((request, eligible))
+        if missed and settings.llm_api_key() and any(eligible for _request, eligible in missed):
+            groups = [
+                (request["title"], request.get("purpose") or "", eligible)
+                for request, eligible in missed
+                if eligible
+            ]
+            try:
+                model_rows = llm_pick(
+                    groups,
+                    count=count,
+                    max_chars=max_chars,
+                    taste=taste if taste is not None else settings.taste(),
+                    opener=opener,
+                    deadline=deadline,
+                    interests=interests,
+                    recent_titles=printed,
+                )
+                model_by_title = {pick["section"]: pick["items"] for pick in model_rows}
+                for request, eligible in missed:
+                    if not eligible:
+                        continue
+                    section_id = str(request.get("section_id") or "")
+                    model_attempted.add(section_id)
+                    chosen = _match_supplied_picks(
+                        eligible,
+                        model_by_title.get(request["title"], []),
+                        seen,
+                        max_chars,
+                        section_limit(request),
+                        clip=True,
+                    )
+                    if chosen:
+                        prechosen[section_id] = chosen
+                        model_hit.add(section_id)
+                reason = "ok"
+            except LLMError as exc:
+                reason = exc.code
+                if exc.code != "no_api_key":
+                    errors.append(_picker_error(exc.code))
+            except Exception:
+                reason = "network"
+                errors.append(_picker_error("network"))
         source = "picks"
     elif settings.llm_api_key() and any(eligible for _request, eligible in prepared):
         groups = [
@@ -2382,28 +2535,27 @@ def pick_news(
         section_count = count
         if isinstance(request.get("item_count"), int) and request["item_count"] > 0:
             section_count = request["item_count"]
-        chosen: list[dict] = []
-        if llm_picks is not None:
-            by_url = {item["url"]: item for item in eligible}
-            for pick in picks_by_title.get(request["title"], []):
-                if len(chosen) >= section_count:
-                    break
-                candidate = by_url.get(pick["url"])
-                if candidate is None or seen.repeat(candidate):
-                    continue
-                summary = fit_summary(candidate["title"], pick["summary"], max_chars)
-                if summary is None:
-                    continue
-                picked = dict(candidate)
-                picked["summary"] = summary
-                picked["rationale"] = "LLM pick: newsworthy for this section and the configured taste."
-                picked["record_history"] = True
-                seen.mark(picked)
-                chosen.append(picked)
-                used_llm = True
         section_id = str(request.get("section_id") or "")
-        if section_id == "local" and not chosen and llm_picks is None:
+        chosen: list[dict] = []
+        model_called = section_id in model_attempted
+        if file_mode:
+            chosen = list(prechosen.get(section_id, []))
+            if chosen:
+                used_llm = True
+        elif llm_picks is not None:
+            chosen = _match_supplied_picks(
+                eligible,
+                picks_by_title.get(request["title"], []),
+                seen,
+                max_chars,
+                section_count,
+            )
+            if chosen:
+                used_llm = True
+        if section_id == "local" and not chosen and (model_called is False) and (file_mode or llm_picks is None):
             items_by_id[section_id] = [_public_item(local_offline_item(request["feed_url"]))]
+            if file_mode:
+                used_fallback = True
             continue
         if section_id != "local" and len(chosen) < section_count:
             likes, dislikes = profile_terms(profile, section_id)
@@ -2418,7 +2570,7 @@ def pick_news(
                 section_id,
             )
             if extra:
-                if llm_picks is not None:
+                if llm_picks is not None or file_mode:
                     used_fallback = True
                 chosen.extend(extra)
         if not chosen:
@@ -2431,17 +2583,21 @@ def pick_news(
                 public.append(_public_item(item))
         items_by_id[request["section_id"]] = public
 
-    if source == "picks":
-        if used_llm and used_fallback:
-            mode = "mixed"
+    if file_mode:
+        if file_hit and not model_hit and not used_fallback:
+            source, mode = "picks", "picks"
             reason = "ok"
-        elif used_llm:
-            mode = "picks"
+        elif model_hit and not file_hit and not used_fallback:
+            source, mode = "llm", "llm"
             reason = "ok"
-        else:
-            mode = "fallback"
+        elif not file_hit and not model_hit:
+            source, mode = "fallback", "fallback"
             if reason == "ok":
-                reason = "no_accepted_picks"
+                reason = "no_accepted_picks" if settings.llm_api_key() else "no_api_key"
+        else:
+            source, mode = "mixed", "mixed"
+            if reason == "ok" or file_hit or model_hit:
+                reason = "ok"
     elif llm_picks is None:
         mode = "fallback"
     elif used_llm and used_fallback:
@@ -2456,7 +2612,9 @@ def pick_news(
             reason = "no_accepted_picks"
             errors.append(_picker_error("no_accepted_picks"))
     model = None
-    if source == "llm" and settings.llm_api_key():
+    if file_mode and model_attempted and settings.llm_api_key():
+        model = settings.llm_model()
+    elif source == "llm" and settings.llm_api_key():
         model = settings.llm_model()
     elif source == "fallback" and settings.llm_api_key() and external_picks is None:
         model = settings.llm_model()
@@ -2702,6 +2860,9 @@ def _read_regular_nofollow(path: Path, limit: int) -> bytes:
 
 
 PICKS_MAX_BYTES = 65536
+CANDIDATES_MAX_BYTES = 256 * 1024
+CANDIDATES_MAX_AGE_SECONDS = 3 * 60 * 60
+CANDIDATES_FUTURE_SKEW_SECONDS = 120
 
 
 class PicksFileError(Exception):
@@ -2791,6 +2952,90 @@ def _validate_picks_document(value: object, digest_date: str) -> dict:
         "picks": _normalize_pick_entries(value["picks"]),
         "shows": _normalize_show_entries(value["shows"]) if "shows" in value else [],
     }
+
+
+def _validate_candidates_document(value: object, digest_date: str) -> dict:
+    if not isinstance(value, dict) or value.get("schema_version") != "1":
+        raise PicksFileError("invalid")
+    if value.get("digest_date") != digest_date:
+        raise PicksFileError("stale")
+    sections = value.get("sections")
+    if not isinstance(sections, list):
+        raise PicksFileError("invalid")
+    cleaned: list[dict] = []
+    for section in sections:
+        if not isinstance(section, dict):
+            raise PicksFileError("invalid")
+        title = section.get("section")
+        purpose = section.get("purpose") if isinstance(section.get("purpose"), str) else ""
+        rows = section.get("candidates")
+        if not isinstance(title, str) or not title.strip() or not isinstance(rows, list):
+            raise PicksFileError("invalid")
+        candidates: list[dict] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                raise PicksFileError("invalid")
+            url = row.get("url")
+            row_title = row.get("title")
+            if not isinstance(url, str) or not url.startswith("http"):
+                raise PicksFileError("invalid")
+            if not isinstance(row_title, str) or not row_title.strip():
+                raise PicksFileError("invalid")
+            summary = row.get("summary") if isinstance(row.get("summary"), str) else ""
+            published = row.get("published_at")
+            if published is not None and not isinstance(published, str):
+                raise PicksFileError("invalid")
+            candidates.append(
+                {
+                    "title": row_title,
+                    "url": url,
+                    "summary": summary,
+                    "published_at": published,
+                }
+            )
+        cleaned.append({"section": title, "purpose": purpose, "candidates": candidates})
+    return {"digest_date": digest_date, "sections": cleaned}
+
+
+def load_candidates(directory: Path, digest_date: str, now: dt.datetime) -> tuple[dict | None, str | None]:
+    """Read this morning's export. A missing file is quiet. A bad file is ignored."""
+    try:
+        return _load_candidates(directory, digest_date, now)
+    except Exception:
+        return None, "candidates ignored: unreadable"
+
+
+def _load_candidates(directory: Path, digest_date: str, now: dt.datetime) -> tuple[dict | None, str | None]:
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", digest_date):
+        return None, "candidates ignored: invalid"
+    path = directory / f"{digest_date}.json"
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return None, None
+    except OSError:
+        return None, "candidates ignored: unreadable"
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        return None, "candidates ignored: unreadable"
+    moment = now if now.tzinfo else now.replace(tzinfo=dt.timezone.utc)
+    age = moment.timestamp() - info.st_mtime
+    if age >= CANDIDATES_MAX_AGE_SECONDS or age < -CANDIDATES_FUTURE_SKEW_SECONDS:
+        return None, "candidates ignored: stale"
+    try:
+        raw = _read_regular_nofollow(path, CANDIDATES_MAX_BYTES + 1)
+    except OSError:
+        return None, "candidates ignored: unreadable"
+    if len(raw) > CANDIDATES_MAX_BYTES:
+        return None, "candidates ignored: file is too large"
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except Exception:
+        return None, "candidates ignored: invalid"
+    try:
+        return _validate_candidates_document(value, digest_date), None
+    except PicksFileError as exc:
+        label = "candidates ignored: stale" if exc.code == "stale" else "candidates ignored: invalid"
+        return None, label
 
 
 def load_picks(directory: Path, digest_date: str) -> tuple[dict | None, str | None]:

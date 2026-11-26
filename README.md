@@ -161,7 +161,7 @@ These failures all fall back to the deterministic picker, and the source file re
 About 15 minutes before 05:00, export the candidate list and let an external bot write `picks/YYYY-MM-DD.json`. The generator does not call a model for that export. See [docs/picks.md](docs/picks.md).
 
 ```bash
-python3 digest_generator.py --export-candidates output/candidates-YYYY-MM-DD.json --date YYYY-MM-DD
+python3 digest_generator.py --export-candidates --date YYYY-MM-DD
 ```
 
 The fallback is deliberately minimal. It runs when no valid picks file is present and the model is unavailable or the call fails. BASTROP prints one fixed line, `Local picks unavailable today (AI offline).`, and does not choose a story. Every other news section prints the newest items from its feeds that are not repeats and that do not contain a death or violence word in the title or the summary (`killed`, `killing`, `dies`, `dead`, `shooting`, `crash`, and the same family of words). There is no idiom exemption and no taste ranking, so a headline such as "the band killed it" is dropped. Likes, dislikes, and prefer terms still order the candidates sent to the model. They do not reorder the fallback. NEARBY SHOWS does not use the model or this fallback. It uses Ticketmaster when a key is set, and the shows array in the picks file otherwise. A summary that only repeats the headline plus the outlet is replaced with `From {outlet}, {date}.` Google News titles that end in ` - Outlet` use the outlet as the source line instead of `news.google.com`.
@@ -172,7 +172,7 @@ The API key is sent only as an `Authorization` header. It is not written into th
 
 ## External picks
 
-See [docs/picks.md](docs/picks.md). The short version: `python3 digest_generator.py --export-candidates <path>` writes the sections, rubrics, up to 12 candidates each, the newest 40 history titles, and the taste note and interests profile. The bot writes `picks/YYYY-MM-DD.json` with the same `picks` objects the model would return, plus `generated_at` and an optional `shows` array. At 05:00 a valid file for today in `DIGEST_TZ` is used instead of the model. A URL that is not one of today's candidates is skipped. A stale, symlinked, or invalid file is ignored. With no Ticketmaster key, NEARBY SHOWS prints the `shows` entries that fall in the usual date window and have not already been mentioned. A Ticketmaster key ignores that array.
+See [docs/picks.md](docs/picks.md). The short version: `python3 digest_generator.py --export-candidates` writes `output/YYYY-MM-DD.json` with the sections, rubrics, up to 12 candidates each, the newest 40 history titles, and the taste note and interests profile. Summaries in that file are budgeted at the crowded limit (200). The bot writes `picks/YYYY-MM-DD.json` with the same `picks` objects the model would return, plus `generated_at` and an optional `shows` array. At 05:00 a fresh export is reused and the news feeds are not fetched again. Weather still is, and Ticketmaster still is when a key is set. A valid picks file is used instead of the model. A URL matches after tracking parameters are removed. A section whose picks all miss goes to the model when a key is set, and otherwise to the fallback. A stale, symlinked, or invalid file is ignored. With no Ticketmaster key, NEARBY SHOWS prints the `shows` entries that fall in the usual date window and have not already been mentioned. A Ticketmaster key ignores that array.
 
 ## Bot updates
 

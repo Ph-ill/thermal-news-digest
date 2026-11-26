@@ -433,6 +433,58 @@ def build_shows_section(
     return {"section": spec.title, "source_feed": TICKETMASTER_EVENTS, "items": items}, errors, records
 
 
+def _requests_from_candidates(document: dict, specs: list) -> list[dict]:
+    """News requests from a fresh export, so 05:00 does not re-fetch the feeds."""
+    by_title = {section["section"]: section for section in document.get("sections") or []}
+    requests: list[dict] = []
+    for spec in specs:
+        if spec.kind != "news":
+            continue
+        exported = by_title.get(spec.title) or {}
+        candidates = []
+        for row in exported.get("candidates") or []:
+            candidates.append(
+                {
+                    "title": row.get("title") or "",
+                    "url": row.get("url") or "",
+                    "summary": row.get("summary") or "",
+                    "published_at": row.get("published_at"),
+                }
+            )
+        feed_url = ""
+        try:
+            feeds = settings.feeds_for(spec.id)
+            if feeds:
+                feed_url = feeds[0].url
+        except Exception:
+            feed_url = ""
+        request = {
+            "section_id": spec.id,
+            "title": spec.title,
+            "purpose": exported.get("purpose") or spec.purpose,
+            "feed_url": feed_url,
+            "prefer_terms": (),
+            "candidates": candidates,
+        }
+        if spec.id == "companies":
+            topics: set[str] = set()
+            try:
+                for feed in settings.feeds_for("companies"):
+                    if not feed.topic or not feed.required:
+                        continue
+                    for item in candidates:
+                        blob = f"{item.get('title') or ''} {item.get('summary') or ''}".casefold()
+                        if any(term in blob for term in feed.required):
+                            topics.add(feed.topic)
+                            break
+            except Exception:
+                topics = set()
+            if len(topics) > 1:
+                request["item_count"] = min(2, len(topics))
+        requests.append(request)
+    return requests
+
+
 def supplied_shows_section(
     digest_day: str,
     entries: list[dict],
@@ -763,6 +815,7 @@ def make_payload(
     persist_history: bool = True,
     history_out: list | None = None,
     picks_directory: Path | None = None,
+    candidates_directory: Path | None = None,
     export_only: bool = False,
 ) -> dict:
     moment = now or dt.datetime.now(dt.timezone.utc)
@@ -780,6 +833,7 @@ def make_payload(
             persist_history=persist_history,
             history_out=history_out,
             picks_directory=picks_directory,
+            candidates_directory=candidates_directory,
             export_only=export_only,
         )
     finally:
@@ -797,6 +851,7 @@ def _make_payload(
     persist_history: bool,
     history_out: list | None,
     picks_directory: Path | None = None,
+    candidates_directory: Path | None = None,
     export_only: bool = False,
 ) -> dict:
     bounded = _guarded(fetcher)
@@ -811,12 +866,18 @@ def _make_payload(
 
     jobs: list[tuple[str, Callable[[], object]]] = []
     feed_plan: list[tuple] = []
+    saved_candidates = None
+    if not export_only:
+        candidates_root = candidates_directory or settings.candidates_dir()
+        saved_candidates, candidates_error = digest_picker.load_candidates(candidates_root, digest_date, moment)
+        if candidates_error:
+            errors.append({"section": "PICKER", "url": "candidates", "error": candidates_error})
     weather_spec = settings.section_by_id("weather")
     if weather_spec is not None and not export_only:
         jobs.append(("weather", WEATHER_POINT, lambda: weather(bounded, digest_date)))
 
     for spec in specs:
-        if spec.kind != "news":
+        if spec.kind != "news" or saved_candidates is not None:
             continue
         try:
             feeds = settings.feeds_for(spec.id)
@@ -894,11 +955,13 @@ def _make_payload(
         }
 
     news_requests: list[dict] = []
+    if saved_candidates is not None:
+        news_requests = _requests_from_candidates(saved_candidates, specs)
     planned_by_section: dict[str, list] = {}
     for key, spec, feed in feed_plan:
         planned_by_section.setdefault(spec.id, []).append((key, spec, feed))
     for spec in specs:
-        if spec.kind != "news" or spec.id not in planned_by_section:
+        if saved_candidates is not None or spec.kind != "news" or spec.id not in planned_by_section:
             continue
         rows = planned_by_section[spec.id]
         collected: list[dict] = []
@@ -1145,13 +1208,14 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--date", default=None)
     parser.add_argument("--out", type=Path)
-    parser.add_argument("--export-candidates", type=Path)
+    parser.add_argument("--export-candidates", nargs="?", const="", default=None)
     args = parser.parse_args(argv)
     day = args.date or digest_date()
     moment = dt.datetime.now(dt.timezone.utc)
     if args.export_candidates is not None:
+        destination = settings.candidates_path(day) if args.export_candidates == "" else Path(args.export_candidates)
         document = make_payload(day, now=moment, persist_history=False, export_only=True)
-        atomic_json(args.export_candidates, document)
+        atomic_json(destination, document)
         count = sum(len(section.get("candidates") or []) for section in document.get("sections") or [])
         print(
             json.dumps(
@@ -1159,7 +1223,7 @@ def main(argv: list[str] | None = None) -> int:
                     "digest_date": document.get("digest_date"),
                     "sections": len(document.get("sections") or []),
                     "candidates": count,
-                    "output": str(args.export_candidates.resolve()),
+                    "output": str(destination.resolve()),
                 },
                 sort_keys=True,
             )

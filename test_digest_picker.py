@@ -2371,6 +2371,7 @@ class ExternalPicksTests(unittest.TestCase):
                 history_file=history_file or picks_dir / "history.json",
                 bot_directory=picks_dir / "bots",
                 picks_directory=picks_dir,
+                candidates_directory=picks_dir / "no-export",
                 persist_history=False,
             )
 
@@ -2420,6 +2421,7 @@ class ExternalPicksTests(unittest.TestCase):
         self.assertEqual(called["n"], 0)
         self.assertEqual(document["schema_version"], "1")
         self.assertEqual(document["digest_date"], "2026-11-26")
+        self.assertEqual(document["summary_max_chars"], 200)
         self.assertIn("taste", document)
         self.assertIn("interests", document)
         self.assertLessEqual(len(document["recent_titles"]), 40)
@@ -2449,6 +2451,16 @@ class ExternalPicksTests(unittest.TestCase):
             with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                 with self.assertRaises(SystemExit):
                     dg.main(["--date", "2026-11-26"])
+        with tempfile.TemporaryDirectory() as temp:
+            with mock.patch.dict(os.environ, {"DIGEST_CANDIDATES_DIR": temp}):
+                with mock.patch.object(
+                    dg,
+                    "make_payload",
+                    return_value={"schema_version": "1", "digest_date": "2026-11-26", "sections": []},
+                ):
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        self.assertEqual(dg.main(["--export-candidates", "--date", "2026-11-26"]), 0)
+            self.assertTrue((Path(temp) / "2026-11-26.json").is_file())
 
     def test_picks_file_beats_the_model_and_rejects_an_unoffered_url(self):
         def opener(request, timeout):
@@ -2597,6 +2609,279 @@ class ExternalPicksTests(unittest.TestCase):
             with mock.patch.dict(os.environ, {"DIGEST_TICKETMASTER_KEY": "tm-test-key"}):
                 keyed = self._payload(root)
             self.assertNotIn("NEARBY SHOWS", [section["section"] for section in keyed["sections"]])
+
+    def test_fresh_export_is_reused_and_a_stale_export_is_refetched(self):
+        moment = dt.datetime(2026, 11, 26, 11, 0, tzinfo=dt.timezone.utc)
+        export_title = "Export only harbor talks stay in the file"
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            fresh = root / "fresh"
+            fresh.mkdir()
+            self._write_export(fresh, export_title, moment.timestamp() - 60)
+            artists = root / "artists.txt"
+            artists.write_text("Sample Band\n", encoding="utf-8")
+            calls: list[str] = []
+
+            def fetcher(url):
+                calls.append(url)
+                if url == dg.WEATHER_POINT or url.startswith("https://api.weather.gov/") or url.startswith(dg.TICKETMASTER_EVENTS):
+                    return b"{}"
+                raise AssertionError(url)
+
+            with mock.patch.dict(
+                os.environ,
+                {"DIGEST_TICKETMASTER_KEY": "tm-test-key", "DIGEST_ARTISTS_FILE": str(artists)},
+            ):
+                payload = dg.make_payload(
+                    "2026-11-26",
+                    fetcher,
+                    now=moment,
+                    history_file=root / "history.json",
+                    bot_directory=root / "bots",
+                    picks_directory=root / "picks",
+                    candidates_directory=fresh,
+                    persist_history=False,
+                )
+            titles = [item["title"] for section in payload["sections"] for item in section["items"] if "title" in item]
+            self.assertIn(export_title, titles)
+            self.assertIn(dg.WEATHER_POINT, calls)
+            self.assertTrue(any(url.startswith(dg.TICKETMASTER_EVENTS) for url in calls))
+            self.assertFalse(any(url.endswith("global.xml") for url in calls))
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            stale = root / "stale"
+            stale.mkdir()
+            self._write_export(stale, export_title, moment.timestamp() - 4 * 60 * 60)
+            calls = []
+            base = self._fetcher(self._global_entries())
+
+            def fetcher(url):
+                calls.append(url)
+                if url == dg.WEATHER_POINT or url.startswith("https://api.weather.gov/") or url.startswith(dg.TICKETMASTER_EVENTS):
+                    return b"{}"
+                return base(url)
+
+            payload = dg.make_payload(
+                "2026-11-26",
+                fetcher,
+                now=moment,
+                history_file=root / "history.json",
+                bot_directory=root / "bots",
+                picks_directory=root / "picks",
+                candidates_directory=stale,
+                persist_history=False,
+            )
+            blob = json.dumps(payload)
+            self.assertNotIn(export_title, blob)
+            self.assertTrue(any(url.endswith("global.xml") for url in calls))
+            self.assertEqual(payload["sections"][1]["items"][0]["title"], LIBRARY)
+            self.assertTrue(any(row["error"] == "candidates ignored: stale" for row in payload["source_errors"]))
+
+    def _write_export(self, directory: Path, title: str, mtime: float) -> None:
+        document = {
+            "schema_version": "1",
+            "digest_date": "2026-11-26",
+            "sections": [
+                {
+                    "section": "GLOBAL",
+                    "purpose": "World news that will still matter by tonight.",
+                    "candidates": [
+                        {
+                            "url": "https://example.com/from-export",
+                            "title": title,
+                            "summary": "This story exists only in the morning export and was not fetched again.",
+                            "published_at": "Thu, 26 Nov 2026 08:00:00 GMT",
+                        }
+                    ],
+                }
+            ],
+        }
+        path = directory / "2026-11-26.json"
+        path.write_text(json.dumps(document), encoding="utf-8")
+        os.utime(path, (mtime, mtime))
+
+    def test_utm_param_matches_a_candidate(self):
+        requests = [
+            {
+                "section_id": "global",
+                "title": "GLOBAL",
+                "purpose": "world",
+                "feed_url": "https://example.com/global",
+                "prefer_terms": (),
+                "candidates": [item(HARBOR, "https://example.com/harbor", HARBOR_SUMMARY)],
+            }
+        ]
+        picked, meta, _errors, _records = dp.pick_news(
+            requests,
+            digest_date="2026-11-26",
+            history=[],
+            has_bots=False,
+            external_picks=[
+                {
+                    "section": "GLOBAL",
+                    "items": [
+                        {
+                            "url": "https://example.com/harbor?utm_source=bot&utm_medium=email",
+                            "summary": HARBOR_SUMMARY,
+                        }
+                    ],
+                }
+            ],
+        )
+        self.assertEqual(picked["global"][0]["title"], HARBOR)
+        self.assertEqual(meta["source"], "picks")
+
+    def test_missed_section_uses_the_model_or_the_fallback(self):
+        requests = [
+            {
+                "section_id": "global",
+                "title": "GLOBAL",
+                "purpose": "world",
+                "feed_url": "https://example.com/global",
+                "prefer_terms": (),
+                "candidates": [
+                    item(LIBRARY, "https://example.com/library", LONG, "Thu, 26 Nov 2026 10:00:00 GMT"),
+                    item(HARBOR, "https://example.com/harbor", HARBOR_SUMMARY),
+                ],
+            },
+            {
+                "section_id": "local",
+                "title": "BASTROP",
+                "purpose": "local",
+                "feed_url": "https://example.com/local",
+                "prefer_terms": (),
+                "candidates": [
+                    item(
+                        "Bastrop brewery opens on Main Street",
+                        "https://example.com/brewery",
+                        "The new taproom pours on Friday and keeps a small kitchen open until nine.",
+                    )
+                ],
+            },
+        ]
+        picks = [
+            {"section": "GLOBAL", "items": [{"url": "https://example.com/harbor", "summary": HARBOR_SUMMARY}]},
+            {
+                "section": "BASTROP",
+                "items": [{"url": "https://example.com/not-offered", "summary": HARBOR_SUMMARY}],
+            },
+        ]
+        prompted: list[list[str]] = []
+
+        def opener(request, timeout):
+            body = json.loads(request.data.decode())
+            user = json.loads(body["messages"][1]["content"])
+            prompted.append([section["section"] for section in user["sections"]])
+            content = json.dumps(
+                {
+                    "picks": [
+                        {
+                            "section": "BASTROP",
+                            "items": [
+                                {
+                                    "url": "https://example.com/brewery",
+                                    "summary": "The new taproom pours on Friday and keeps a small kitchen open until nine.",
+                                }
+                            ],
+                        }
+                    ]
+                }
+            )
+            return FakeResponse(json.dumps({"choices": [{"message": {"content": content}}]}).encode())
+
+        with mock.patch.dict(os.environ, {"DIGEST_LLM_API_KEY": SECRET}):
+            picked, meta, _errors, _records = dp.pick_news(
+                requests,
+                digest_date="2026-11-26",
+                history=[],
+                has_bots=False,
+                opener=opener,
+                external_picks=picks,
+                item_count=1,
+            )
+        self.assertEqual(prompted, [["BASTROP"]])
+        self.assertEqual(picked["global"][0]["title"], HARBOR)
+        self.assertEqual(picked["local"][0]["title"], "Bastrop brewery opens on Main Street")
+        self.assertEqual(meta["source"], "mixed")
+        self.assertNotEqual(picked["local"][0]["title"], dp.PLACEHOLDER_TITLE)
+
+        def refuse(request, timeout):
+            raise AssertionError("no key means the model is not called")
+
+        missed, _meta, _errors, _records = dp.pick_news(
+            requests[:1],
+            digest_date="2026-11-26",
+            history=[],
+            has_bots=False,
+            opener=refuse,
+            external_picks=[
+                {"section": "GLOBAL", "items": [{"url": "https://example.com/not-offered", "summary": HARBOR_SUMMARY}]}
+            ],
+            item_count=1,
+        )
+        self.assertEqual(missed["global"][0]["title"], LIBRARY)
+        self.assertNotEqual(missed["global"][0]["title"], dp.PLACEHOLDER_TITLE)
+        offline, _meta, _errors, _records = dp.pick_news(
+            requests[1:],
+            digest_date="2026-11-26",
+            history=[],
+            has_bots=False,
+            opener=refuse,
+            external_picks=[
+                {"section": "BASTROP", "items": [{"url": "https://example.com/not-offered", "summary": HARBOR_SUMMARY}]}
+            ],
+            item_count=1,
+        )
+        self.assertEqual(offline["local"][0]["title"], dp.LOCAL_OFFLINE_TITLE)
+
+    def test_over_budget_picks_summary_is_clipped_when_crowded(self):
+        summary = "Mediators finished a written ceasefire before dawn"
+        while len(summary) + 1 < 252:
+            summary += " today"
+        summary = summary[:251].rstrip() + "."
+        self.assertEqual(len(summary), 252)
+        self.assertNotIn(".", summary[:-1])
+        picked, _meta, _errors, _records = dp.pick_news(
+            [
+                {
+                    "section_id": "global",
+                    "title": "GLOBAL",
+                    "purpose": "world",
+                    "feed_url": "https://example.com/global",
+                    "prefer_terms": (),
+                    "candidates": [item(HARBOR, "https://example.com/harbor", HARBOR_SUMMARY)],
+                }
+            ],
+            digest_date="2026-11-26",
+            history=[],
+            has_bots=False,
+            crowded=True,
+            external_picks=[{"section": "GLOBAL", "items": [{"url": "https://example.com/harbor", "summary": summary}]}],
+        )
+        printed = picked["global"][0]
+        self.assertEqual(printed["title"], HARBOR)
+        self.assertLessEqual(len(printed["summary"]), 200)
+        self.assertGreaterEqual(len(printed["summary"]), 30)
+        self.assertNotEqual(printed["summary"], summary)
+        self.assertTrue(printed["summary"].endswith("."))
+
+    def test_control_character_show_url_is_rejected(self):
+        os.environ.pop("DIGEST_TICKETMASTER_KEY", None)
+        good = {
+            "artist": "Sample Band",
+            "venue": "Mohawk",
+            "city": "Austin",
+            "date": "2026-11-30",
+            "url": "https://venue.example/e/1",
+        }
+        bad = {**good, "artist": "Other Band", "url": "https://venue.example/e/2\x01"}
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self._write_picks(root, "2026-11-26", [], shows=[bad, good])
+            payload = self._payload(root)
+        shows = next(section for section in payload["sections"] if section["section"] == "NEARBY SHOWS")
+        self.assertEqual([item["url"] for item in shows["items"]], ["https://venue.example/e/1"])
+        self.assertNotIn("\x01", json.dumps(shows))
 
 
 if __name__ == "__main__":

@@ -404,6 +404,17 @@ def picks_dir() -> Path:
     return project_dir() / "picks"
 
 
+def candidates_dir() -> Path:
+    raw = os.environ.get("DIGEST_CANDIDATES_DIR", "").strip()
+    if raw:
+        return Path(raw)
+    return project_dir() / "output"
+
+
+def candidates_path(digest_date: str) -> Path:
+    return candidates_dir() / f"{digest_date}.json"
+
+
 def bot_updates_dir() -> Path:
     raw = os.environ.get("DIGEST_BOT_UPDATES_DIR", "").strip()
     if raw:
