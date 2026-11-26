@@ -67,7 +67,7 @@ With the default reader ids, the second note is headed `Listener: Morning queue 
 
 ## Pictures
 
-Each note is printed as a square picture on the left and a speech bubble on the right. The bubble's tail points at the picture. The heading and the first-person text sit inside the bubble and wrap to the bubble width.
+Each note is printed as a square picture on the left, 144 dots (18 mm), and a speech bubble on the right. The bubble is a rounded comic balloon with an arched top and bottom and a curved, tapered tail pointing at the picture. The heading and the first-person text sit inside the bubble, with space above and below the words and between notes, and wrap to the bubble width.
 
 Pictures live in `DIGEST_AVATARS_DIR` (default `avatars/` inside the project directory). That directory is gitignored. The file name is the slug plus `.png`, `.jpg`, `.jpeg`, or `.webp`, for example `avatars/popcorn.png`. The loader tries those extensions in that order and uses the first one that decodes.
 

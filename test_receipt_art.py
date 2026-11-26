@@ -169,6 +169,10 @@ class WeatherIconTests(unittest.TestCase):
             ("Sunny and breezy", "", False, "sun"),
             ("Hot", "", False, "sun"),
             ("Blizzard Warning", "", False, "snow"),
+            ("Mostly Cloudy then Sunny", "", False, "cloud"),
+            ("Sunny then Mostly Cloudy", "", False, "sun"),
+            ("Sunday", "", False, None),
+            ("Sunday: high 70°F. Mostly Cloudy", "", False, "cloud"),
             ("", "", False, None),
             ("No daytime forecast for 2026-11-26", "", False, None),
         )
@@ -186,11 +190,27 @@ class WeatherIconTests(unittest.TestCase):
             self.assertEqual(icon.mode, "L")
             self.assertGreater(_black(icon), 0)
             self.assertLess(_black(icon), icon.size[0] * icon.size[1])
+        sunday = {"headline": "Sunday: high 70°F. Mostly Cloudy"}
+        self.assertEqual(art.icon_for_item(sunday), "cloud")
+        self.assertIsNone(art.icon_for_item({"title": "Sunday"}))
+        self.assertEqual(art.icon_for_item({"headline": "Mostly Cloudy then Sunny"}), "cloud")
 
     def test_bubble_tail_points_at_the_avatar_side(self):
-        path = art.bubble_path(120, 40, 400, 80, 76)
-        self.assertIn("L106,76", path)
+        path = art.bubble_path(200, 40, 380, 160, 120)
         self.assertTrue(path.startswith("M"))
+        self.assertTrue(path.endswith("Z"))
+        self.assertIn("C", path)
+        self.assertIn("Q", path)
+        tip_x = 200 - art.TAIL_W
+        self.assertIn(f"{tip_x},120", path)
+        self.assertLess(tip_x, 200)
+        self.assertGreaterEqual(art.AVATAR_PX, 128)
+        self.assertLessEqual(art.AVATAR_PX, 144)
+        self.assertGreaterEqual(art.BUBBLE_PAD_Y, 24)
+        self.assertGreaterEqual(art.NOTE_GAP, 24)
+        self.assertGreaterEqual(art.BUBBLE_STROKE, 4)
+        _origin, _width, text_width = rd._bubble_origin()
+        self.assertGreaterEqual(text_width, 340)
 
 
 class ReceiptArtRenderTests(unittest.TestCase):
@@ -234,9 +254,14 @@ class ReceiptArtRenderTests(unittest.TestCase):
                     weather = [mark for mark in metadata["geometry"]["art"] if mark["type"] == "weather"]
                     self.assertEqual(len(bubbles), 4)
                     self.assertEqual(len(avatars_drawn), 3)
+                    self.assertEqual(avatars_drawn[0]["size"], art.AVATAR_PX)
                     self.assertEqual([mark["letter"] for mark in fallbacks], ["S"])
+                    bubbles_by_y = sorted(bubbles, key=lambda mark: mark["y"])
+                    for earlier, later in zip(bubbles_by_y, bubbles_by_y[1:]):
+                        self.assertGreaterEqual(later["y"] - (earlier["y"] + earlier["h"]), art.NOTE_GAP)
                     self.assertEqual(weather[0]["icon"], icon)
                     svg = Path(metadata["svg"]).read_text(encoding="utf-8")
+                    self.assertIn(f'stroke-width="{art.BUBBLE_STROKE}"', svg)
                     self.assertIn("GROK BOT UPDATES", svg)
                     self.assertIn(">S<", svg)
                     self.assertEqual(svg.count("<circle "), 1)
@@ -259,6 +284,30 @@ class ReceiptArtRenderTests(unittest.TestCase):
                     self.assertGreater(bubbles[-1]["h"], art.AVATAR_PX)
             self.assertNotEqual(icons[0], icons[1])
             self.assertLess(max(heights), rd.MAX_HEIGHT_DOTS // 2)
+
+    def test_four_max_length_notes_stay_under_the_length_cap(self):
+        sentence = "I am writing a long first person note so the bubble has to wrap this line. "
+        text = (sentence * 8)[:360]
+        self.assertEqual(len(text), 360)
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            value = fixtures.showcase_payload(
+                "sun",
+                "Thursday: high 70°F, low 48°F. Sunny",
+                "Clear and mild through the afternoon.",
+            )
+            for item in value["sections"][-1]["items"]:
+                item["summary"] = text
+            value["digest_id"] = rd.payload_digest_id(value)
+            metadata = fixtures.ReceiptDigestTests().render_payload(value, root / "long")
+            self.assertLessEqual(metadata["geometry"]["height_dots"], rd.MAX_HEIGHT_DOTS)
+            self.assertFalse(metadata["geometry"]["clipping"])
+            bubbles = [mark for mark in metadata["geometry"]["art"] if mark["type"] == "bubble"]
+            self.assertEqual(len(bubbles), 4)
+            _origin, bubble_w, text_width = rd._bubble_origin()
+            self.assertGreaterEqual(text_width, 340)
+            self.assertLess(bubble_w, rd.WIDTH_DOTS)
+            self.assertGreater(bubbles[-1]["h"], art.AVATAR_PX)
 
 
 if __name__ == "__main__":

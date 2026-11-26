@@ -184,7 +184,7 @@ See [docs/picks.md](docs/picks.md). The short version: `python3 digest_generator
 
 ## Bot updates
 
-See [docs/bot-updates.md](docs/bot-updates.md) for the file name, the JSON schema, the staleness rules, and the receipt layout. The short version: an external process writes `bot-updates/YYYY-MM-DD.json` before 05:00. A bad or stale file is ignored. A good file becomes the GROK BOT UPDATES section, and each news section drops from two items to one so the notes fit under the length cap. Each note is that bot's picture (or a circle with its initial) beside a speech bubble. The bubble text is first person. Film, television, and music notes belong in that file. Nearby concerts are [docs/shows.md](docs/shows.md), not a bot note. The heading can still be renamed with `DIGEST_SECTION_TITLE_BOT_UPDATES`.
+See [docs/bot-updates.md](docs/bot-updates.md) for the file name, the JSON schema, the staleness rules, and the receipt layout. The short version: an external process writes `bot-updates/YYYY-MM-DD.json` before 05:00. A bad or stale file is ignored. A good file becomes the GROK BOT UPDATES section, and each news section drops from two items to one so the notes fit under the length cap. Each note is that bot's picture (or a circle with its initial) beside a comic speech bubble. The bubble text is first person. Film, television, and music notes belong in that file. Nearby concerts are [docs/shows.md](docs/shows.md), not a bot note. The heading can still be renamed with `DIGEST_SECTION_TITLE_BOT_UPDATES`.
 
 ## Deploy
 

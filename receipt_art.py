@@ -20,15 +20,23 @@ import digest_picker
 import digest_settings as settings
 
 
-AVATAR_PX = 72
+# 144 dots is 18 mm on the 8 dot/mm head. A dithered face needs that much
+# before eyes and hair survive; 72 dots (9 mm) printed as noise.
+AVATAR_PX = 144
 AVATAR_MAX_BYTES = 512 * 1024
 AVATAR_MAX_PIXELS = 1024 * 1024
 AVATAR_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp")
-TAIL_W = 14
-TAIL_GAP = 6
-BUBBLE_PAD_X = 12
-BUBBLE_PAD_Y = 10
-BUBBLE_RADIUS = 12
+TAIL_W = 22
+TAIL_GAP = 8
+BUBBLE_PAD_X = 16
+BUBBLE_PAD_Y = 28
+BUBBLE_RADIUS = 48
+# Gap under the last baseline so descenders clear the stroke.
+BUBBLE_INK_BELOW = 8
+# White space between one note's outline and the next.
+NOTE_GAP = 28
+# Dots. Slightly heavier than the section rules so the balloon reads on thermal paper.
+BUBBLE_STROKE = 4
 WEATHER_ICON_PX = 64
 WEATHER_GAP = 12
 
@@ -82,33 +90,76 @@ _CODE_KIND = {
 _RANK = {"sun": 0, "partly": 1, "cloud": 1, "wind": 2, "fog": 3, "rain": 4, "snow": 5, "storm": 6}
 
 
-def bubble_path(x: int, y: int, w: int, h: int, tip_y: int, *, radius: int = BUBBLE_RADIUS, tail: int = TAIL_W) -> str:
-    """Rounded speech bubble whose tail points left, toward an avatar."""
+def _coord(value: float) -> str:
+    return str(int(round(value)))
+
+
+def bubble_radius(width: int, height: int, bulge: int) -> int:
+    """Comic corner. Leave a straight left waist so the tail can sit mid-bubble."""
+    room = max(16, height // 2 - 18)
+    cap = max(12, room - bulge)
+    return max(12, min(BUBBLE_RADIUS, width // 2, height // 2, cap))
+
+
+def bubble_path(
+    x: int,
+    y: int,
+    w: int,
+    h: int,
+    tip_y: int,
+    *,
+    radius: int | None = None,
+    tail: int = TAIL_W,
+) -> str:
+    """Comic balloon: arched body, round corners, curved tail pointing left.
+
+    The tail is two inward cubics that meet at ``tip_y``, which the layout
+    sets to the avatar's vertical center. The arch and the corners stay
+    inside the box; only the tail crosses the left edge.
+    """
     x, y, w, h = int(x), int(y), int(w), int(h)
-    radius = max(4, min(int(radius), w // 2, h // 2))
+    tail = max(8, int(tail))
+    bulge = max(8, min(16, h // 10))
+    if radius is None:
+        radius = bubble_radius(w, h, bulge)
+    else:
+        radius = max(8, min(int(radius), w // 2, h // 2))
+    if 2 * (bulge + radius) > h - 16:
+        bulge = max(0, (h - 2 * radius - 16) // 2)
+    straight_top = y + bulge + radius
+    straight_bot = y + h - bulge - radius
+    if straight_bot - straight_top < 16:
+        radius = max(8, (h - 16) // 2 - bulge)
+        straight_top = y + bulge + radius
+        straight_bot = y + h - bulge - radius
+    span = max(16, straight_bot - straight_top)
+    half = max(8, min(15, span // 2 - 2))
     tip_y = int(tip_y)
-    half = 9
-    top_attach = y + radius + 2
-    bot_attach = y + h - radius - 2
-    y1 = max(top_attach, min(tip_y - half, bot_attach - 2 * half))
-    y2 = min(bot_attach, y1 + 2 * half)
-    y1 = y2 - 2 * half
-    tip_x = x - int(tail)
-    # Tip stays on the straight left edge so it meets the avatar, not the corner.
-    tip_y = max(y1 + 2, min(tip_y, y2 - 2))
+    tip_y = max(straight_top + half, min(tip_y, straight_bot - half))
+    y1 = tip_y - half
+    y2 = tip_y + half
+    tip_x = x - tail
+    mid = x + w / 2.0
+    pull = tail * 0.55
+    # Controls sit toward the tail's center line so each side bows inward
+    # and the outline tapers to a point instead of a triangle.
+    c1x, c1y = x - pull * 0.45, y2 + (tip_y - y2) * 0.72
+    c2x, c2y = tip_x + tail * 0.38, tip_y + (y2 - tip_y) * 0.22
+    c3x, c3y = tip_x + tail * 0.38, tip_y + (y1 - tip_y) * 0.22
+    c4x, c4y = x - pull * 0.45, y1 + (tip_y - y1) * 0.72
     return (
-        f"M{x + radius},{y} "
-        f"H{x + w - radius} "
-        f"A{radius},{radius} 0 0 1 {x + w},{y + radius} "
-        f"V{y + h - radius} "
-        f"A{radius},{radius} 0 0 1 {x + w - radius},{y + h} "
-        f"H{x + radius} "
-        f"A{radius},{radius} 0 0 1 {x},{y + h - radius} "
-        f"V{y2} "
-        f"L{tip_x},{tip_y} "
-        f"L{x},{y1} "
-        f"V{y + radius} "
-        f"A{radius},{radius} 0 0 1 {x + radius},{y} Z"
+        f"M{_coord(x + radius)},{_coord(y + bulge)} "
+        f"Q{_coord(mid)},{_coord(y - bulge)} {_coord(x + w - radius)},{_coord(y + bulge)} "
+        f"A{_coord(radius)},{_coord(radius)} 0 0 1 {_coord(x + w)},{_coord(y + bulge + radius)} "
+        f"V{_coord(y + h - bulge - radius)} "
+        f"A{_coord(radius)},{_coord(radius)} 0 0 1 {_coord(x + w - radius)},{_coord(y + h - bulge)} "
+        f"Q{_coord(mid)},{_coord(y + h + bulge)} {_coord(x + radius)},{_coord(y + h - bulge)} "
+        f"A{_coord(radius)},{_coord(radius)} 0 0 1 {_coord(x)},{_coord(straight_bot)} "
+        f"V{_coord(y2)} "
+        f"C{_coord(c1x)},{_coord(c1y)} {_coord(c2x)},{_coord(c2y)} {_coord(tip_x)},{_coord(tip_y)} "
+        f"C{_coord(c3x)},{_coord(c3y)} {_coord(c4x)},{_coord(c4y)} {_coord(x)},{_coord(y1)} "
+        f"V{_coord(straight_top)} "
+        f"A{_coord(radius)},{_coord(radius)} 0 0 1 {_coord(x + radius)},{_coord(y + bulge)} Z"
     )
 
 
@@ -290,15 +341,29 @@ def _blob(*parts: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
-def _has(blob: str, *words: str, prefix: bool = False) -> bool:
+def _at(blob: str, *words: str, prefix: bool = False, not_day: bool = False) -> int | None:
+    """Index of the earliest word. ``not_day`` matches ``sun`` and ``sunny`` but not ``sunday``."""
+    best: int | None = None
     for word in words:
-        if prefix:
+        if not_day:
+            pattern = rf"(?<![a-z0-9]){re.escape(word)}(?!day)"
+        elif prefix:
             pattern = rf"(?<![a-z0-9]){re.escape(word)}"
         else:
             pattern = rf"(?<![a-z0-9]){re.escape(word)}(?![a-z0-9])"
-        if re.search(pattern, blob):
-            return True
-    return False
+        match = re.search(pattern, blob)
+        if match is not None and (best is None or match.start() < best):
+            best = match.start()
+    return best
+
+
+def _has(blob: str, *words: str, prefix: bool = False) -> bool:
+    return _at(blob, *words, prefix=prefix) is not None
+
+
+def _soonest(*indexes: int | None) -> int | None:
+    found = [index for index in indexes if index is not None]
+    return min(found) if found else None
 
 
 def _kind_from_prose(blob: str) -> str | None:
@@ -310,8 +375,9 @@ def _kind_from_prose(blob: str) -> str | None:
     fog = _has(blob, "fog", prefix=True) or _has(blob, "mist", "haze", "smoke", "dust")
     partly = _has(blob, "partly", "scattered") or _has(blob, "sct", "few")
     wind = _has(blob, "wind", "breez", "gust", prefix=True)
-    cloud = _has(blob, "cloud", prefix=True) or _has(blob, "overcast", "bkn", "ovc")
-    sun = _has(blob, "sun", prefix=True) or _has(blob, "clear", "fair", "skc", "hot")
+    cloud_at = _soonest(_at(blob, "cloud", prefix=True), _at(blob, "overcast", "bkn", "ovc"))
+    # ``sun(?!day)`` matches sunny and a lone sun, and leaves the weekday alone.
+    sun_at = _soonest(_at(blob, "sun", not_day=True), _at(blob, "clear", "fair", "skc", "hot"))
     if storm:
         return "storm"
     if snow:
@@ -322,14 +388,13 @@ def _kind_from_prose(blob: str) -> str | None:
         return "fog"
     if partly:
         return "partly"
-    if cloud and not sun:
-        return "cloud"
-    if sun:
+    if cloud_at is not None or sun_at is not None:
+        # NWS names the sky you have now first: "Mostly Cloudy then Sunny" stays cloudy.
+        if sun_at is None or (cloud_at is not None and cloud_at <= sun_at):
+            return "cloud"
         return "sun"
     if wind:
         return "wind"
-    if cloud:
-        return "cloud"
     return None
 
 
@@ -390,7 +455,9 @@ def classify_weather(short_forecast: str = "", icon: str = "", *, nighttime: boo
 
     Precipitation and storms win over sky cover. Wind wins over a clear icon
     code (``wind_skc``) and loses to an explicit sunny or cloudy sentence.
-    An empty description returns None so a missing forecast is not given a cloud.
+    When both cloud and sun are named, the earlier word wins, and "Sunday"
+    is not a sunny forecast. An empty description returns None so a missing
+    forecast is not given a cloud.
     """
     if nighttime is None:
         nighttime = _night_from_icon(icon)

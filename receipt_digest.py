@@ -423,26 +423,32 @@ def _place_bots(block: dict, section: dict, y: int, fonts: dict) -> tuple[int, i
     """Avatar on the left, speech bubble on the right. Returns the y under the last bubble."""
     bubble_x, bubble_w, text_width = _bubble_origin()
     text_x = bubble_x + receipt_art.BUBBLE_PAD_X
-    y += 6
+    y += 16
     total_lines = 0
     headline_chars = 0
     printable_chars = 0
     for item_index, item in enumerate(section["items"]):
         if item_index:
-            y += 8
+            y += receipt_art.NOTE_GAP
         grouped = (
             ("headline", item["headline_lines"], BODY_LINE_HEIGHT, BODY_FONT_SIZE),
             ("detail", item["detail_lines"], DETAIL_LINE_HEIGHT, 4),
         )
+        line_start = len(block["lines"])
         _baseline, count, last = _append_lines(
             block, item_index, fonts, grouped, text_x, y + receipt_art.BUBBLE_PAD_Y, text_width
         )
         total_lines += count
-        bubble_h = max(receipt_art.AVATAR_PX, last + 8 - y + receipt_art.BUBBLE_PAD_Y)
-        if bubble_h <= receipt_art.AVATAR_PX + 4:
-            avatar_y = y + max(0, (bubble_h - receipt_art.AVATAR_PX) // 2)
-        else:
-            avatar_y = y
+        natural = last + receipt_art.BUBBLE_INK_BELOW - y + receipt_art.BUBBLE_PAD_Y
+        bubble_h = max(receipt_art.AVATAR_PX, natural)
+        slack = bubble_h - natural
+        if slack > 0:
+            shift = slack // 2
+            for line in block["lines"][line_start:]:
+                line["y"] += shift
+        # The face stays centered on the balloon so the tail meets it on the waist,
+        # not in the corner of a tall note.
+        avatar_y = y + max(0, (bubble_h - receipt_art.AVATAR_PX) // 2)
         block["bubbles"].append(
             {
                 "x": bubble_x,
@@ -599,16 +605,21 @@ def build_svg(payload: dict) -> tuple[str, dict]:
         )
         for bubble in block["bubbles"]:
             path = receipt_art.bubble_path(bubble["x"], bubble["y"], bubble["w"], bubble["h"], bubble["tip_y"])
-            svg.append(f'<path d="{path}" fill="white" stroke="black" stroke-width="3"/>')
+            svg.append(
+                f'<path d="{path}" fill="white" stroke="black" stroke-width="{receipt_art.BUBBLE_STROKE}" '
+                f'stroke-linejoin="round" stroke-linecap="round"/>'
+            )
             art.append({"type": "bubble", "x": bubble["x"], "y": bubble["y"], "w": bubble["w"], "h": bubble["h"]})
         for badge in block["badges"]:
             radius = receipt_art.AVATAR_PX // 2 - 2
+            letter_px = max(32, receipt_art.AVATAR_PX * 32 // 72)
+            letter_dy = letter_px * 11 // 32
             svg.append(
-                f'<circle cx="{badge["cx"]}" cy="{badge["cy"]}" r="{radius}" fill="white" stroke="black" stroke-width="3"/>'
+                f'<circle cx="{badge["cx"]}" cy="{badge["cy"]}" r="{radius}" fill="white" stroke="black" stroke-width="{receipt_art.BUBBLE_STROKE}"/>'
             )
             svg.append(
-                f'<text x="{badge["cx"]}" y="{badge["cy"] + 11}" text-anchor="middle" '
-                f'font-family="DejaVu Sans Mono" font-size="32" font-weight="bold" fill="black">{html.escape(badge["letter"])}</text>'
+                f'<text x="{badge["cx"]}" y="{badge["cy"] + letter_dy}" text-anchor="middle" '
+                f'font-family="DejaVu Sans Mono" font-size="{letter_px}" font-weight="bold" fill="black">{html.escape(badge["letter"])}</text>'
             )
             art.append(
                 {
@@ -762,7 +773,7 @@ def render(source: Path, output_dir: Path) -> dict:
         "source_sha256": hashlib.sha256(raw.encode("utf-8")).hexdigest(),
         "source_errors": payload.get("source_errors", []),
         "digest_id": digest_id,
-        "profile": "receipt-80mm-news-v7",
+        "profile": "receipt-80mm-news-v8",
         "geometry": geometry,
         "raster_black_bbox": list(bbox),
         "raster_black_ratio": round(black_ratio, 6),
