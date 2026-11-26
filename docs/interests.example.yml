@@ -1,0 +1,42 @@
+# Example interests. Copy this file outside the repo and set DIGEST_PROFILE_FILE.
+# Plain text in this shape, or a JSON object with the same keys. Do not put names,
+# addresses, or employers in the file.
+# Lines under the top likes/dislikes apply to every section. A section name adds more.
+
+likes:
+  - cerebral sci-fi
+  - space
+  - horror
+  - local food and drink openings
+dislikes:
+  - politics
+  - celebrity gossip
+  - sports
+
+local:
+  likes:
+    - new restaurants
+    - bars and breweries
+    - coffee shops
+    - live music
+    - outdoor activities
+  dislikes:
+    - city council
+    - school board
+    - crime
+
+companies:
+  likes:
+    - launches
+    - milestones
+    - company announcements
+  dislikes:
+    - stock prices
+    - market chatter
+
+global:
+  likes:
+    - reported events
+  dislikes:
+    - celebrity gossip
+    - sports

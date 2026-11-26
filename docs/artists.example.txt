@@ -1,0 +1,5 @@
+# Placeholder artists. One name per line.
+# Copy this file outside the repo and set DIGEST_ARTISTS_FILE to that copy.
+# Do not commit a real list.
+Artist Example
+The Sample Band

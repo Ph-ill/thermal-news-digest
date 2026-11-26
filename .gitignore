@@ -3,6 +3,14 @@
 !.env.example
 output/
 state.json
+state.json.corrupt-*
+*.corrupt-*
+digest-history.json
+bot-updates/
+interests.yml
+interests.yaml
+interests.txt
+artists.txt
 print.lock
 *.tspl
 __pycache__/
