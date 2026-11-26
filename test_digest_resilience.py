@@ -262,6 +262,40 @@ class ModelFailureTests(unittest.TestCase):
         self.assertNotIn("taste_profile", payload)
         self.assertTrue(payload["digest_id"])
 
+    def test_a_full_edition_leaves_the_model_thirty_seconds(self):
+        budget = dg.Budget(75)
+        token = dg._budget_var.set(budget)
+        self.addCleanup(dg._budget_var.reset, token)
+        budget.deadline = time.monotonic() + 20
+        self.assertFalse(dg.feeds_may_fetch())
+        budget.deadline = time.monotonic() + 50
+        self.assertTrue(dg.feeds_may_fetch())
+        short = dg.Budget(5)
+        short_token = dg._budget_var.set(short)
+        self.addCleanup(dg._budget_var.reset, short_token)
+        short.deadline = time.monotonic() + 4
+        self.assertTrue(dg.feeds_may_fetch())
+
+        calls = []
+
+        def fetcher(url):
+            calls.append(url)
+            return b"{}"
+
+        with mock.patch.object(dg.Budget, "remaining", return_value=10.0):
+            dg.make_payload(
+                "2026-11-26",
+                fetcher,
+                now=NOW,
+                history_file=Path(tempfile.gettempdir()) / "unused-history-reserve.json",
+                bot_directory=Path(tempfile.gettempdir()) / "unused-bots-reserve",
+                budget_seconds=75,
+                persist_history=False,
+            )
+        self.assertTrue(calls)
+        self.assertTrue(all("api.weather.gov" in url for url in calls))
+        self.assertFalse(any("news.google" in url or "ticketmaster" in url for url in calls))
+
 
 class WeatherSplitTests(unittest.TestCase):
     def test_split_day_uses_the_higher_daytime_and_a_later_night(self):

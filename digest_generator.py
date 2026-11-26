@@ -95,10 +95,29 @@ WEATHER_POINT = _weather_point()
 
 class Budget:
     def __init__(self, seconds: float):
-        self.deadline = time.monotonic() + max(0.0, seconds)
+        self.seconds = max(0.0, float(seconds))
+        self.deadline = time.monotonic() + self.seconds
 
     def remaining(self) -> float:
         return self.deadline - time.monotonic()
+
+
+# A full edition stops new feed and show fetches once this much time would be left for the model.
+LLM_RESERVE_SECONDS = 30.0
+
+
+def feeds_may_fetch() -> bool:
+    """True when another feed or show call would still leave the model its slice.
+
+    A short budget cannot spare 30 seconds, so tests and retries keep fetching
+    until the budget itself is gone.
+    """
+    budget = _budget_var.get()
+    if budget is None:
+        return True
+    if budget.seconds < LLM_RESERVE_SECONDS + FETCH_TIMEOUT_CAP + 5:
+        return budget.remaining() >= 0.05
+    return budget.remaining() > LLM_RESERVE_SECONDS + FETCH_TIMEOUT_CAP
 
 
 _budget_var: contextvars.ContextVar[Budget | None] = contextvars.ContextVar("digest_budget", default=None)
@@ -265,6 +284,8 @@ def build_shows_section(
     errors: list[dict] = []
     found: list[dict] = []
     for artist in artists:
+        if not feeds_may_fetch():
+            break
         # The request URL contains the API key. Errors cite the bare endpoint instead.
         url = ticketmaster_events_url(artist, start, end)
         try:
@@ -586,6 +607,8 @@ def _make_payload(
         public_urls: list[str] = []
         failures = 0
         for feed in feeds:
+            if not feeds_may_fetch():
+                break
             public = digest_picker.strip_userinfo(feed.url)
             public_urls.append(public)
             try:

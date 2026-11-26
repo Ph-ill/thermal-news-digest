@@ -1,6 +1,6 @@
 # Nearby shows
 
-NEARBY SHOWS lists upcoming concerts by artists in a private list, within about an hour's drive of Bastrop, Texas. The default search is a 50 mile radius around the public city center, which covers Austin. A venue whose coordinates fall outside that radius is dropped. A venue with no coordinates is kept only when its city is nearby (Bastrop, Austin, Elgin, Smithville, Cedar Creek, Lockhart, San Marcos, Round Rock, Pflugerville, Manor, Georgetown, Kyle, Buda, La Grange, or Giddings). Houston and Dallas are dropped. It is omitted when there is nothing to print. The other sections then keep their usual space, the same way they do when BOT UPDATES is absent.
+NEARBY SHOWS lists upcoming concerts by artists in a private list, within about an hour's drive of Bastrop, Texas. The default search is a 50 mile radius around the public city center, which covers Austin. A venue whose coordinates fall outside that radius is dropped. A venue with no coordinates is kept only when its city is inside that radius, including Bastrop, Austin, Elgin, Smithville, Cedar Creek, Lockhart, San Marcos, Round Rock, and the smaller towns Ticketmaster may name (McDade, Paige, Red Rock, Rockne, Dale, Taylor, Hutto, Del Valle, Luling, Seguin, and the rest of that list). Houston and Dallas are dropped. When a venue has coordinates, those decide, and the city name does not override them. It is omitted when there is nothing to print. The other sections then keep their usual space, the same way they do when BOT UPDATES is absent.
 
 ## Artist file
 
