@@ -17,23 +17,19 @@ DEFAULT_SECTION_ORDER = (
     "weather",
     "global",
     "local",
-    "events",
-    "markets",
-    "uk",
-    "film",
+    "companies",
+    "shows",
     "bot_updates",
 )
 
-OPTIONAL_SECTION_IDS = frozenset({"bot_updates"})
+OPTIONAL_SECTION_IDS = frozenset({"shows", "bot_updates"})
 
 DEFAULT_TITLES = {
     "weather": "WEATHER",
     "global": "GLOBAL",
-    "local": "LOCAL",
-    "events": "EVENTS TODAY / SOON",
-    "markets": "SPACEX/SPACE STOCK",
-    "uk": "UK",
-    "film": "FILM/TV",
+    "local": "BASTROP",
+    "companies": "SPACEX & EARTH FUNERAL",
+    "shows": "NEARBY SHOWS",
     "bot_updates": "BOT UPDATES",
 }
 
@@ -41,10 +37,8 @@ TITLE_ENV = {
     "weather": "DIGEST_SECTION_TITLE_WEATHER",
     "global": "DIGEST_SECTION_TITLE_GLOBAL",
     "local": "DIGEST_SECTION_TITLE_LOCAL",
-    "events": "DIGEST_SECTION_TITLE_EVENTS",
-    "markets": "DIGEST_SECTION_TITLE_MARKETS",
-    "uk": "DIGEST_SECTION_TITLE_UK",
-    "film": "DIGEST_SECTION_TITLE_FILM",
+    "companies": "DIGEST_SECTION_TITLE_COMPANIES",
+    "shows": "DIGEST_SECTION_TITLE_SHOWS",
     "bot_updates": "DIGEST_SECTION_TITLE_BOT_UPDATES",
 }
 
@@ -52,31 +46,49 @@ SECTION_KINDS = {
     "weather": "weather",
     "global": "news",
     "local": "news",
-    "events": "events",
-    "markets": "news",
-    "uk": "news",
-    "film": "news",
+    "companies": "news",
+    "shows": "shows",
     "bot_updates": "bot_updates",
 }
 
 PURPOSES = {
-    "weather": "Daytime forecast for the configured place.",
-    "global": "World news that will still matter by tonight. Prefer reported events over columns.",
-    "local": "Local news that affects daily life in the configured area.",
-    "events": "Verified events from the configured calendars.",
-    "markets": "News about the configured market interests. Skip promotional stock tips and buy alerts.",
-    "uk": "UK news with a clear event, decision, or public impact.",
-    "film": "Film and television the configured taste would actually care about.",
+    "weather": "Daytime forecast for Bastrop, Texas.",
+    "global": "World news that will still matter by tonight. Prefer reported events over columns. Follow the interests profile.",
+    "local": (
+        "New openings and things to do in Bastrop and nearby: restaurants, bars, breweries, "
+        "coffee shops, shops, markets, live music, and outdoor activities in Bastrop, Smithville, "
+        "Elgin, Cedar Creek, or east Austin. Skip city council, government, school board, crime, and obituaries."
+    ),
+    "companies": (
+        "Company news about SpaceX and about Earth Funeral, the human-composting company. "
+        "Prefer launches, milestones, facilities, and press. Skip stock prices and market chatter. "
+        "If one company has no real story, leave it out. Do not fill the gap with unrelated items."
+    ),
+    "shows": "Upcoming concerts by the configured artists within about an hour of Bastrop.",
     "bot_updates": "Notes dropped off by the household's assistant bots.",
 }
 
+# Public city center of Bastrop, Texas. Not a street address.
+DEFAULT_LAT = "30.1105"
+DEFAULT_LON = "-97.3153"
 DEFAULT_GLOBAL_FEED = "https://feeds.bbci.co.uk/news/world/rss.xml"
-DEFAULT_UK_FEED = "https://feeds.bbci.co.uk/news/uk/rss.xml"
-DEFAULT_FILM_FEED = "https://www.hollywoodreporter.com/c/movies/movie-news/feed/"
-DEFAULT_MARKETS_QUERY = "SpaceX OR Rocket Lab OR ASTS stock"
+# Community Impact documents RSS at /rss/. The Bastrop edition page does not currently publish its own feed.
+DEFAULT_COMMUNITY_IMPACT_FEED = "https://communityimpact.com/rss/"
+DEFAULT_EATER_AUSTIN_FEED = "https://austin.eater.com/rss/index.xml"
+DEFAULT_LOCAL_QUERY = (
+    'Bastrop (restaurant OR bar OR brewery OR coffee OR opening OR "now open" OR market '
+    'OR "live music" OR trail OR park OR festival)'
+)
+DEFAULT_NEARBY_QUERY = (
+    '(Smithville OR Elgin OR "Cedar Creek") (Texas) (restaurant OR bar OR brewery OR opening '
+    'OR market OR festival OR "live music" OR trail)'
+)
+DEFAULT_EAST_AUSTIN_QUERY = '"east Austin" (restaurant OR bar OR brewery OR coffee OR opening OR "live music" OR market)'
+DEFAULT_SPACEX_QUERY = '"SpaceX" (Starship OR Falcon OR Starlink OR launch OR mission OR NASA)'
+DEFAULT_EARTH_QUERY = '"Earth Funeral" (compost OR "soil transformation" OR "organic reduction" OR facility OR opens OR announces)'
 DEFAULT_TASTE = (
-    "mystery-box world-building, character-driven thrillers, action anime, "
-    "westerns, offbeat adult animation; exclude generic superheroes."
+    "cerebral sci-fi, space, horror, and new local food and drink openings; "
+    "skip politics, celebrity gossip, and sports."
 )
 
 MAX_NEWS_ITEMS = 3
@@ -227,30 +239,130 @@ def google_news(query: str) -> str:
     )
 
 
-def film_terms() -> tuple[str, ...]:
-    raw = env_or("DIGEST_FILM_TERMS", "anime,thriller,western,animation")
-    return tuple(part.strip().casefold() for part in raw.split(",") if part.strip())
+@dataclass(frozen=True)
+class FeedSpec:
+    url: str
+    topic: str = ""
+    # When set, a candidate must contain one of these phrases. Stops a wide feed from padding a section.
+    required: tuple[str, ...] = ()
+    # Wide local feeds (a site-wide RSS, an Austin food blog) must name the area.
+    require_place: bool = False
+
+
+def _split_urls(raw: str) -> tuple[str, ...]:
+    return tuple(part.strip() for part in raw.split(",") if part.strip())
+
+
+def _explicit_feeds(names: tuple[str, ...], topic: str = "", required: tuple[str, ...] = ()) -> tuple[FeedSpec, ...] | None:
+    for name in names:
+        raw = os.environ.get(name, "").strip()
+        if raw:
+            return tuple(FeedSpec(url, topic, required) for url in _split_urls(raw))
+    return None
+
+
+def feeds_for(section_id: str) -> tuple[FeedSpec, ...]:
+    """RSS sources for one news section. An explicit env list replaces the defaults."""
+    if section_id == "global":
+        explicit = _explicit_feeds(("DIGEST_GLOBAL_FEED",))
+        if explicit:
+            return explicit
+        return (FeedSpec(DEFAULT_GLOBAL_FEED),)
+    if section_id == "local":
+        explicit = _explicit_feeds(("DIGEST_LOCAL_FEEDS", "DIGEST_LOCAL_FEED"), topic="local")
+        if explicit:
+            return explicit
+        query = env_or("DIGEST_LOCAL_NEWS_QUERY", "")
+        if query:
+            return (FeedSpec(google_news(query), "local"),)
+        return (
+            FeedSpec(google_news(DEFAULT_LOCAL_QUERY), "local", (), True),
+            FeedSpec(google_news(DEFAULT_NEARBY_QUERY), "local", (), True),
+            FeedSpec(google_news(DEFAULT_EAST_AUSTIN_QUERY), "local", (), True),
+            FeedSpec(env_or("DIGEST_COMMUNITY_IMPACT_FEED", DEFAULT_COMMUNITY_IMPACT_FEED), "local", (), True),
+            FeedSpec(env_or("DIGEST_EATER_AUSTIN_FEED", DEFAULT_EATER_AUSTIN_FEED), "local", (), True),
+        )
+    if section_id == "companies":
+        explicit = _explicit_feeds(("DIGEST_COMPANIES_FEEDS", "DIGEST_COMPANIES_FEED"))
+        if explicit:
+            return explicit
+        spacex = os.environ.get("DIGEST_SPACEX_FEED", "").strip() or google_news(
+            env_or("DIGEST_SPACEX_QUERY", DEFAULT_SPACEX_QUERY)
+        )
+        earth = os.environ.get("DIGEST_EARTH_FUNERAL_FEED", "").strip() or google_news(
+            env_or("DIGEST_EARTH_FUNERAL_QUERY", DEFAULT_EARTH_QUERY)
+        )
+        return (
+            FeedSpec(spacex, "spacex", ("spacex", "starship", "falcon", "starlink")),
+            FeedSpec(earth, "earth", ("earth funeral",)),
+        )
+    raise KeyError(section_id)
 
 
 def news_feed(section_id: str) -> tuple[str, tuple[str, ...]]:
-    """Return (feed URL, preferred terms) for one RSS section."""
-    if section_id == "global":
-        return env_or("DIGEST_GLOBAL_FEED", DEFAULT_GLOBAL_FEED), ()
-    if section_id == "local":
-        explicit = os.environ.get("DIGEST_LOCAL_FEED", "").strip()
-        if explicit:
-            return explicit, ()
-        return google_news(env_or("DIGEST_LOCAL_NEWS_QUERY", "Springfield")), ()
-    if section_id == "markets":
-        explicit = os.environ.get("DIGEST_MARKETS_FEED", "").strip()
-        if explicit:
-            return explicit, ()
-        return google_news(env_or("DIGEST_MARKETS_NEWS_QUERY", DEFAULT_MARKETS_QUERY)), ()
-    if section_id == "uk":
-        return env_or("DIGEST_UK_FEED", DEFAULT_UK_FEED), ()
-    if section_id == "film":
-        return env_or("DIGEST_FILM_FEED", DEFAULT_FILM_FEED), film_terms()
-    raise KeyError(section_id)
+    """Primary feed URL. Tests and overrides that want every source use feeds_for."""
+    feeds = feeds_for(section_id)
+    return feeds[0].url, feeds[0].required
+
+
+def fresh_hours() -> int:
+    return env_int("DIGEST_FRESH_HOURS", 36, 6, 168)
+
+
+def company_stale_hours() -> int:
+    """How old a company story may be when that company has nothing newer."""
+    return env_int("DIGEST_COMPANY_STALE_HOURS", 24 * 14, 36, 24 * 60)
+
+
+def profile_path() -> Path | None:
+    raw = os.environ.get("DIGEST_PROFILE_FILE", "").strip()
+    if not raw:
+        return None
+    return Path(raw)
+
+
+def artists_path() -> Path | None:
+    raw = os.environ.get("DIGEST_ARTISTS_FILE", "").strip()
+    if not raw:
+        return None
+    return Path(raw)
+
+
+def ticketmaster_key() -> str:
+    return os.environ.get("DIGEST_TICKETMASTER_KEY", "").strip()
+
+
+def shows_lat() -> float:
+    try:
+        return float(env_or("DIGEST_SHOWS_LAT", DEFAULT_LAT))
+    except ValueError:
+        return float(DEFAULT_LAT)
+
+
+def shows_lon() -> float:
+    try:
+        return float(env_or("DIGEST_SHOWS_LON", DEFAULT_LON))
+    except ValueError:
+        return float(DEFAULT_LON)
+
+
+def shows_radius_miles() -> int:
+    return env_int("DIGEST_SHOWS_RADIUS_MILES", 50, 5, 150)
+
+
+def shows_horizon_days() -> int:
+    return env_int("DIGEST_SHOWS_HORIZON_DAYS", 90, 7, 180)
+
+
+def shows_configured() -> bool:
+    path = artists_path()
+    if not ticketmaster_key() or path is None or not path.is_file():
+        return False
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    return any(line.split("#", 1)[0].strip() for line in text.splitlines())
 
 
 def taste() -> str:
@@ -261,14 +373,14 @@ def candidates_per_section() -> int:
     return env_int("DIGEST_CANDIDATES_PER_SECTION", 16, 10, 20)
 
 
-def news_item_count(has_bots: bool) -> int:
-    if has_bots:
+def news_item_count(has_bots: bool, *, crowded: bool = False) -> int:
+    if has_bots or crowded:
         return env_int("DIGEST_ITEMS_WITH_BOTS", 1, 1, MAX_NEWS_ITEMS)
     return env_int("DIGEST_ITEMS_WITHOUT_BOTS", 2, 1, MAX_NEWS_ITEMS)
 
 
-def summary_limit(has_bots: bool) -> int:
-    if has_bots:
+def summary_limit(has_bots: bool, *, crowded: bool = False) -> int:
+    if has_bots or crowded:
         return env_int("DIGEST_SUMMARY_CHARS_WITH_BOTS", 200, 80, 420)
     return env_int("DIGEST_SUMMARY_CHARS_WITHOUT_BOTS", 300, 80, 520)
 

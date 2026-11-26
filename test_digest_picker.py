@@ -26,12 +26,7 @@ for _name in list(os.environ):
 os.environ["DIGEST_LLM_API_KEY"] = ""
 os.environ.update(
     {
-        "DIGEST_LOCATION_LABEL": "near Springfield",
-        "DIGEST_NEIGHBORHOOD_EVENTS_URL": "https://maplegrove.example.org/events/",
-        "DIGEST_NEIGHBORHOOD_NAME": "Maple Grove",
-        "DIGEST_NEIGHBORHOOD_MARKERS": "maple grove,100 main street",
-        "DIGEST_CHAMBER_EVENTS_URL": "https://business.chamber.example.com/eventcalendar",
-        "DIGEST_LOCAL_CITY": "Springfield",
+        "DIGEST_LOCATION_LABEL": "Bastrop, TX",
         "DIGEST_TZ": "America/Chicago",
     }
 )
@@ -124,6 +119,8 @@ class PickerTests(unittest.TestCase):
         self.assertTrue(dp.is_obituary("Death of a long-serving clerk shocks the town"))
         self.assertTrue(dp.is_obituary("Driver killed in a downtown collision"))
         self.assertFalse(dp.is_obituary("Senate killed the bill"))
+        self.assertFalse(dp.is_obituary("The bill died in committee"))
+        self.assertFalse(dp.is_obituary("The amendment was killed in committee"))
         self.assertTrue(dp.is_obituary("The clerk was killed overnight"))
         self.assertTrue(dp.is_obituary("A guard killed by an intruder"))
         kept = dp.fallback_pick(
@@ -757,89 +754,101 @@ class GeneratorTests(unittest.TestCase):
             },
         ]
         shared = "https://example.com/shared-story"
+        os.environ["DIGEST_GLOBAL_FEED"] = "https://example.com/global.xml"
+        os.environ["DIGEST_LOCAL_FEED"] = "https://example.com/local.xml"
+        os.environ["DIGEST_SPACEX_FEED"] = "https://example.com/spacex.xml"
+        os.environ["DIGEST_EARTH_FUNERAL_FEED"] = "https://example.com/earth.xml"
+        for name in (
+            "DIGEST_GLOBAL_FEED",
+            "DIGEST_LOCAL_FEED",
+            "DIGEST_SPACEX_FEED",
+            "DIGEST_EARTH_FUNERAL_FEED",
+        ):
+            self.addCleanup(os.environ.pop, name, None)
         feeds = {}
         for spec in settings.sections():
             if spec.kind != "news":
                 continue
-            url, _terms = settings.news_feed(spec.id)
-            if spec.id == "film":
-                entries = [
-                    {
-                        "title": "Studio announces a sequel",
-                        "url": "https://www.hollywoodreporter.com/sequel",
-                        "date": "Thu, 26 Nov 2026 10:00:00 GMT",
-                        "summary": "The studio announced a sequel and named the director, the city, and the month cameras roll.",
-                    },
-                    {
-                        "title": "A restored western screens all weekend",
-                        "url": "https://www.hollywoodreporter.com/western",
-                        "date": "Thu, 26 Nov 2026 08:00:00 GMT",
-                        "summary": "The western screens all weekend at the small downtown house, with one show each afternoon.",
-                    },
-                ]
-            elif spec.id == "markets":
-                entries = [
-                    {
-                        "title": "ASTS stock last chance to buy before the open",
-                        "url": "https://news.google.com/rss/articles/spam",
-                        "date": "Thu, 26 Nov 2026 10:00:00 GMT",
-                        "summary": "ASTS stock last chance to buy before the open Tip Sheet",
-                    },
-                    {
-                        "title": "Launch firm wins a civil science contract",
-                        "url": "https://example.com/contract",
-                        "date": "Thu, 26 Nov 2026 08:00:00 GMT",
-                        "summary": "The firm won a civil contract to fly two science missions next spring, including ground support.",
-                    },
-                ]
-            elif spec.id == "global":
-                entries = [
-                    {
-                        "title": "Editor dies at 90",
-                        "url": "https://example.com/obit",
-                        "date": "Thu, 26 Nov 2026 11:00:00 GMT",
-                        "summary": "An obituary for an editor who dies at 90.",
-                    },
-                    {
-                        "title": "Harbor talks end with a written ceasefire",
-                        "url": shared,
-                        "date": "Thu, 26 Nov 2026 09:00:00 GMT",
-                        "summary": "Mediators said both sides signed the text before dawn and set Friday for the first aid ship.",
-                    },
-                ]
-            elif spec.id == "uk":
-                entries = [
-                    {
-                        "title": "Harbor talks end with a written ceasefire",
-                        "url": shared + "?utm_source=uk",
-                        "date": "Thu, 26 Nov 2026 09:30:00 GMT",
-                        "summary": "Mediators said both sides signed the text before dawn and set Friday for the first aid ship.",
-                    },
-                    {
-                        "title": "Rail board publishes the weekend map",
-                        "url": "https://example.com/rail",
-                        "date": "Thu, 26 Nov 2026 08:00:00 GMT",
-                        "summary": "Engineers reopened the main line after replacing the cracked span and posted a shorter weekend map.",
-                    },
-                ]
-            else:
-                entries = [
-                    {
-                        "title": f"{spec.title} council adopts the annual budget - Springfield Ledger",
-                        "url": f"https://news.google.com/rss/articles/{spec.id}",
-                        "date": "Thu, 26 Nov 2026 08:00:00 GMT",
-                        "summary": f"{spec.title} council adopts the annual budget Springfield Ledger",
-                    }
-                ]
-            feeds[url] = rss(entries)
+            for feed in settings.feeds_for(spec.id):
+                if spec.id == "global":
+                    entries = [
+                        {
+                            "title": "Editor dies at 90",
+                            "url": "https://example.com/obit",
+                            "date": "Thu, 26 Nov 2026 11:00:00 GMT",
+                            "summary": "An obituary for an editor who dies at 90.",
+                        },
+                        {
+                            "title": "Old ridge survey sits in a drawer",
+                            "url": "https://example.com/old-ridge",
+                            "date": "Mon, 23 Nov 2026 08:00:00 GMT",
+                            "summary": "The survey was filed three days ago and has not changed since the instruments came home.",
+                        },
+                        {
+                            "title": "Harbor talks end with a written ceasefire",
+                            "url": shared,
+                            "date": "Thu, 26 Nov 2026 09:00:00 GMT",
+                            "summary": "Mediators said both sides signed the text before dawn and set Friday for the first aid ship.",
+                        },
+                    ]
+                elif spec.id == "local":
+                    entries = [
+                        {
+                            "title": "City council adopts the annual budget",
+                            "url": "https://example.com/council",
+                            "date": "Thu, 26 Nov 2026 10:00:00 GMT",
+                            "summary": "The city council adopted the annual budget after a long evening meeting in the chambers.",
+                        },
+                        {
+                            "title": "Harbor talks end with a written ceasefire",
+                            "url": shared + "?utm_source=local",
+                            "date": "Thu, 26 Nov 2026 09:30:00 GMT",
+                            "summary": "Mediators said both sides signed the text before dawn and set Friday for the first aid ship.",
+                        },
+                        {
+                            "title": "Bastrop brewery opens on Main Street",
+                            "url": "https://example.com/brewery",
+                            "date": "Thu, 26 Nov 2026 08:00:00 GMT",
+                            "summary": "The new taproom pours on Friday and keeps a small kitchen open until nine.",
+                        },
+                    ]
+                elif feed.url.endswith("spacex.xml"):
+                    entries = [
+                        {
+                            "title": "SpaceX stock last chance to buy before the open",
+                            "url": "https://news.google.com/rss/articles/spam",
+                            "date": "Thu, 26 Nov 2026 10:00:00 GMT",
+                            "summary": "SpaceX stock last chance to buy before the open, according to a tip sheet.",
+                        },
+                        {
+                            "title": "SpaceX sets a dawn Starship launch window",
+                            "url": "https://example.com/starship",
+                            "date": "Thu, 26 Nov 2026 08:00:00 GMT",
+                            "summary": "The window opens at sunrise and the company said the flight is a fueling test, not a market note.",
+                        },
+                    ]
+                else:
+                    entries = [
+                        {
+                            "title": "Chapel opens a new viewing room",
+                            "url": "https://example.com/chapel",
+                            "date": "Thu, 26 Nov 2026 10:00:00 GMT",
+                            "summary": "A chapel opened a viewing room downtown and invited the neighborhood to visit.",
+                        },
+                        {
+                            "title": "Earth Funeral opens a soil transformation facility",
+                            "url": "https://example.com/earth-funeral",
+                            "date": "Wed, 25 Nov 2026 15:00:00 GMT",
+                            "summary": "Earth Funeral opened the facility and said families can choose soil transformation there next month.",
+                        },
+                    ]
+                feeds[feed.url] = rss(entries)
 
         def fetcher(url):
             if url == dg.WEATHER_POINT:
                 return json.dumps({"properties": {"forecast": forecast_url}}).encode()
             if url == forecast_url:
                 return json.dumps({"properties": {"periods": periods}}).encode()
-            if url in {dg.NEIGHBORHOOD_EVENTS_URL, dg.CHAMBER_EVENTS_URL}:
-                return b""
             if url in feeds:
                 return feeds[url]
             raise AssertionError(url)
@@ -861,6 +870,9 @@ class GeneratorTests(unittest.TestCase):
             self.assertEqual(names, list(settings.required_titles()))
             self.assertNotIn("MUSIC", names)
             self.assertNotIn("BOT UPDATES", names)
+            self.assertNotIn("UK", names)
+            self.assertNotIn("FILM/TV", names)
+            self.assertNotIn("EVENTS TODAY / SOON", names)
             self.assertEqual(first["picker"]["mode"], "fallback")
             weather = first["sections"][0]["items"][0]
             self.assertIn("high 64°F", weather["headline"])
@@ -872,16 +884,17 @@ class GeneratorTests(unittest.TestCase):
             global_titles = [item["title"] for item in by_name["GLOBAL"]["items"]]
             self.assertIn("Harbor talks end with a written ceasefire", global_titles)
             self.assertNotIn("Editor dies at 90", global_titles)
-            uk_blob = json.dumps(by_name["UK"])
-            self.assertNotIn(shared, uk_blob)
-            self.assertIn("Rail board publishes the weekend map", uk_blob)
-            markets_blob = json.dumps(by_name["SPACEX/SPACE STOCK"]).casefold()
-            self.assertNotIn("last chance", markets_blob)
-            self.assertIn("civil science contract", markets_blob)
-            film_titles = [item["title"] for item in by_name["FILM/TV"]["items"]]
-            self.assertEqual(film_titles[0], "A restored western screens all weekend")
-            self.assertEqual(len(film_titles), 2)
-            local_item = by_name["LOCAL"]["items"][0]
+            self.assertNotIn("Old ridge survey sits in a drawer", global_titles)
+            local_blob = json.dumps(by_name["BASTROP"])
+            self.assertNotIn(shared, local_blob)
+            self.assertNotIn("City council", local_blob)
+            self.assertIn("Bastrop brewery opens on Main Street", local_blob)
+            companies_blob = json.dumps(by_name["SPACEX & EARTH FUNERAL"]).casefold()
+            self.assertNotIn("last chance", companies_blob)
+            self.assertNotIn("viewing room", companies_blob)
+            self.assertIn("starship", companies_blob)
+            self.assertIn("earth funeral", companies_blob)
+            local_item = by_name["BASTROP"]["items"][0]
             self.assertNotIn(local_item["title"].casefold(), local_item["summary"].casefold())
             second = dg.make_payload(
                 "2026-11-26",
@@ -919,7 +932,7 @@ class GeneratorTests(unittest.TestCase):
             self.assertEqual(bot_names[-1], "BOT UPDATES")
             self.assertEqual(with_bots["sections"][-1]["items"][0]["source_label"], "Popcorn")
             for section in with_bots["sections"]:
-                if section["section"] in {"GLOBAL", "LOCAL", "UK", "FILM/TV", "SPACEX/SPACE STOCK"}:
+                if section["section"] in {"GLOBAL", "BASTROP"}:
                     self.assertEqual(len(section["items"]), 1)
 
             def timed_out(request, timeout):
@@ -939,25 +952,436 @@ class GeneratorTests(unittest.TestCase):
             self.assertNotIn(SECRET, json.dumps(failed))
             self.assertNotIn("MUSIC", [section["section"] for section in failed["sections"]])
 
-    def test_settings_move_markets_query_uk_feed_and_titles(self):
+    def test_settings_move_company_query_and_local_title(self):
         with mock.patch.dict(
             os.environ,
             {
-                "DIGEST_MARKETS_NEWS_QUERY": "railroad stocks",
-                "DIGEST_UK_FEED": "https://example.com/uk.xml",
-                "DIGEST_SECTION_TITLES": '{"uk": "BRITAIN"}',
-                "DIGEST_SECTION_TITLE_MARKETS": "MARKETS",
+                "DIGEST_SPACEX_QUERY": "starship launch",
+                "DIGEST_SECTION_TITLE_LOCAL": "TOWN",
+                "DIGEST_SECTION_TITLE_COMPANIES": "COMPANIES",
             },
         ):
-            markets, _terms = settings.news_feed("markets")
-            uk, _terms = settings.news_feed("uk")
-            self.assertIn("railroad+stocks", markets)
-            self.assertEqual(uk, "https://example.com/uk.xml")
-            self.assertEqual(settings.section_by_id("markets").title, "MARKETS")
-            self.assertEqual(settings.section_by_id("uk").title, "BRITAIN")
+            feeds = settings.feeds_for("companies")
+            self.assertIn("starship+launch", feeds[0].url)
+            self.assertEqual(feeds[0].topic, "spacex")
+            self.assertEqual(feeds[1].topic, "earth")
+            self.assertIn("earth funeral", feeds[1].required)
+            self.assertEqual(settings.section_by_id("local").title, "TOWN")
+            self.assertEqual(settings.section_by_id("companies").title, "COMPANIES")
+            for gone in ("events", "uk", "film", "markets"):
+                self.assertIsNone(settings.section_by_id(gone))
         with mock.patch.dict(os.environ, {"DIGEST_SECTION_ORDER": "nope"}):
             self.assertEqual(settings.resolve_order(), settings.DEFAULT_SECTION_ORDER)
             self.assertTrue(any("DIGEST_SECTION_ORDER" in problem for problem in settings.configuration_problems()))
+
+
+class TailoringTests(unittest.TestCase):
+    def test_profile_likes_outrank_dislikes_and_reach_the_model(self):
+        text = """
+likes:
+  - cerebral sci-fi
+  - space
+dislikes:
+  - politics
+  - celebrity gossip
+  - sports
+local:
+  likes:
+    - brewery opening
+  dislikes:
+    - city council
+"""
+        profile = dp.parse_profile(text)
+        likes, dislikes = dp.profile_terms(profile, "local")
+        self.assertIn("brewery opening", likes)
+        self.assertIn("space", likes)
+        self.assertIn("city council", dislikes)
+        self.assertIn("politics", dislikes)
+        seen = dp.Seen([], "2026-11-26")
+        chosen = dp.fallback_pick(
+            [
+                item(
+                    "Celebrity gossip fills the sports pages",
+                    "https://example.com/gossip",
+                    "A celebrity gossip column recaps the sports weekend and the politics that came with it.",
+                ),
+                item(
+                    "A cerebral sci-fi novel about space travel",
+                    "https://example.com/scifi",
+                    "The novel treats space travel as a hard problem and stays with one crew for the whole book.",
+                ),
+            ],
+            1,
+            seen,
+            likes=likes,
+            dislikes=dislikes,
+        )
+        self.assertEqual(chosen[0]["title"], "A cerebral sci-fi novel about space travel")
+        captured = {}
+
+        def opener(request, timeout):
+            captured["body"] = json.loads(request.data.decode("utf-8"))
+            content = json.dumps(
+                {
+                    "picks": [
+                        {
+                            "section": "GLOBAL",
+                            "items": [
+                                {
+                                    "url": "https://example.com/scifi",
+                                    "summary": "The novel treats space travel as a hard problem and stays with one crew.",
+                                }
+                            ],
+                        }
+                    ]
+                }
+            )
+            return FakeResponse(json.dumps({"choices": [{"message": {"content": content}}]}).encode())
+
+        with mock.patch.dict(os.environ, {"DIGEST_LLM_API_KEY": SECRET}):
+            dp.pick_news(
+                [
+                    {
+                        "section_id": "global",
+                        "title": "GLOBAL",
+                        "purpose": "world",
+                        "feed_url": "https://example.com/global",
+                        "prefer_terms": (),
+                        "candidates": [
+                            item(
+                                "A cerebral sci-fi novel about space travel",
+                                "https://example.com/scifi",
+                                "The novel treats space travel as a hard problem and stays with one crew for the whole book.",
+                            )
+                        ],
+                    }
+                ],
+                digest_date="2026-11-26",
+                history=[],
+                has_bots=False,
+                opener=opener,
+                profile=profile,
+                item_count=1,
+                summary_chars=300,
+            )
+        interests = captured["body"]["messages"][1]["content"]
+        self.assertIn("cerebral sci-fi", interests)
+        self.assertIn("celebrity gossip", interests)
+        self.assertIn("brewery opening", interests)
+
+    def test_freshness_drops_old_items_only_when_something_newer_exists(self):
+        now = dt.datetime(2026, 11, 26, 12, 0, tzinfo=dt.timezone.utc)
+        fresh = item("Fresh harbor report", "https://example.com/fresh", "Mediators signed the text this morning and named Friday.")
+        stale = item(
+            "Older ridge survey",
+            "https://example.com/stale",
+            "The survey was filed earlier and has sat unchanged since then.",
+            "Tue, 24 Nov 2026 08:00:00 GMT",
+        )
+        kept = dp.select_fresh([stale, fresh], now, hours=36)
+        self.assertEqual([row["url"] for row in kept], ["https://example.com/fresh"])
+        only_old = dp.select_fresh([stale], now, hours=36)
+        self.assertEqual(only_old[0]["url"], "https://example.com/stale")
+        earth_old = {
+            "title": "Earth Funeral publishes a facility note",
+            "url": "https://example.com/earth-old",
+            "summary": "Earth Funeral described the soil transformation building and the month it opens.",
+            "published_at": "Tue, 17 Nov 2026 08:00:00 GMT",
+            "topic": "earth",
+        }
+        spacex_new = {
+            "title": "SpaceX launches Starship",
+            "url": "https://example.com/starship",
+            "summary": "SpaceX launched Starship at dawn and recovered the booster.",
+            "published_at": "Thu, 26 Nov 2026 08:00:00 GMT",
+            "topic": "spacex",
+        }
+        ancient = {
+            "title": "Earth Funeral mentioned in an old roundup",
+            "url": "https://example.com/earth-ancient",
+            "summary": "Earth Funeral was one line in a roundup from last season.",
+            "published_at": "Mon, 05 Oct 2026 08:00:00 GMT",
+            "topic": "earth",
+        }
+        company = dp.select_company_fresh([earth_old, spacex_new, ancient], now, 36, 24 * 14)
+        urls = {row["url"] for row in company}
+        self.assertIn("https://example.com/starship", urls)
+        self.assertIn("https://example.com/earth-old", urls)
+        self.assertNotIn("https://example.com/earth-ancient", urls)
+
+    def test_fuzzy_titles_treat_two_outlets_as_one_story(self):
+        self.assertTrue(
+            dp.titles_similar(
+                "Harbor ferry delayed after storm",
+                "Storm delays harbor ferry, officials say",
+            )
+        )
+        self.assertFalse(
+            dp.titles_similar(
+                "Bastrop brewery opens on Main Street",
+                "Bastrop coffee shop opens on Main Street",
+            )
+        )
+        seen = dp.Seen(
+            [
+                {
+                    "digest_date": "2026-11-25",
+                    "section": "global",
+                    "url": "https://example.com/outlet-a",
+                    "title": dp.normalize_title("Harbor ferry delayed after storm"),
+                }
+            ],
+            "2026-11-26",
+        )
+        chosen = dp.fallback_pick(
+            [
+                item(
+                    "Storm delays harbor ferry, officials say",
+                    "https://example.com/outlet-b",
+                    "Officials said the harbor ferry is delayed after the storm and will resume in the morning.",
+                ),
+                item(
+                    "Library board funds a new reading room",
+                    "https://example.com/library",
+                    LONG,
+                ),
+            ],
+            1,
+            seen,
+        )
+        self.assertEqual(chosen[0]["title"], "Library board funds a new reading room")
+
+    def test_crowded_companies_section_keeps_one_story_per_company(self):
+        def company(title, url, summary, topic):
+            row = item(title, url, summary)
+            row["topic"] = topic
+            return row
+
+        picked, _meta, _errors, _records = dp.pick_news(
+            [
+                {
+                    "section_id": "companies",
+                    "title": "SPACEX & EARTH FUNERAL",
+                    "purpose": "company news",
+                    "feed_url": "https://example.com/companies",
+                    "prefer_terms": (),
+                    "item_count": 2,
+                    "candidates": [
+                        company(
+                            "SpaceX sets a dawn Starship launch window",
+                            "https://example.com/starship",
+                            "The window opens at sunrise and the company said the flight is a fueling test.",
+                            "spacex",
+                        ),
+                        company(
+                            "SpaceX finishes a second Starship tank test",
+                            "https://example.com/starship-2",
+                            "The company finished the tank test and said the next flight follows next week.",
+                            "spacex",
+                        ),
+                        company(
+                            "Earth Funeral opens a soil transformation facility",
+                            "https://example.com/earth",
+                            "Earth Funeral opened the facility and said families can choose soil transformation there next month.",
+                            "earth",
+                        ),
+                    ],
+                }
+            ],
+            digest_date="2026-11-26",
+            history=[],
+            has_bots=True,
+            item_count=1,
+        )
+        titles = [row["title"] for row in picked["companies"]]
+        self.assertEqual(len(titles), 2)
+        self.assertTrue(any("Starship launch" in title for title in titles))
+        self.assertTrue(any("Earth Funeral" in title for title in titles))
+        self.assertFalse(any("tank test" in title for title in titles))
+
+    def test_company_filter_drops_stock_and_unrelated_funeral_items(self):
+        stock = {
+            "title": "SpaceX shares jump on a price target",
+            "summary": "The share price moved after a downgrade was reversed.",
+            "topic": "spacex",
+        }
+        launch = {
+            "title": "SpaceX completes a Starship fueling test",
+            "summary": "The company completed the fueling test ahead of the next flight.",
+            "topic": "spacex",
+        }
+        other = {
+            "title": "Chapel opens a new viewing room",
+            "summary": "A chapel opened downtown.",
+            "topic": "earth",
+        }
+        earth = {
+            "title": "Earth Funeral opens a soil transformation facility",
+            "summary": "Earth Funeral said the facility starts next month.",
+            "topic": "earth",
+        }
+        self.assertFalse(dp.keep_company(stock))
+        self.assertTrue(dp.keep_company(launch))
+        self.assertFalse(dp.keep_company(other))
+        self.assertTrue(dp.keep_company(earth))
+
+    def test_local_filter_keeps_an_opening_and_drops_council_and_crime(self):
+        opening = {
+            "title": "Bastrop brewery opens on Main Street",
+            "summary": "The taproom pours on Friday.",
+        }
+        council = {
+            "title": "Bastrop city council adopts the budget",
+            "summary": "The vote was unanimous.",
+        }
+        crime = {
+            "title": "Smithville man arrested after a shooting",
+            "summary": "Police said the street is closed.",
+        }
+        houston = {
+            "title": "Houston bakery opens a second room",
+            "summary": "The bakery is downtown.",
+        }
+        self.assertTrue(dp.keep_local(opening, require_place=True))
+        self.assertFalse(dp.keep_local(council, require_place=True))
+        self.assertFalse(dp.keep_local(crime, require_place=True))
+        self.assertFalse(dp.keep_local(houston, require_place=True))
+        self.assertTrue(dp.keep_local(houston, require_place=False))
+
+
+def _ticketmaster_event(name, attractions, event_id, day, url, venue="Mohawk", city="Austin"):
+    return {
+        "id": event_id,
+        "name": name,
+        "url": url,
+        "dates": {"start": {"localDate": day, "localTime": "19:30:00"}},
+        "_embedded": {
+            "attractions": [{"name": attraction} for attraction in attractions],
+            "venues": [{"name": venue, "city": {"name": city}}],
+        },
+    }
+
+
+class ShowTests(unittest.TestCase):
+    def test_artist_match_ignores_the_case_punctuation_and_tributes(self):
+        self.assertTrue(dp.names_match_artist("The Sample Band", "sample band"))
+        self.assertTrue(dp.names_match_artist("Sample Band", "Sample-Band"))
+        self.assertFalse(dp.names_match_artist("Prince", "Prince Royce"))
+        self.assertFalse(dp.event_matches_artist("Sample Band", "Sample Band Tribute", ["Sample Band Tribute"]))
+        self.assertFalse(dp.event_matches_artist("The Sample Band", "The Music of Sample Band", ["Sample Band"]))
+
+    def test_shows_skip_without_a_key_file_or_match_and_mention_once_until_the_week(self):
+        body = json.dumps(
+            {
+                "_embedded": {
+                    "events": [
+                        _ticketmaster_event(
+                            "Sample Band",
+                            ["The Sample Band"],
+                            "show-1",
+                            "2026-12-20",
+                            "https://user:secret@www.ticketmaster.com/event/show-1",
+                        ),
+                        _ticketmaster_event(
+                            "Sample Band Tribute",
+                            ["Sample Band Tribute"],
+                            "show-tribute",
+                            "2026-12-21",
+                            "https://www.ticketmaster.com/event/tribute",
+                        ),
+                    ]
+                }
+            }
+        ).encode()
+        early = dp.shows_from_ticketmaster(body, "Sample Band", "2026-11-26", [], 90)
+        self.assertEqual(len(early), 1)
+        self.assertEqual(early[0]["show_id"], "show-1")
+        self.assertEqual(early[0]["phase"], "early")
+        self.assertEqual(early[0]["url"], "https://www.ticketmaster.com/event/show-1")
+        self.assertNotIn("secret", json.dumps(early))
+        self.assertIn("MOHAWK", early[0]["summary"].upper())
+        self.assertIn("AUSTIN", early[0]["summary"].upper())
+        self.assertIn("SAMPLE BAND", early[0]["title"].upper())
+        again = dp.shows_from_ticketmaster(
+            body,
+            "Sample Band",
+            "2026-11-27",
+            [{"digest_date": "2026-11-26", "show_id": "show-1", "phase": "early"}],
+            90,
+        )
+        self.assertEqual(again, [])
+        week_body = json.dumps(
+            {
+                "_embedded": {
+                    "events": [
+                        _ticketmaster_event(
+                            "Sample Band",
+                            ["Sample Band"],
+                            "show-1",
+                            "2026-12-02",
+                            "https://www.ticketmaster.com/event/show-1",
+                        )
+                    ]
+                }
+            }
+        ).encode()
+        week = dp.shows_from_ticketmaster(
+            week_body,
+            "the sample band",
+            "2026-11-27",
+            [{"digest_date": "2026-11-26", "show_id": "show-1", "phase": "early"}],
+            90,
+        )
+        self.assertEqual(len(week), 1)
+        self.assertEqual(week[0]["phase"], "week")
+        quiet = dp.shows_from_ticketmaster(
+            week_body,
+            "Sample Band",
+            "2026-11-28",
+            [
+                {"digest_date": "2026-11-26", "show_id": "show-1", "phase": "early"},
+                {"digest_date": "2026-11-27", "show_id": "show-1", "phase": "week"},
+            ],
+            90,
+        )
+        self.assertEqual(quiet, [])
+
+        def explode(_url):
+            raise AssertionError("network")
+
+        self.assertEqual(dg.build_shows_section("2026-11-26", explode, []), (None, [], []))
+        with tempfile.TemporaryDirectory() as temp:
+            artists = Path(temp) / "artists.txt"
+            artists.write_text("# placeholder\nArtist Example\nThe Sample Band\n", encoding="utf-8")
+            with mock.patch.dict(os.environ, {"DIGEST_ARTISTS_FILE": str(artists), "DIGEST_TICKETMASTER_KEY": ""}):
+                self.assertEqual(dg.build_shows_section("2026-11-26", explode, []), (None, [], []))
+            calls = []
+
+            def fetcher(url):
+                calls.append(url)
+                if "Sample+Band" in url or "Sample%20Band" in url or "sample+band" in url.lower():
+                    return body
+                return b'{"_embedded": {"events": []}}'
+
+            with mock.patch.dict(
+                os.environ,
+                {"DIGEST_ARTISTS_FILE": str(artists), "DIGEST_TICKETMASTER_KEY": "tm-test-key"},
+            ):
+                section, errors, records = dg.build_shows_section("2026-11-26", fetcher, [])
+            self.assertEqual(errors, [])
+            self.assertIsNotNone(section)
+            self.assertEqual(section["items"][0]["url"], "https://www.ticketmaster.com/event/show-1")
+            self.assertEqual(records[0]["phase"], "early")
+            self.assertEqual(records[0]["show_id"], "show-1")
+            stored = json.dumps({"section": section, "errors": errors, "records": records})
+            self.assertNotIn("tm-test-key", stored)
+            self.assertNotIn("apikey", stored)
+            self.assertTrue(all("apikey" not in error.get("url", "") for error in errors))
+            self.assertIn("geoPoint=", calls[0])
+            self.assertIn("latlong=", calls[0])
+
+    def test_geohash_matches_the_known_vector(self):
+        self.assertEqual(dg.geohash(57.64911, 10.40744), "u4pruyd")
 
 
 if __name__ == "__main__":

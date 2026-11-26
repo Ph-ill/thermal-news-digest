@@ -2,7 +2,7 @@
 
 An external process, not this repository, can leave a JSON file for the morning receipt. The generator reads it while building the day's source file. When the file is valid and fresh, the receipt gains a **BOT UPDATES** section. When the file is missing, empty, stale, or invalid, that section is left out and the news sections use the extra room.
 
-Music recommendations belong here. The old Music section, which printed a placeholder every day, is gone.
+Film, television, and music notes belong here. Those daily sections were removed on purpose. NEARBY SHOWS is a separate optional section for concerts from the artist file, not a place for these notes.
 
 ## Where the file goes
 

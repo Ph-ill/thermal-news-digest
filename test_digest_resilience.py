@@ -254,7 +254,11 @@ class ModelFailureTests(unittest.TestCase):
             budget_seconds=0,
             persist_history=False,
         )
-        self.assertGreaterEqual(len(payload["sections"]), 7)
+        self.assertGreaterEqual(len(payload["sections"]), 4)
+        names = [section["section"] for section in payload["sections"]]
+        self.assertNotIn("UK", names)
+        self.assertNotIn("FILM/TV", names)
+        self.assertNotIn("EVENTS TODAY / SOON", names)
         self.assertNotIn("taste_profile", payload)
         self.assertTrue(payload["digest_id"])
 
@@ -540,16 +544,11 @@ class ShellEndToEndTests(unittest.TestCase):
                     "DIGEST_WEATHER_POINT": base + "/points",
                     "DIGEST_GLOBAL_FEED": base + "/rss/global",
                     "DIGEST_LOCAL_FEED": base + "/rss/local",
-                    "DIGEST_UK_FEED": base + "/rss/uk",
-                    "DIGEST_FILM_FEED": base + "/rss/film",
-                    "DIGEST_MARKETS_FEED": base + "/rss/markets",
+                    "DIGEST_COMPANIES_FEED": base + "/rss/companies",
                     "DIGEST_WEATHER_LAT": "0",
                     "DIGEST_WEATHER_LON": "0",
-                    "DIGEST_NEIGHBORHOOD_EVENTS_URL": base + "/events",
-                    "DIGEST_CHAMBER_EVENTS_URL": base + "/chamber",
-                    "DIGEST_LOCATION_LABEL": "near Springfield",
-                    "DIGEST_NEIGHBORHOOD_NAME": "Neighborhood",
-                    "DIGEST_LOCAL_CITY": "Springfield",
+                    "DIGEST_LOCATION_LABEL": "Bastrop, TX",
+                    "DIGEST_LOCAL_CITY": "Bastrop",
                 }
             )
             # The generator reads the point URL from its own defaults unless the lat/lon
@@ -856,27 +855,58 @@ class StateRecoveryTests(unittest.TestCase):
             self.assertFalse(shaped.exists())
             self.assertEqual(len(list(root.glob("shape.json.corrupt-*"))), 1)
 
+            nondict = root / "nonstr.json"
+            nondict.write_text('{"version": 1, "digests": {"abc": "nope"}}', encoding="utf-8")
+            self.assertEqual(rd.read_state(nondict), {"version": 1, "digests": {}})
+            self.assertFalse(nondict.exists())
+            self.assertEqual(len(list(root.glob("nonstr.json.corrupt-*"))), 1)
+
+            replaced = root / "replaced.json"
+            replaced.write_text("{", encoding="utf-8")
+            identity = (replaced.stat().st_dev, replaced.stat().st_ino)
+            held = root / "held.json"
+            replaced.rename(held)
+            replaced.write_text('{"version": 1, "digests": {}}', encoding="utf-8")
+            self.assertNotEqual((replaced.stat().st_dev, replaced.stat().st_ino), identity)
+            self.assertFalse(rd._quarantine_state(replaced, identity))
+            self.assertEqual(replaced.read_text(encoding="utf-8"), '{"version": 1, "digests": {}}')
+            self.assertEqual(held.read_text(encoding="utf-8"), "{")
+
+            stale = root / "fresh.json.corrupt-old"
+            stale.write_text("{", encoding="utf-8")
+            old = time.time() - (20 * 24 * 60 * 60)
+            os.utime(stale, (old, old))
+            fresh_state = root / "fresh.json"
+            fresh_state.write_text('{"version": 1, "digests": {}}', encoding="utf-8")
+            self.assertEqual(rd.read_state(fresh_state)["version"], 1)
+            self.assertFalse(stale.exists())
+
 
 class SourceUrlTests(unittest.TestCase):
     def test_event_and_forecast_urls_drop_userinfo(self):
         secret = "forecast-userinfo-secret"
         start = dt.datetime(2026, 11, 26, 12, 0, tzinfo=ZoneInfo("America/Chicago"))
-        event = dg._event_item(
+        body = json.dumps(
             {
-                "start": start,
-                "end": None,
-                "is_today": True,
-                "time_listed": True,
-                "location": "Library",
-                "scope": "Neighborhood",
-                "name": "Reading night",
-                "url": f"https://user:{secret}@neighborhood.example.org/events/reading?day=1",
-                "source_id": "neighborhood.example.org:mec:9",
-                "rationale": "Official calendar event",
+                "_embedded": {
+                    "events": [
+                        {
+                            "id": "show-9",
+                            "name": "Sample Band",
+                            "url": f"https://user:{secret}@www.ticketmaster.com/event/show-9",
+                            "dates": {"start": {"localDate": "2026-12-02", "localTime": "19:30:00"}},
+                            "_embedded": {
+                                "attractions": [{"name": "Sample Band"}],
+                                "venues": [{"name": "Mohawk", "city": {"name": "Austin"}}],
+                            },
+                        }
+                    ]
+                }
             }
-        )
-        self.assertEqual(event["url"], "https://neighborhood.example.org/events/reading?day=1")
-        self.assertNotIn(secret, json.dumps(event))
+        ).encode()
+        shows = dp.shows_from_ticketmaster(body, "Sample Band", "2026-11-26", [], 90)
+        self.assertEqual(shows[0]["url"], "https://www.ticketmaster.com/event/show-9")
+        self.assertNotIn(secret, json.dumps(shows))
 
         forecast = f"https://user:{secret}@api.weather.gov/gridpoints/TOP/31,80/forecast"
         day = {

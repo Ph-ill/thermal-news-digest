@@ -10,7 +10,7 @@ Personal values stay in the environment. See `.env.example`. Do not commit names
 
 | Piece | Role |
 | --- | --- |
-| `digest_generator.py` | Fetches weather, news, and calendars. Writes `output/digest-source-YYYY-MM-DD.json` once. |
+| `digest_generator.py` | Fetches weather, news, and nearby shows. Writes `output/digest-source-YYYY-MM-DD.json` once. |
 | `digest_settings.py` | Reads env settings: feeds, section order, titles, model, history, bot updates. |
 | `digest_picker.py` | Scores candidates, calls the model, validates JSON, and remembers recent URLs and titles. |
 | `receipt_digest.py` | Checks the section list, draws an SVG, rasterizes it, and packs a TSPL2 bitmap. |
@@ -27,9 +27,9 @@ Pillow wraps text and measures the bitmap. `rsvg-convert` (librsvg) turns the SV
 2. The trigger starts `print_digest_safe.sh --submit`. A second press while the lock is held gets HTTP 409.
 3. The shell script takes an exclusive non-blocking `flock` on `print.lock`.
 4. If `output/digest-source-YYYY-MM-DD.json` is missing, empty, or cannot be rendered, `digest_generator.py` builds it. The date is the calendar date in `DIGEST_TZ` (default `America/Chicago`), in both the shell and the generator. The generator stops fetching after about 75 seconds and prints whatever it already has, so the whole trigger stays inside 120 seconds.
-   - NOAA daytime forecast for the digest date (the overnight period is not used).
-   - Up to 16 candidates from each news feed.
-   - Verified events from the neighborhood calendar, then the chamber calendar.
+   - NOAA daytime forecast for the digest date (the overnight period is not used). The default point is the public city center of Bastrop, Texas.
+   - Up to 16 candidates from each news feed. Stories older than about 36 hours are dropped when the section has anything newer.
+   - Nearby shows, only when a Ticketmaster key and an artist file are set and a concert matches. See [docs/shows.md](docs/shows.md).
    - The bot-updates file, if it is valid and newer than about 30 hours.
    - One chat-completions call to pick and summarize the news. Any failure uses the fallback picker.
    - Recent URLs and titles are skipped, then today's picks are appended to `digest-history.json`.
@@ -43,16 +43,20 @@ Default section order:
 
 1. WEATHER
 2. GLOBAL
-3. LOCAL
-4. EVENTS TODAY / SOON
-5. SPACEX/SPACE STOCK
-6. UK
-7. FILM/TV
-8. BOT UPDATES, only when the day's file is valid
+3. BASTROP
+4. SPACEX & EARTH FUNERAL
+5. NEARBY SHOWS, only when a concert matches
+6. BOT UPDATES, only when the day's file is valid
 
-BOT UPDATES is optional. The other sections are required unless `DIGEST_SECTION_ORDER` removes them. A missing required section, a section out of order, or the old MUSIC section is rejected before anything is sent to the printer. MUSIC was removed on purpose: music notes arrive as a bot update instead of a daily placeholder.
+NEARBY SHOWS and BOT UPDATES are optional. The other sections are required unless `DIGEST_SECTION_ORDER` removes them. A missing required section, a section out of order, or the old MUSIC section is rejected before anything is sent to the printer. Events, UK, Film/TV, and the daily Music section were removed on purpose. Those notes belong in BOT UPDATES. The Bastrop header can be renamed with `DIGEST_SECTION_TITLE_LOCAL`.
 
-When the bot section is present, each news section prints one item and a shorter summary. When it is absent, each news section prints two items and a longer summary. Events stay at most three. The strip still stops at 6000 dots (750 mm).
+When either optional section is present, each news section prints one item and a shorter summary. When both are absent, each news section prints two items and a longer summary. If both companies have a real story, that section still prints one of each. Shows stay at most three. The strip still stops at 6000 dots (750 mm).
+
+The sample without bot updates includes one nearby show so that section is visible. A real run leaves it off when nothing matches. The sample with bot updates is the shorter layout.
+
+BASTROP wants new openings, markets, live music, and outdoor plans in Bastrop, Smithville, Elgin, Cedar Creek, and east Austin. City council, government, school board, crime, and obituaries are dropped before the picker runs. The default sources are Google News RSS searches for those openings, plus the public Community Impact RSS and the Eater Austin RSS, both filtered to that area. Visit Bastrop's calendar did not offer a feed this client could read, and the Bastrop edition of Community Impact does not currently publish its own `/feed` URL, so those are not hardcoded.
+
+SPACEX & EARTH FUNERAL is company news: launches, milestones, and press for SpaceX, and the same for Earth Funeral (the human-composting company). Stock prices and market chatter are dropped. Earth Funeral is quiet, so a SpaceX story does not get a filler item beside it, and an Earth Funeral item has to actually name Earth Funeral. Each company keeps a story up to about 14 days old only when that company has nothing newer. The sources are Google News RSS searches. Neither company publishes an RSS feed that this client could use.
 
 Sample strips, rendered from fixture data:
 
@@ -90,39 +94,40 @@ Copy `.env.example` to `.env`. Empty values fall back to the defaults below. The
 | `DIGEST_HOME` | script directory | Where `output/`, `state.json`, and the history file live. |
 | `DIGEST_PRINTER_QUEUE` | `receipt` | CUPS raw queue. |
 | `DIGEST_TRIGGER_PORT` | `8793` | Loopback port. |
-| `DIGEST_TZ` | `America/Chicago` | Edition date, event times, and the forecast date. The host zone can differ. |
-| `DIGEST_LOCATION_LABEL` | `near Springfield` | Line under the title. |
-| `DIGEST_WEATHER_LAT`, `DIGEST_WEATHER_LON` | Springfield, Illinois | NOAA point. |
-| `DIGEST_LOCAL_NEWS_QUERY` | `Springfield` | Google News query for the local section. |
-| `DIGEST_LOCAL_FEED` | unset | Full local feed URL. When set, the local query is not used. |
+| `DIGEST_TZ` | `America/Chicago` | Edition date and the forecast date. The host zone can differ. |
+| `DIGEST_LOCATION_LABEL` | `Bastrop, TX` | Line under the title. |
+| `DIGEST_WEATHER_LAT`, `DIGEST_WEATHER_LON` | Bastrop city center | NOAA point. Public coordinates, not a street address. |
+| `DIGEST_LOCAL_NEWS_QUERY` | built-in opening queries | One Google News query. When set, it replaces the default local list. |
+| `DIGEST_LOCAL_FEED` or `DIGEST_LOCAL_FEEDS` | unset | One URL, or a comma-separated list. When set, the default local sources are not used. |
 | `DIGEST_WEATHER_POINT` | NOAA point for the lat/lon | Override the forecast point URL. |
-| `DIGEST_LOCAL_CITY` | `Springfield` | City name used when filtering chamber events. |
-| `DIGEST_NEIGHBORHOOD_EVENTS_URL` | example neighborhood calendar | Primary events page. |
-| `DIGEST_NEIGHBORHOOD_NAME` | `Neighborhood` | Label for events that match the markers. |
-| `DIGEST_NEIGHBORHOOD_MARKERS` | `neighborhood` | Comma-separated words that mark a neighborhood event. |
-| `DIGEST_CHAMBER_EVENTS_URL` | example chamber calendar | Fallback events page. |
 | `DIGEST_GLOBAL_FEED` | BBC world RSS | Global section. |
-| `DIGEST_UK_FEED` | BBC UK RSS | UK section. |
-| `DIGEST_FILM_FEED` | Hollywood Reporter movie news | Film and TV section. |
-| `DIGEST_MARKETS_NEWS_QUERY` | `SpaceX OR Rocket Lab OR ASTS stock` | Google News query for the markets section. |
-| `DIGEST_MARKETS_FEED` | unset | Full feed URL. When set, the markets query is not used. |
-| `DIGEST_FILM_TERMS` | `anime,thriller,western,animation` | Preferred words for the fallback film picker. They are not a hard filter. |
-| `DIGEST_TASTE` | character-driven thrillers, anime, westerns, offbeat animation | Taste note sent to the model. |
-| `DIGEST_SECTION_ORDER` | the eight ids listed above | Comma-separated ids. Unknown or repeated ids are ignored and the default order is used. |
-| `DIGEST_SECTION_TITLES` | unset | JSON object of id to header, for example `{"markets":"MARKETS"}`. |
-| `DIGEST_SECTION_TITLE_*` | the headers in the sample | One variable per section (`WEATHER`, `GLOBAL`, `LOCAL`, `EVENTS`, `MARKETS`, `UK`, `FILM`, `BOT_UPDATES`). Overrides the JSON object. Max 32 characters. |
+| `DIGEST_SPACEX_QUERY`, `DIGEST_EARTH_FUNERAL_QUERY` | launch and company queries | Google News queries for the two companies. |
+| `DIGEST_SPACEX_FEED`, `DIGEST_EARTH_FUNERAL_FEED` | unset | Full feed URLs. When set, that company's query is not used. |
+| `DIGEST_COMPANIES_FEED` or `DIGEST_COMPANIES_FEEDS` | unset | Replaces both company feeds. Items are not forced through the company phrase checks. |
+| `DIGEST_TASTE` | sci-fi, space, horror, local openings | Taste note sent to the model. Not copied into the source file. |
+| `DIGEST_PROFILE_FILE` | unset | Gitignored interests file. See `docs/interests.example.yml`. Unset means no profile. A missing or unreadable file is recorded and ignored. |
+| `DIGEST_FRESH_HOURS` | `36` | Drop older stories when the section has anything newer. |
+| `DIGEST_COMPANY_STALE_HOURS` | `336` | How old a company story may be when that company has nothing newer. |
+| `DIGEST_ARTISTS_FILE` | unset | Gitignored artist list, one name per line. See `docs/artists.example.txt`. |
+| `DIGEST_TICKETMASTER_KEY` | empty | Discovery API key. Empty skips NEARBY SHOWS. |
+| `DIGEST_SHOWS_LAT`, `DIGEST_SHOWS_LON` | Bastrop city center | Center of the concert search. |
+| `DIGEST_SHOWS_RADIUS_MILES` | `50` | Search radius. |
+| `DIGEST_SHOWS_HORIZON_DAYS` | `90` | How far ahead a show may be. |
+| `DIGEST_SECTION_ORDER` | weather, global, local, companies, shows, bot_updates | Comma-separated ids. Unknown or repeated ids are ignored and the default order is used. |
+| `DIGEST_SECTION_TITLES` | unset | JSON object of id to header, for example `{"local":"BASTROP"}`. |
+| `DIGEST_SECTION_TITLE_*` | the headers above | One variable per section (`WEATHER`, `GLOBAL`, `LOCAL`, `COMPANIES`, `SHOWS`, `BOT_UPDATES`). Overrides the JSON object. Max 32 characters. |
 | `DIGEST_LLM_BASE_URL` | `https://api.x.ai/v1` | Chat-completions origin, without `/chat/completions`. |
 | `DIGEST_LLM_API_KEY` | empty | Bearer token. Empty means fallback picker only. |
 | `DIGEST_LLM_MODEL` | `grok-4.7` | Model id. Change this when the provider renames the model. |
 | `DIGEST_LLM_TIMEOUT` | `45` | Seconds for one chat call, clamped to 5–90, and also cut to the time left in the 75s generator budget. A HTTP 400 retry uses that same budget. |
 | `DIGEST_LLM_REASONING_EFFORT` | `low` | `low`, `medium`, `high`, `xhigh`, or `off`. |
 | `DIGEST_CANDIDATES_PER_SECTION` | `16` | Newest feed items considered, clamped to 10–20. |
-| `DIGEST_ITEMS_WITH_BOTS` | `1` | News items per section when bot updates are printed. |
-| `DIGEST_ITEMS_WITHOUT_BOTS` | `2` | News items per section when they are not. |
-| `DIGEST_SUMMARY_CHARS_WITH_BOTS` | `200` | Summary budget with a bot section. |
-| `DIGEST_SUMMARY_CHARS_WITHOUT_BOTS` | `300` | Summary budget without one. |
+| `DIGEST_ITEMS_WITH_BOTS` | `1` | News items per section when shows or bot updates are printed. |
+| `DIGEST_ITEMS_WITHOUT_BOTS` | `2` | News items per section when neither is printed. |
+| `DIGEST_SUMMARY_CHARS_WITH_BOTS` | `200` | Summary budget when an optional section is present. |
+| `DIGEST_SUMMARY_CHARS_WITHOUT_BOTS` | `300` | Summary budget when neither is present. |
 | `DIGEST_HISTORY_PATH` | `$DIGEST_HOME/digest-history.json` | Recent-item file. |
-| `DIGEST_HISTORY_DAYS` | `7` | How many days back a URL or title stays blocked. |
+| `DIGEST_HISTORY_DAYS` | `7` | How many days back a URL or a similar title stays blocked. |
 | `DIGEST_BOT_UPDATES_DIR` | `$DIGEST_HOME/bot-updates` | Directory of `YYYY-MM-DD.json` files. |
 | `DIGEST_READER_IDS` | `reader-a,reader-b` | Ids allowed in a bot update's `for` field, besides `both`. |
 | `DIGEST_BOT_UPDATES_MAX_AGE_HOURS` | `30` | Older bot files are ignored. |
@@ -135,7 +140,7 @@ The generator sends one `POST` to `{DIGEST_LLM_BASE_URL}/chat/completions` using
 
 The default model id is `grok-4.7` on `https://api.x.ai/v1`. That id is a setting, not a promise that the name will stay. Set `DIGEST_LLM_MODEL` to pin or to move.
 
-The model sees each section's purpose, the taste note, and the candidates (title, url, time, and any summary that is not just the headline). It must return:
+The model sees each section's purpose, the taste note, the interests profile when `DIGEST_PROFILE_FILE` is set, and the candidates (title, url, time, and any summary that is not just the headline). It must return:
 
 ```json
 {"picks":[{"section":"GLOBAL","items":[{"url":"https://example.com/story","summary":"One or two plain sentences."}]}]}
@@ -152,13 +157,15 @@ These failures all fall back to the deterministic picker, and the source file re
 - JSON that is not the schema above
 - picks that do not match the candidates
 
-The fallback keeps the newest remaining items. It prefers the film terms when the film feed has them, and it still fills the section from the rest of that feed so a quiet keyword list does not leave film blank. A summary that only repeats the headline plus the outlet is replaced with `From {outlet}, {date}.` Google News titles that end in ` - Outlet` use the outlet as the source line instead of `news.google.com`.
+The fallback keeps the newest remaining items, then moves a profile "like" ahead of a neutral item and a "dislike" behind both. A summary that only repeats the headline plus the outlet is replaced with `From {outlet}, {date}.` Google News titles that end in ` - Outlet` use the outlet as the source line instead of `news.google.com`.
 
-The API key is sent only as an `Authorization` header. It is not written into the digest, the history file, or the error strings. Stored URLs have any username or password removed. The taste note is sent to the model and is not copied into the source file. Picker failures are stored as a short code.
+The same story from another outlet is treated as a repeat when the significant words overlap (shared stems, not just a shared town). Exact URLs and exact normalized titles still match. A story printed yesterday is skipped. The same calendar day can be rebuilt.
+
+The API key is sent only as an `Authorization` header. It is not written into the digest, the history file, or the error strings. Stored URLs have any username or password removed. The taste note and the interests profile are sent to the model and are not copied into the source file. Picker failures are stored as a short code. A broken `state.json` is moved aside as `state.json.corrupt-<time>` and the run starts from an empty state. The rename happens under the print lock and only if the file is still the one that was read. Old `.corrupt-*` copies are deleted after 14 days. A digest entry that is not an object is treated as a broken file. "Died in committee" and "killed in committee" are not obituaries.
 
 ## Bot updates
 
-See [docs/bot-updates.md](docs/bot-updates.md) for the file name, the JSON schema, the staleness rules, and the receipt layout. The short version: an external process writes `bot-updates/YYYY-MM-DD.json` before 05:00. A bad or stale file is ignored. A good file becomes the BOT UPDATES section, and each news section drops from two items to one so the notes fit under the length cap.
+See [docs/bot-updates.md](docs/bot-updates.md) for the file name, the JSON schema, the staleness rules, and the receipt layout. The short version: an external process writes `bot-updates/YYYY-MM-DD.json` before 05:00. A bad or stale file is ignored. A good file becomes the BOT UPDATES section, and each news section drops from two items to one so the notes fit under the length cap. Film, television, and music notes belong in that file. Nearby concerts are [docs/shows.md](docs/shows.md), not a bot note.
 
 ## Deploy
 
@@ -185,7 +192,7 @@ python3 -m unittest discover -v
 
 GitHub Actions runs the same command on `ubuntu-latest` after installing `librsvg2-bin`, `fonts-dejavu-core`, and Pillow (`.github/workflows/test.yml`).
 
-The tests cover the fallback picker, mocked chat-completions responses (including bad JSON, a timeout, and a dropped socket), the daytime weather choice (including a split day and the digest timezone), cross-day de-dupe, bot-file parsing (including a bad encoding, a symlink, and an oversized file), layout with and without the bot section, and `print_digest_safe.sh` with fake `lp`, `lpstat`, and a local HTTP server. They do not call the public network.
+The tests cover the fallback picker, the interests profile, the 36 hour freshness rule, fuzzy titles, the company and Bastrop filters, nearby-show matching, mocked chat-completions responses (including bad JSON, a timeout, and a dropped socket), the daytime weather choice (including a split day and the digest timezone), cross-day de-dupe, bot-file parsing (including a bad encoding, a symlink, and an oversized file), layout with and without the bot section, state recovery, and `print_digest_safe.sh` with fake `lp`, `lpstat`, and a local HTTP server. They do not call the public network.
 
 Regenerate the sample PNGs from the fixture payloads:
 

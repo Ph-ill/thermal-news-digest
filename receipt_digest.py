@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import re
+import stat
 import subprocess
 import sys
 import tempfile
@@ -190,7 +191,7 @@ def validate_payload(payload: dict) -> None:
             raise ValueError("news digest section is not an object")
         spec = specs[section["section"]]
         items = section.get("items")
-        if spec.kind == "events":
+        if spec.kind == "shows":
             allowed = range(1, 4)
         elif spec.kind == "bot_updates":
             allowed = range(1, settings.max_bot_updates() + 1)
@@ -212,8 +213,8 @@ def validate_payload(payload: dict) -> None:
                     raise ValueError(f"section {section.get('section')} has no source label")
             elif not item.get("url"):
                 raise ValueError(f"section {section.get('section')} has no source URL")
-            if spec.kind == "events" and not item.get("source_id"):
-                raise ValueError("event item has no public source identifier")
+            if spec.kind == "shows" and not item.get("url"):
+                raise ValueError("show item has no public event URL")
     expected = payload_digest_id(payload)
     if payload.get("digest_id") != expected:
         raise ValueError("news digest ID does not match its stable payload")
@@ -570,7 +571,7 @@ def render(source: Path, output_dir: Path) -> dict:
         "source_sha256": hashlib.sha256(raw.encode("utf-8")).hexdigest(),
         "source_errors": payload.get("source_errors", []),
         "digest_id": digest_id,
-        "profile": "receipt-80mm-news-events-v5",
+        "profile": "receipt-80mm-news-v6",
         "geometry": geometry,
         "raster_black_bbox": list(bbox),
         "raster_black_ratio": round(black_ratio, 6),
@@ -596,8 +597,54 @@ def _blank_state() -> dict:
     return {"version": 1, "digests": {}}
 
 
-def _quarantine_state(path: Path) -> None:
-    """Move a state file aside so a later submit can start clean without deleting the evidence."""
+CORRUPT_KEEP = 8
+CORRUPT_KEEP_SECONDS = 14 * 24 * 60 * 60
+
+
+def _purge_corrupt_state(path: Path) -> None:
+    """Drop old quarantined copies. Keep a few recent ones so the latest failure stays inspectable."""
+    prefix = f"{path.name}.corrupt-"
+    found: list[Path] = []
+    try:
+        children = list(path.parent.iterdir())
+    except OSError:
+        return
+    for child in children:
+        if not child.name.startswith(prefix):
+            continue
+        try:
+            if child.is_file():
+                found.append(child)
+        except OSError:
+            continue
+    try:
+        found.sort(key=lambda item: item.stat().st_mtime, reverse=True)
+    except OSError:
+        return
+    cutoff = time.time() - CORRUPT_KEEP_SECONDS
+    for index, child in enumerate(found):
+        try:
+            recent = child.stat().st_mtime >= cutoff
+        except OSError:
+            continue
+        if index < CORRUPT_KEEP and recent:
+            continue
+        try:
+            child.unlink()
+        except OSError:
+            pass
+
+
+def _quarantine_state(path: Path, identity: tuple[int, int] | None) -> bool:
+    """Move a state file aside only when it is still the file that was read."""
+    try:
+        current = os.stat(path, follow_symlinks=False)
+    except OSError:
+        return False
+    if not stat.S_ISREG(current.st_mode):
+        return False
+    if identity is not None and (current.st_dev, current.st_ino) != identity:
+        return False
     stamp = time.time_ns()
     dest = path.with_name(f"{path.name}.corrupt-{stamp}")
     counter = 0
@@ -605,28 +652,52 @@ def _quarantine_state(path: Path) -> None:
         counter += 1
         dest = path.with_name(f"{path.name}.corrupt-{stamp}-{counter}")
     os.replace(path, dest)
+    return True
+
+
+def _read_state_locked(path: Path) -> dict:
+    if not path.exists():
+        _purge_corrupt_state(path)
+        return _blank_state()
+    identity: tuple[int, int] | None = None
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except OSError:
+        return _blank_state()
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError("state is not a regular file")
+        identity = (info.st_dev, info.st_ino)
+        raw = os.read(fd, STATE_MAX_BYTES + 1)
+        if len(raw) > STATE_MAX_BYTES:
+            raise ValueError("state too large")
+        value = json.loads(raw.decode("utf-8"))
+        digests = value.get("digests") if isinstance(value, dict) else None
+        if (
+            not isinstance(value, dict)
+            or value.get("version") != 1
+            or not isinstance(digests, dict)
+            or any(not isinstance(entry, dict) for entry in digests.values())
+        ):
+            raise ValueError("invalid state")
+        _purge_corrupt_state(path)
+        return value
+    except Exception:
+        try:
+            _quarantine_state(path, identity)
+        except OSError:
+            pass
+        _purge_corrupt_state(path)
+        return _blank_state()
+    finally:
+        os.close(fd)
 
 
 def read_state(path: Path) -> dict:
     """Load print state. An unreadable or wrongly shaped file is set aside and replaced with a fresh one."""
-    if not path.exists():
-        return _blank_state()
-    try:
-        with path.open("rb") as handle:
-            raw = handle.read(STATE_MAX_BYTES + 1)
-        if len(raw) > STATE_MAX_BYTES:
-            raise ValueError("state too large")
-        value = json.loads(raw.decode("utf-8"))
-        if not isinstance(value, dict) or value.get("version") != 1 or not isinstance(value.get("digests"), dict):
-            raise ValueError("invalid state")
-        return value
-    except Exception:
-        try:
-            if path.exists():
-                _quarantine_state(path)
-        except OSError:
-            pass
-        return _blank_state()
+    with digest_picker._printer_lock():
+        return _read_state_locked(path)
 
 
 def submit(metadata: dict, queue: str, state_path: Path, poll_seconds: int, *, force: bool = False) -> dict:

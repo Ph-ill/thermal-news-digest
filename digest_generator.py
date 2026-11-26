@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build the daily news digest plus verified local events.
+"""Build the daily news digest, including nearby concerts when they are configured.
 
 News sections collect a handful of candidates, then one chat-completions call
 picks and summarizes them. If that call cannot be used, a deterministic picker
@@ -29,38 +29,64 @@ from zoneinfo import ZoneInfo
 import digest_picker
 import digest_settings as settings
 
-# All location- and person-specific settings come from the environment
-# (see .env.example). Defaults are neutral placeholders.
+# Place defaults are the public city center of Bastrop, Texas. Not a street address.
 def _env(name: str, default: str) -> str:
     return os.environ.get(name) or default
 
 
-LOCATION_LABEL = _env("DIGEST_LOCATION_LABEL", "near Springfield")
-# Primary calendar: a WordPress "Modern Events Calendar" (MEC) /events/ page.
-NEIGHBORHOOD_EVENTS_URL = _env("DIGEST_NEIGHBORHOOD_EVENTS_URL", "https://neighborhood.example.org/events/")
-NEIGHBORHOOD_NAME = _env("DIGEST_NEIGHBORHOOD_NAME", "Neighborhood")
-NEIGHBORHOOD_MARKERS = tuple(
-    marker.strip().casefold()
-    for marker in _env("DIGEST_NEIGHBORHOOD_MARKERS", "neighborhood").split(",")
-    if marker.strip()
-)
-# Fallback calendar: a GrowthZone chamber-of-commerce /eventcalendar page.
-CHAMBER_EVENTS_URL = _env("DIGEST_CHAMBER_EVENTS_URL", "https://business.chamber.example.com/eventcalendar")
-LOCAL_CITY = _env("DIGEST_LOCAL_CITY", "Springfield")
-EVENT_WINDOW_DAYS = 21
-MAX_EVENTS = 3
+LOCATION_LABEL = _env("DIGEST_LOCATION_LABEL", "Bastrop, TX")
 # Leaves room inside the 120s trigger for render and the CUPS poll.
 GENERATOR_BUDGET_SECONDS = 75.0
 FETCH_TIMEOUT_CAP = 8.0
 FETCH_READ_CAP = 1_048_576
 TITLE_CAP = 240
+MAX_SHOWS = 3
+MAX_ARTISTS = 8
+TICKETMASTER_EVENTS = "https://app.ticketmaster.com/discovery/v2/events.json"
+_GEOHASH_CHARS = "0123456789bcdefghjkmnpqrstuvwxyz"
+
+
+def geohash(lat: float, lon: float, precision: int = 7) -> str:
+    """Encode a point the way Ticketmaster's geoPoint parameter expects."""
+    lat_range = [-90.0, 90.0]
+    lon_range = [-180.0, 180.0]
+    bits = (16, 8, 4, 2, 1)
+    chars: list[str] = []
+    bit = 0
+    value = 0
+    even = True
+    while len(chars) < precision:
+        if even:
+            mid = (lon_range[0] + lon_range[1]) / 2
+            if lon >= mid:
+                value |= bits[bit]
+                lon_range[0] = mid
+            else:
+                lon_range[1] = mid
+        else:
+            mid = (lat_range[0] + lat_range[1]) / 2
+            if lat >= mid:
+                value |= bits[bit]
+                lat_range[0] = mid
+            else:
+                lat_range[1] = mid
+        even = not even
+        if bit < 4:
+            bit += 1
+        else:
+            chars.append(_GEOHASH_CHARS[value])
+            bit = 0
+            value = 0
+    return "".join(chars)
+
+
 def _weather_point() -> str:
     explicit = os.environ.get("DIGEST_WEATHER_POINT", "").strip()
     if explicit:
         return explicit
     return (
         "https://api.weather.gov/points/"
-        f"{_env('DIGEST_WEATHER_LAT', '39.7817')},{_env('DIGEST_WEATHER_LON', '-89.6501')}"
+        f"{_env('DIGEST_WEATHER_LAT', settings.DEFAULT_LAT)},{_env('DIGEST_WEATHER_LON', settings.DEFAULT_LON)}"
     )
 
 
@@ -174,334 +200,120 @@ def rss_items(raw: bytes, limit: int | None = None) -> list[dict]:
     return items[:cap]
 
 
-def _parse_local_datetime(value: str) -> dt.datetime:
-    return dt.datetime.strptime(value.strip(), "%m/%d/%Y %I:%M:%S %p").replace(
-        tzinfo=local_zone()
-    )
+def load_artists(path: Path) -> list[str]:
+    text = path.read_text(encoding="utf-8")
+    artists: list[str] = []
+    for line in text.splitlines():
+        name = line.split("#", 1)[0].strip()
+        if name and name not in artists:
+            artists.append(name)
+    return artists[:MAX_ARTISTS]
 
 
-def _host(url: str) -> str:
-    return urllib.parse.urlparse(url).hostname or "source"
-
-
-def _event_window(digest_date: str) -> tuple[dt.date, dt.date]:
-    start = dt.date.fromisoformat(digest_date)
-    return start, start + dt.timedelta(days=EVENT_WINDOW_DAYS)
-
-
-def _event_item(event: dict) -> dict:
-    start: dt.datetime = event["start"]
-    end: dt.datetime | None = event.get("end")
-    date_label = "TODAY" if event["is_today"] else start.strftime("%a %b %-d").upper()
-    if event.get("time_listed", True):
-        time_label = start.strftime("%-I:%M %p")
-        if end:
-            time_label += f"-{end.strftime('%-I:%M %p')}"
-    else:
-        time_label = "TIME NOT LISTED"
-    location = clean(event["location"])
-    scope = event["scope"]
-    return {
-        "title": f"{date_label} · {time_label} · {clean(event['name'])}",
-        "summary": f"{location} · {scope}",
-        "url": digest_picker.strip_userinfo(event["url"]),
-        "published_at": start.isoformat(),
-        "event_start": start.isoformat(),
-        "event_end": end.isoformat() if end else None,
-        "location": location,
-        "source_id": event["source_id"],
-        "source_scope": scope,
-        "rationale": event["rationale"],
-    }
-
-
-def neighborhood_events(raw: bytes, digest_date: str) -> list[dict]:
-    """Parse public JSON-LD plus its adjacent MEC article time metadata."""
-    text = raw.decode("utf-8", errors="replace")
-    script_pattern = re.compile(
-        r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(?P<json>.*?)</script>',
-        re.IGNORECASE | re.DOTALL,
-    )
-    window_start, window_end = _event_window(digest_date)
-    events: list[dict] = []
-    for match in script_pattern.finditer(text):
-        article_start = text.find("<article", match.end())
-        next_script = script_pattern.search(text, match.end())
-        if article_start < 0 or (next_script and next_script.start() < article_start):
-            continue
-        article_end = text.find("</article>", article_start)
-        if article_end < 0:
-            continue
-        article = text[article_start:article_end]
-        script_text = html.unescape(match.group("json")).strip()
-        try:
-            value = json.loads(script_text)
-        except json.JSONDecodeError:
-            start_values = re.findall(r'"startDate"\s*:\s*"([^"]+)"', script_text)
-            name_values = re.findall(r'"name"\s*:\s*"([^"]+)"', script_text)
-            url_values = re.findall(r'"url"\s*:\s*"(https?://[^"]+)"', script_text)
-            location_match = re.search(
-                r'"location"\s*:\s*\{(.*?)\}\s*,\s*"organizer"',
-                script_text,
-                re.DOTALL,
-            )
-            organizer_match = re.search(
-                r'"organizer"\s*:\s*\{(.*?)\}\s*,\s*"offers"',
-                script_text,
-                re.DOTALL,
-            )
-            location_text = location_match.group(1) if location_match else ""
-            organizer_text = organizer_match.group(1) if organizer_match else ""
-            location_names = re.findall(r'"name"\s*:\s*"([^"]*)"', location_text)
-            addresses = re.findall(r'"address"\s*:\s*"([^"]*)"', location_text)
-            organizer_names = re.findall(r'"name"\s*:\s*"([^"]*)"', organizer_text)
-            if not start_values or not name_values or not url_values:
-                continue
-            value = {
-                "startDate": start_values[0],
-                "name": name_values[-1],
-                "url": url_values[-1],
-                "location": {
-                    "name": location_names[-1] if location_names else "",
-                    "address": addresses[-1] if addresses else "",
-                },
-                "organizer": {
-                    "name": organizer_names[-1] if organizer_names else ""
-                },
-            }
-        try:
-            event_date = dt.date.fromisoformat(value["startDate"][:10])
-        except (KeyError, TypeError, ValueError):
-            continue
-        if not window_start <= event_date <= window_end:
-            continue
-        event_id_match = re.search(r'data-event-id=["\'](\d+)["\']', article)
-        start_match = re.search(
-            r'class=["\']mec-start-time["\'][^>]*>(.*?)</span>', article, re.I | re.S
-        )
-        end_match = re.search(
-            r'class=["\']mec-end-time["\'][^>]*>(.*?)</span>', article, re.I | re.S
-        )
-        if not event_id_match or not start_match:
-            continue
-        try:
-            start_time = dt.datetime.strptime(clean(start_match.group(1)), "%I:%M %p").time()
-            start = dt.datetime.combine(event_date, start_time, local_zone())
-            end = None
-            if end_match:
-                end_time = dt.datetime.strptime(clean(end_match.group(1)), "%I:%M %p").time()
-                end = dt.datetime.combine(event_date, end_time, local_zone())
-        except ValueError:
-            continue
-        location_value = value.get("location") or {}
-        venue = clean(str(location_value.get("name") or ""))
-        address = clean(str(location_value.get("address") or ""))
-        location = ", ".join(part for part in (venue, address) if part)
-        if not location:
-            continue
-        name = clean(str(value.get("name") or ""))
-        url = clean(str(value.get("url") or ""))
-        organizer = clean(str((value.get("organizer") or {}).get("name") or ""))
-        primary_text = " ".join((name, venue, address, organizer)).casefold()
-        is_neighborhood = any(marker in primary_text for marker in NEIGHBORHOOD_MARKERS)
-        if not name or not url:
-            continue
-        events.append(
-            {
-                "name": name,
-                "start": start,
-                "end": end,
-                "location": location,
-                "url": url,
-                "source_id": f"{_host(NEIGHBORHOOD_EVENTS_URL)}:mec:{event_id_match.group(1)}",
-                "scope": NEIGHBORHOOD_NAME if is_neighborhood else f"{LOCAL_CITY} area",
-                "priority": 0 if is_neighborhood else 2,
-                "is_today": event_date == window_start,
-                "rationale": (
-                    f"Official {NEIGHBORHOOD_NAME} calendar event"
-                    if is_neighborhood
-                    else f"{LOCAL_CITY}-area fallback from the official {NEIGHBORHOOD_NAME} calendar"
-                ),
-            }
-        )
-    return events
-
-
-def chamber_event_candidates(raw: bytes, digest_date: str) -> list[dict]:
-    text = raw.decode("utf-8", errors="replace")
-    pattern = re.compile(
-        r'<a href=["\'](?P<url>' + re.escape(CHAMBER_EVENTS_URL.rstrip("/")) + r'/Details/[^"\']+)["\']'
-        r'[^>]*class=["\'][^"\']*gz-event-card-title[^"\']*["\'][^>]*>(?P<name>.*?)</a>'
-        r'.*?<meta itemprop=["\']startDate["\'] content=["\'](?P<start>[^"\']+)["\']>'
-        r'.*?<meta itemprop=["\']endDate["\'] content=["\'](?P<end>[^"\']+)["\']>',
-        re.IGNORECASE | re.DOTALL,
-    )
-    window_start, window_end = _event_window(digest_date)
-    result: list[dict] = []
-    seen: set[tuple[str, str]] = set()
-    for match in pattern.finditer(text):
-        try:
-            start = _parse_local_datetime(match.group("start"))
-            end = _parse_local_datetime(match.group("end"))
-        except ValueError:
-            continue
-        if not window_start <= start.date() <= window_end:
-            continue
-        name = clean(match.group("name"))
-        url = html.unescape(match.group("url"))
-        key = (url.split("?", 1)[0], start.isoformat())
-        if key in seen:
-            continue
-        seen.add(key)
-        result.append({"name": name, "url": url, "start": start, "end": end})
-    return sorted(result, key=lambda event: (event["start"], event["name"]))
-
-
-def chamber_event_location(raw: bytes) -> str:
-    text = raw.decode("utf-8", errors="replace")
-    match = re.search(
-        r'<div[^>]+class=["\'][^"\']*gz-event-address[^"\']*["\'][^>]*>(.*?)</div>',
-        text,
-        re.IGNORECASE | re.DOTALL,
-    )
-    if not match:
-        return ""
-    value = re.sub(r"<br\s*/?>", ", ", match.group(1), flags=re.IGNORECASE)
-    value = clean(value)
-    value = re.sub(r"^Address\s+", "", value, flags=re.IGNORECASE)
-    value = re.sub(r"\s+,", ",", value)
-    parts: list[str] = []
-    for part in (piece.strip() for piece in value.split(",")):
-        words = part.split()
-        midpoint = len(words) // 2
-        if len(words) >= 4 and len(words) % 2 == 0:
-            if [word.casefold() for word in words[:midpoint]] == [
-                word.casefold() for word in words[midpoint:]
-            ]:
-                part = " ".join(words[:midpoint])
-        if part:
-            parts.append(part)
-    return ", ".join(parts)
-
-
-def _events_title() -> str:
-    spec = settings.section_by_id("events")
-    if spec is not None:
-        return spec.title
-    return settings.DEFAULT_TITLES["events"]
-
-
-def build_events_section(
-    digest_date: str, fetcher: Callable[[str], bytes]
-) -> tuple[dict, list[dict]]:
-    errors: list[dict] = []
-    events_title = _events_title()
-    neighborhood: list[dict] = []
-    chamber: list[dict] = []
-    try:
-        neighborhood = neighborhood_events(fetcher(NEIGHBORHOOD_EVENTS_URL), digest_date)
-    except Exception as exc:
-        errors.append(
-            {
-                "section": events_title,
-                "url": NEIGHBORHOOD_EVENTS_URL,
-                "error": _failure_name(exc),
-            }
-        )
-    try:
-        candidates = chamber_event_candidates(fetcher(CHAMBER_EVENTS_URL), digest_date)
-        for candidate in candidates[:12]:
-            if len(chamber) >= MAX_EVENTS:
-                break
-            try:
-                location = chamber_event_location(fetcher(candidate["url"]))
-            except Exception as exc:
-                errors.append(
-                    {
-                        "section": events_title,
-                        "url": candidate["url"],
-                        "error": _failure_name(exc),
-                    }
-                )
-                continue
-            if LOCAL_CITY.casefold() not in location.casefold():
-                continue
-            identifier = re.search(r"-(\d+)(?:\?|$)", candidate["url"])
-            candidate.update(
-                {
-                    "location": location,
-                    "source_id": (
-                        f"{_host(CHAMBER_EVENTS_URL)}:event:{identifier.group(1)}"
-                        if identifier
-                        else candidate["url"]
-                    ),
-                    "scope": f"{LOCAL_CITY} area",
-                    "priority": 1,
-                    "is_today": candidate["start"].date()
-                    == dt.date.fromisoformat(digest_date),
-                    "rationale": f"{LOCAL_CITY}-area fallback from the chamber of commerce calendar",
-                }
-            )
-            chamber.append(candidate)
-    except Exception as exc:
-        errors.append(
-            {
-                "section": events_title,
-                "url": CHAMBER_EVENTS_URL,
-                "error": _failure_name(exc),
-            }
-        )
-
-    primary = sorted(
-        (event for event in neighborhood if event["priority"] == 0),
-        key=lambda event: (event["start"], event["name"]),
-    )
-    official_fallback = sorted(
-        (event for event in neighborhood if event["priority"] == 2),
-        key=lambda event: (event["start"], event["name"]),
-    )
-    selected: list[dict] = []
-    for pool in (primary, chamber, official_fallback):
-        for event in pool:
-            identity = (event["url"].split("?", 1)[0], event["start"].isoformat())
-            if any(
-                (prior["url"].split("?", 1)[0], prior["start"].isoformat()) == identity
-                for prior in selected
-            ):
-                continue
-            selected.append(event)
-            if len(selected) == MAX_EVENTS:
-                break
-        if len(selected) == MAX_EVENTS:
-            break
-
-    window_start, window_end = _event_window(digest_date)
-    if selected:
-        items = [_event_item(event) for event in selected]
-    else:
-        items = [
-            {
-                "title": f"No verified local events {window_start:%b %-d}-{window_end:%b %-d}",
-                "summary": f"The configured {NEIGHBORHOOD_NAME} and {LOCAL_CITY} calendars returned no verifiable events in the today/soon window.",
-                "url": NEIGHBORHOOD_EVENTS_URL,
-                "published_at": None,
-                "source_id": "event-window-empty",
-                "rationale": "No source event was available; no event was invented.",
-            }
-        ]
-    return (
+def ticketmaster_events_url(artist: str, start: str, end: str) -> str:
+    """Discovery API search. The key stays in this URL and must not be stored."""
+    query = urllib.parse.urlencode(
         {
-            "section": events_title,
-            "source_feed": NEIGHBORHOOD_EVENTS_URL,
-            "source_feeds": [NEIGHBORHOOD_EVENTS_URL, CHAMBER_EVENTS_URL],
-            "window_start": window_start.isoformat(),
-            "window_end": window_end.isoformat(),
-            "window_days": EVENT_WINDOW_DAYS,
-            "priority_order": [NEIGHBORHOOD_NAME, f"{LOCAL_CITY} area"],
-            "items": items,
-        },
-        errors,
+            "apikey": settings.ticketmaster_key(),
+            "keyword": artist,
+            "classificationName": "music",
+            "latlong": f"{settings.shows_lat():.4f},{settings.shows_lon():.4f}",
+            "geoPoint": geohash(settings.shows_lat(), settings.shows_lon()),
+            "radius": str(settings.shows_radius_miles()),
+            "unit": "miles",
+            "sort": "date,asc",
+            "size": "5",
+            "startDateTime": start,
+            "endDateTime": end,
+        }
     )
+    return TICKETMASTER_EVENTS + "?" + query
+
+
+def _shows_window(digest_day: str) -> tuple[str, str]:
+    day = dt.date.fromisoformat(digest_day)
+    start = dt.datetime(day.year, day.month, day.day, tzinfo=dt.timezone.utc)
+    end = start + dt.timedelta(days=settings.shows_horizon_days())
+    fmt = "%Y-%m-%dT%H:%M:%SZ"
+    return start.strftime(fmt), end.strftime(fmt)
+
+
+def build_shows_section(
+    digest_day: str,
+    fetcher: Callable[[str], bytes],
+    history: list[dict],
+) -> tuple[dict | None, list[dict], list[dict]]:
+    """Upcoming concerts. Returns no section when the key, file, or matches are missing."""
+    spec = settings.section_by_id("shows")
+    if spec is None or not settings.ticketmaster_key():
+        return None, [], []
+    path = settings.artists_path()
+    if path is None or not path.is_file():
+        return None, [], []
+    try:
+        artists = load_artists(path)
+    except OSError:
+        return None, [], []
+    if not artists:
+        return None, [], []
+    try:
+        start, end = _shows_window(digest_day)
+    except ValueError:
+        return None, [], []
+    errors: list[dict] = []
+    found: list[dict] = []
+    for artist in artists:
+        # The request URL contains the API key. Errors cite the bare endpoint instead.
+        url = ticketmaster_events_url(artist, start, end)
+        try:
+            raw = fetcher(url)
+        except Exception as exc:
+            errors.append({"section": spec.title, "url": TICKETMASTER_EVENTS, "error": _failure_name(exc)})
+            continue
+        try:
+            found.extend(
+                digest_picker.shows_from_ticketmaster(
+                    raw,
+                    artist,
+                    digest_day,
+                    history,
+                    settings.shows_horizon_days(),
+                )
+            )
+        except Exception:
+            errors.append({"section": spec.title, "url": TICKETMASTER_EVENTS, "error": "ticketmaster_parse"})
+    if not found:
+        return None, errors, []
+    found.sort(key=lambda item: (item["event_start"], item["title"]))
+    items: list[dict] = []
+    records: list[dict] = []
+    seen_ids: set[str] = set()
+    for item in found:
+        if item["show_id"] in seen_ids:
+            continue
+        seen_ids.add(item["show_id"])
+        items.append(
+            {
+                "title": item["title"],
+                "summary": item["summary"],
+                "url": item["url"],
+                "published_at": item["event_start"],
+            }
+        )
+        records.append(
+            {
+                "digest_date": digest_day,
+                "section": "shows",
+                "url": digest_picker.normalize_url(item["url"]),
+                "title": digest_picker.normalize_title(item["title"]),
+                "show_id": item["show_id"],
+                "event_start": item["event_start"],
+                "phase": item["phase"],
+            }
+        )
+        if len(items) >= MAX_SHOWS:
+            break
+    return {"section": spec.title, "source_feed": TICKETMASTER_EVENTS, "items": items}, errors, records
 
 
 def _period_on_date(period: dict, today: dt.date, tz: ZoneInfo) -> bool:
@@ -657,14 +469,7 @@ def _emergency_payload(digest_date: str, moment: dt.datetime) -> dict:
     for spec in settings.sections():
         if spec.optional:
             continue
-        if spec.kind == "events":
-            item = {
-                "title": "No verified local events",
-                "summary": "The events calendars were not available for this edition.",
-                "url": "https://example.invalid/events",
-                "source_id": "event-window-empty",
-            }
-        elif spec.kind == "weather":
+        if spec.kind == "weather":
             item = {
                 "headline": "Forecast unavailable",
                 "summary": "The forecast could not be built for this edition.",
@@ -770,51 +575,64 @@ def _make_payload(
     for spec in specs:
         if spec.kind != "news":
             continue
-        feed_url, prefer_terms = settings.news_feed(spec.id)
         try:
-            candidates = rss_items(bounded(feed_url))
+            feeds = settings.feeds_for(spec.id)
         except Exception as exc:
-            errors.append({"section": spec.title, "url": digest_picker.strip_userinfo(feed_url), "error": _failure_name(exc)})
+            errors.append({"section": spec.title, "url": "feeds", "error": _failure_name(exc)})
+            continue
+        collected: list[dict] = []
+        public_urls: list[str] = []
+        failures = 0
+        for feed in feeds:
+            public = digest_picker.strip_userinfo(feed.url)
+            public_urls.append(public)
+            try:
+                raw_items = rss_items(bounded(feed.url))
+            except Exception as exc:
+                failures += 1
+                errors.append({"section": spec.title, "url": public, "error": _failure_name(exc)})
+                continue
+            for raw in raw_items:
+                item = dict(raw)
+                item["topic"] = feed.topic
+                blob = f"{item.get('title') or ''} {item.get('summary') or ''}"
+                if feed.required and not any(term in blob.casefold() for term in feed.required):
+                    continue
+                if spec.id == "local" and not digest_picker.keep_local(item, require_place=feed.require_place):
+                    continue
+                if spec.id == "companies" and not digest_picker.keep_company(item):
+                    continue
+                collected.append(item)
+        if feeds and failures == len(feeds):
+            first = public_urls[0]
             by_id[spec.id] = {
                 "section": spec.title,
-                "source_feed": digest_picker.strip_userinfo(feed_url),
-                "items": [_unavailable_news_item(feed_url, exc)],
+                "source_feed": first,
+                "items": [_unavailable_news_item(first, TimeoutError("unavailable"))],
             }
             continue
-        news_requests.append(
-            {
-                "section_id": spec.id,
-                "title": spec.title,
-                "purpose": spec.purpose,
-                "feed_url": feed_url,
-                "prefer_terms": prefer_terms,
-                "candidates": candidates,
-            }
-        )
-
-    if settings.section_by_id("events") is not None:
-        try:
-            events_section, event_errors = build_events_section(digest_date, bounded)
-        except Exception as exc:
-            events_title = _events_title()
-            errors.append({"section": events_title, "url": NEIGHBORHOOD_EVENTS_URL, "error": _failure_name(exc)})
-            events_section = {
-                "section": events_title,
-                "source_feed": NEIGHBORHOOD_EVENTS_URL,
-                "items": [
-                    {
-                        "title": "No verified local events",
-                        "summary": "The configured calendars could not be read for this edition.",
-                        "url": NEIGHBORHOOD_EVENTS_URL,
-                        "published_at": None,
-                        "source_id": "event-window-empty",
-                        "rationale": "No source event was available; no event was invented.",
-                    }
-                ],
-            }
-            event_errors = []
-        by_id["events"] = events_section
-        errors.extend(event_errors)
+        if spec.id == "companies":
+            collected = digest_picker.select_company_fresh(
+                collected,
+                moment,
+                settings.fresh_hours(),
+                settings.company_stale_hours(),
+            )
+        else:
+            collected = digest_picker.select_fresh(collected, moment, hours=settings.fresh_hours())
+        request = {
+            "section_id": spec.id,
+            "title": spec.title,
+            "purpose": spec.purpose,
+            "feed_url": public_urls[0] if public_urls else "",
+            "prefer_terms": (),
+            "candidates": collected,
+        }
+        topics = {str(item.get("topic") or "") for item in collected if item.get("topic")}
+        # One real story per company, even when shows or bot notes have shortened the other sections.
+        if spec.id == "companies" and len(topics) > 1:
+            request["item_count"] = min(2, len(topics))
+        news_requests.append(request)
 
     bot_spec = settings.section_by_id("bot_updates")
     bot_dir = bot_directory or settings.bot_updates_dir()
@@ -845,15 +663,24 @@ def _make_payload(
         history, history_error = [], "history ignored: unreadable"
     if history_error:
         errors.append({"section": "HISTORY", "url": "digest-history", "error": history_error})
+    profile, profile_error = digest_picker.load_profile(settings.profile_path())
+    if profile_error:
+        errors.append({"section": "PROFILE", "url": "interests", "error": profile_error})
+    shows_section, show_errors, show_records = build_shows_section(digest_date, bounded, history)
+    errors.extend(show_errors)
+    if shows_section is not None:
+        by_id["shows"] = shows_section
     try:
         picked, picker_meta, picker_errors, history_records = digest_picker.pick_news(
             news_requests,
             digest_date=digest_date,
             history=history,
             has_bots="bot_updates" in by_id,
+            crowded="shows" in by_id,
             taste=settings.taste(),
             opener=opener,
             deadline=deadline,
+            profile=profile,
         )
     except Exception:
         picked, picker_meta, picker_errors, history_records = {}, {"mode": "fallback", "model": None, "reason": "picker_error"}, [], []
@@ -869,6 +696,7 @@ def _make_payload(
             ]
         errors.append({"section": "PICKER", "url": "llm", "error": "llm fallback: picker_error"})
     errors.extend(picker_errors)
+    history_records.extend(show_records)
     feeds = {request["section_id"]: request["feed_url"] for request in news_requests}
     for section_id, items in picked.items():
         spec = settings.section_by_id(section_id)

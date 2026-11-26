@@ -50,6 +50,34 @@ _DEATH = re.compile(
     re.IGNORECASE,
 )
 _DIES_AT_SEA = re.compile(r"\bdies at sea\b", re.IGNORECASE)
+# "died in committee" / "killed in committee" is a bill, not a person.
+_COMMITTEE = re.compile(
+    r"\b(?:dies|died|was killed|killed)\s+in\s+(?:the\s+)?committee\b",
+    re.IGNORECASE,
+)
+_TITLE_STOP = frozenset(
+    "a an the of and to in on for with from by at as is was are were be been or its their "
+    "after over into about amid says said".split()
+)
+_LOCAL_PLACE = re.compile(
+    r"\bbastrop\b|\bsmithville\b|\belgin\b|\bcedar creek\b|\beast austin\b",
+    re.IGNORECASE,
+)
+_LOCAL_CIVIC = re.compile(
+    r"\bcity council\b|\bschool board\b|\bcommissioners?\b|\bordinance\b|"
+    r"\barrested\b|\bshooting\b|\bhomicide\b|\bmurder(?:ed)?\b|\bobituary\b|"
+    r"\bindicted\b|\bpolice said\b|\blegislature\b|\bgovernment\b|"
+    r"\bschool district\b|\bisd\b|\bcounty judge\b|\bzoning\b",
+    re.IGNORECASE,
+)
+_STOCK = re.compile(
+    r"\bstocks?\b|\bshares?\b|\bnasdaq\b|\bnyse\b|\bprice target\b|"
+    r"\bdowngrade\b|\bupgrade\b|\bbuy the dip\b|\bshare price\b|\bmarket cap\b|\bticker\b",
+    re.IGNORECASE,
+)
+_SPACEX = re.compile(r"\b(?:spacex|starship|falcon|starlink)\b", re.IGNORECASE)
+_LEADING_ARTICLE = re.compile(r"^(?:the|a|an)\s+")
+_TRIBUTE = re.compile(r"\b(?:tribute|tributes|cover band|the music of)\b|\bexperience\b", re.IGNORECASE)
 _SPAM = re.compile(
     r"last chance to buy|stock alert|penny stocks?|stocks? to buy|shares? to buy|"
     r"buy alert|hot stock tip|buy now|act now|limited[- ]time|you won'?t believe|"
@@ -481,11 +509,368 @@ def is_obituary(text: str) -> bool:
     value = text or ""
     if _OBITUARY.search(value):
         return True
-    if not _DEATH.search(value):
+    # Legislative phrasing is not a death notice. A real death later in the same line still is.
+    remainder = _COMMITTEE.sub(" ", value)
+    if not _DEATH.search(remainder):
         return False
     # "dies at sea" is a wreck headline, not a death notice. Any other death word still drops it.
-    remainder = _DIES_AT_SEA.sub(" ", value)
+    remainder = _DIES_AT_SEA.sub(" ", remainder)
     return bool(_DEATH.search(remainder))
+
+
+def keep_local(item: dict, *, require_place: bool) -> bool:
+    blob = f"{item.get('title') or ''} {item.get('summary') or ''}"
+    if _LOCAL_CIVIC.search(blob) or is_obituary(blob):
+        return False
+    if require_place and not _LOCAL_PLACE.search(blob):
+        return False
+    return True
+
+
+def keep_company(item: dict) -> bool:
+    blob = f"{item.get('title') or ''} {item.get('summary') or ''}"
+    if is_spam(blob) or _STOCK.search(blob):
+        return False
+    topic = str(item.get("topic") or "")
+    if topic == "earth":
+        return "earth funeral" in blob.casefold()
+    if topic == "spacex":
+        return bool(_SPACEX.search(blob))
+    return True
+
+
+def published_age_hours(value: object, now: dt.datetime) -> float | None:
+    if value is None or value == "":
+        return None
+    text = str(value)
+    parsed = None
+    try:
+        parsed = parsedate_to_datetime(text)
+    except (TypeError, ValueError, OverflowError):
+        try:
+            parsed = dt.datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except (TypeError, ValueError, OverflowError):
+            return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    moment = now if now.tzinfo else now.replace(tzinfo=dt.timezone.utc)
+    return (moment.astimezone(dt.timezone.utc) - parsed.astimezone(dt.timezone.utc)).total_seconds() / 3600
+
+
+def select_fresh(
+    items: list[dict],
+    now: dt.datetime,
+    *,
+    hours: int,
+    outer_hours: int | None = None,
+) -> list[dict]:
+    """Keep items newer than ``hours`` when any exist. Otherwise keep the older ones.
+
+    Undated items are not fresh. ``outer_hours`` drops anything older than that even
+    when nothing is fresh, so a quiet company topic is left empty instead of padded.
+    """
+    annotated = [(item, published_age_hours(item.get("published_at"), now)) for item in items]
+    fresh = [item for item, age in annotated if age is not None and -1 <= age <= hours]
+    if fresh:
+        return fresh
+    if outer_hours is None:
+        return [item for item, _age in annotated]
+    return [item for item, age in annotated if age is not None and age <= outer_hours]
+
+
+def select_company_fresh(items: list[dict], now: dt.datetime, hours: int, outer_hours: int) -> list[dict]:
+    """Freshness is per company, so a new SpaceX story does not erase a sparse Earth Funeral item."""
+    groups: dict[str, list[dict]] = {}
+    order: list[str] = []
+    for item in items:
+        topic = str(item.get("topic") or "")
+        if topic not in groups:
+            order.append(topic)
+            groups[topic] = []
+        groups[topic].append(item)
+    kept: list[dict] = []
+    for topic in order:
+        kept.extend(select_fresh(groups[topic], now, hours=hours, outer_hours=outer_hours))
+    return kept
+
+
+def _profile_bucket(value: object) -> dict[str, list[str]]:
+    likes: list[str] = []
+    dislikes: list[str] = []
+    if isinstance(value, dict):
+        for phrase in value.get("likes") or []:
+            text = str(phrase).strip()
+            if text:
+                likes.append(text[:80])
+        for phrase in value.get("dislikes") or []:
+            text = str(phrase).strip()
+            if text:
+                dislikes.append(text[:80])
+    return {"likes": likes[:40], "dislikes": dislikes[:40]}
+
+
+def parse_profile(text: str) -> dict:
+    """A small line-oriented profile. JSON is accepted when the file starts with '{'."""
+    stripped = text.strip()
+    if not stripped:
+        return {"*": {"likes": [], "dislikes": []}}
+    if stripped.startswith("{"):
+        value = json.loads(stripped)
+        if not isinstance(value, dict):
+            raise ValueError("profile")
+        profile = {"*": _profile_bucket(value)}
+        for key, bucket in value.items():
+            if key in {"likes", "dislikes"} or not isinstance(key, str):
+                continue
+            if re.fullmatch(r"[A-Za-z0-9_-]+", key) and isinstance(bucket, dict):
+                profile[key.casefold()] = _profile_bucket(bucket)
+        return profile
+    profile: dict[str, dict[str, list[str]]] = {"*": {"likes": [], "dislikes": []}}
+    current = "*"
+    mode: str | None = None
+    for line in text.splitlines():
+        raw = line.split("#", 1)[0].strip()
+        if not raw:
+            continue
+        if raw.startswith("- "):
+            phrase = raw[2:].strip().strip("\"'")[:80]
+            if mode and phrase:
+                profile.setdefault(current, {"likes": [], "dislikes": []})
+                profile[current][mode].append(phrase)
+            continue
+        if raw.endswith(":"):
+            key = raw[:-1].strip().strip("\"'")
+            if key in {"likes", "dislikes"}:
+                mode = key
+                profile.setdefault(current, {"likes": [], "dislikes": []})
+            elif re.fullmatch(r"[A-Za-z0-9_-]+", key):
+                current = key.casefold()
+                mode = None
+                profile.setdefault(current, {"likes": [], "dislikes": []})
+    return profile
+
+
+def empty_profile() -> dict:
+    return {"*": {"likes": [], "dislikes": []}}
+
+
+def load_profile(path: Path | None) -> tuple[dict, str | None]:
+    if path is None:
+        return empty_profile(), None
+    try:
+        if not path.is_file():
+            return empty_profile(), "profile ignored: missing"
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return empty_profile(), "profile ignored: unreadable"
+    if len(text) > 20000:
+        return empty_profile(), "profile ignored: unreadable"
+    try:
+        return parse_profile(text), None
+    except Exception:
+        return empty_profile(), "profile ignored: invalid"
+
+
+def profile_terms(profile: dict, section_id: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    likes: list[str] = []
+    dislikes: list[str] = []
+    for key in ("*", section_id):
+        bucket = profile.get(key) or {}
+        likes.extend(bucket.get("likes") or [])
+        dislikes.extend(bucket.get("dislikes") or [])
+    return tuple(likes), tuple(dislikes)
+
+
+def profile_brief(profile: dict) -> str:
+    lines: list[str] = []
+    for section, bucket in profile.items():
+        if not isinstance(bucket, dict):
+            continue
+        label = "all sections" if section == "*" else section
+        if bucket.get("likes"):
+            lines.append(f"{label} likes: " + "; ".join(bucket["likes"]))
+        if bucket.get("dislikes"):
+            lines.append(f"{label} dislikes: " + "; ".join(bucket["dislikes"]))
+    return "\n".join(lines)[:2000]
+
+
+def interest_score(item: dict, likes: tuple[str, ...], dislikes: tuple[str, ...], prefer_terms: tuple[str, ...]) -> int:
+    haystack = f"{item.get('title') or ''} {item.get('summary') or ''}".casefold()
+    score = 0
+    if any(term and term.casefold() in haystack for term in prefer_terms):
+        score += 3
+    for phrase in likes:
+        if phrase and phrase.casefold() in haystack:
+            score += 2
+    for phrase in dislikes:
+        if phrase and phrase.casefold() in haystack:
+            score -= 3
+    return score
+
+
+def significant_tokens(title: str) -> frozenset[str]:
+    tokens: list[str] = []
+    for token in normalize_title(title).split():
+        if token in _TITLE_STOP or len(token) <= 2:
+            continue
+        for suffix in ("ing", "ed", "es", "s"):
+            if len(token) > len(suffix) + 3 and token.endswith(suffix):
+                token = token[: -len(suffix)]
+                break
+        if token and token not in _TITLE_STOP:
+            tokens.append(token)
+    return frozenset(tokens)
+
+
+def titles_similar(left: str, right: str) -> bool:
+    """Same story from two outlets: shared wording, not a shared city or verb."""
+    first = significant_tokens(left)
+    second = significant_tokens(right)
+    if len(first) < 3 or len(second) < 3:
+        return False
+    shared = first & second
+    if len(shared) < 3:
+        return False
+    jaccard = len(shared) / len(first | second)
+    contain = len(shared) / min(len(first), len(second))
+    return jaccard >= 0.62 and contain >= 0.8
+
+
+def artist_key(name: str) -> str:
+    text = _LEADING_ARTICLE.sub("", normalize_title(name)).strip()
+    return text
+
+
+def names_match_artist(wanted: str, candidate: str) -> bool:
+    left = artist_key(wanted)
+    right = artist_key(candidate)
+    if not left or left != right:
+        return False
+    if _TRIBUTE.search(candidate) and not _TRIBUTE.search(wanted):
+        return False
+    return True
+
+
+def event_matches_artist(wanted: str, event_name: str, attractions: list[str]) -> bool:
+    if _TRIBUTE.search(event_name) and not _TRIBUTE.search(wanted):
+        return False
+    if any(names_match_artist(wanted, name) for name in attractions):
+        return True
+    return names_match_artist(wanted, event_name)
+
+
+def show_already_mentioned(history: list[dict], show_id: str, phase: str, digest_date: str) -> bool:
+    """Mention a show once when it is first seen, and once more inside a week."""
+    if not show_id:
+        return False
+    for record in history:
+        if not isinstance(record, dict):
+            continue
+        if str(record.get("digest_date") or "") == digest_date:
+            continue
+        if str(record.get("show_id") or "") != show_id:
+            continue
+        recorded = str(record.get("phase") or "")
+        if phase == "early":
+            return True
+        if phase == "week" and recorded == "week":
+            return True
+    return False
+
+
+def _show_clock(local_time: str) -> str:
+    if not local_time:
+        return "TIME TBA"
+    parsed = None
+    for pattern in ("%H:%M:%S", "%H:%M"):
+        try:
+            parsed = dt.datetime.strptime(local_time[:8] if pattern == "%H:%M:%S" else local_time[:5], pattern)
+            break
+        except ValueError:
+            continue
+    if parsed is None:
+        return "TIME TBA"
+    hour = parsed.hour % 12 or 12
+    suffix = "AM" if parsed.hour < 12 else "PM"
+    return f"{hour}:{parsed.minute:02d} {suffix}"
+
+
+def shows_from_ticketmaster(
+    raw: bytes | str,
+    artist: str,
+    digest_date: str,
+    history: list[dict],
+    horizon_days: int,
+) -> list[dict]:
+    """Turn one Discovery API body into printable shows. The body must not be stored."""
+    text = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else raw
+    payload = json.loads(text)
+    if not isinstance(payload, dict):
+        raise ValueError("ticketmaster_parse")
+    embedded = payload.get("_embedded")
+    rows = embedded.get("events") if isinstance(embedded, dict) else None
+    if not isinstance(rows, list):
+        return []
+    try:
+        edition = dt.date.fromisoformat(digest_date)
+    except ValueError:
+        return []
+    found: list[dict] = []
+    for event in rows:
+        if not isinstance(event, dict):
+            continue
+        name = str(event.get("name") or "")
+        inner = event.get("_embedded") if isinstance(event.get("_embedded"), dict) else {}
+        attractions = [
+            str(row.get("name"))
+            for row in (inner.get("attractions") or [])
+            if isinstance(row, dict) and row.get("name")
+        ]
+        if not event_matches_artist(artist, name, attractions):
+            continue
+        dates = event.get("dates") if isinstance(event.get("dates"), dict) else {}
+        start = dates.get("start") if isinstance(dates.get("start"), dict) else {}
+        local_date = start.get("localDate")
+        if not isinstance(local_date, str):
+            continue
+        try:
+            day = dt.date.fromisoformat(local_date)
+        except ValueError:
+            continue
+        delta = (day - edition).days
+        if delta < 0 or delta > horizon_days:
+            continue
+        show_id = str(event.get("id") or "").strip()
+        if not show_id or len(show_id) > 80:
+            continue
+        phase = "week" if delta <= 7 else "early"
+        if show_already_mentioned(history, show_id, phase, digest_date):
+            continue
+        url = event.get("url")
+        if not isinstance(url, str) or not url.startswith("http"):
+            continue
+        url = strip_userinfo(url)
+        venues = [row for row in (inner.get("venues") or []) if isinstance(row, dict)]
+        venue = venues[0] if venues else {}
+        venue_name = clean_spaces(str(venue.get("name") or "Venue TBA"))
+        city_row = venue.get("city") if isinstance(venue.get("city"), dict) else {}
+        city = clean_spaces(str(city_row.get("name") or ""))
+        place = ", ".join(part for part in (venue_name, city) if part)
+        matched = next((row for row in attractions if names_match_artist(artist, row)), artist)
+        local_time = start.get("localTime") if isinstance(start.get("localTime"), str) else ""
+        label = f"{day.strftime('%a').upper()} {day.strftime('%b').upper()} {day.day}"
+        title = clean_spaces(f"{label} · {_show_clock(local_time)} · {matched}")
+        found.append(
+            {
+                "title": title[:240],
+                "summary": (place + ".") if place else "Venue to be announced.",
+                "url": url,
+                "event_start": local_date,
+                "show_id": show_id,
+                "phase": phase,
+            }
+        )
+    return found
 
 
 def is_spam(text: str) -> bool:
@@ -613,6 +998,8 @@ def prepare_candidate(item: dict) -> dict | None:
         prepared["source_label"] = outlet
     elif item.get("source_label"):
         prepared["source_label"] = clean_spaces(str(item["source_label"]))
+    if item.get("topic"):
+        prepared["topic"] = str(item["topic"])
     return prepared
 
 
@@ -646,17 +1033,24 @@ class Seen:
             url = str(record.get("url") or "")
             if url:
                 self.history_urls.add(url)
-            key = title_key(str(record.get("title") or ""))
+            key = normalize_title(str(record.get("title") or ""))
             if key:
                 self.history_titles.add(key)
         self.chosen_urls: set[str] = set()
         self.chosen_titles: set[str] = set()
 
+    def _title_hit(self, title: str, titles: set[str]) -> bool:
+        key = normalize_title(title)
+        if not key:
+            return False
+        if title_key(title) and key in titles:
+            return True
+        return any(titles_similar(key, prior) for prior in titles)
+
     def _match(self, item: dict, urls: set[str], titles: set[str]) -> bool:
         if normalize_url(item["url"]) in urls:
             return True
-        key = title_key(item["title"])
-        return bool(key and key in titles)
+        return self._title_hit(item["title"], titles)
 
     def in_history(self, item: dict) -> bool:
         return self._match(item, self.history_urls, self.history_titles)
@@ -729,15 +1123,29 @@ def fallback_from_eligible(
     seen: Seen,
     prefer_terms: tuple[str, ...],
     max_chars: int,
+    likes: tuple[str, ...] = (),
+    dislikes: tuple[str, ...] = (),
 ) -> list[dict]:
-    preferred_ids: set[int] = set()
-    preferred: list[dict] = []
-    if prefer_terms:
-        for item in eligible:
-            if _matches_terms(item, prefer_terms):
-                preferred.append(item)
-                preferred_ids.add(id(item))
-    ordered = preferred + [item for item in eligible if id(item) not in preferred_ids]
+    ranked_pairs = sorted(
+        enumerate(eligible),
+        key=lambda pair: (-interest_score(pair[1], likes, dislikes, prefer_terms), pair[0]),
+    )
+    ranked = [item for _index, item in ranked_pairs]
+    company_topics = [item.get("topic") for item in ranked if item.get("topic") in {"spacex", "earth"}]
+    if len(set(company_topics)) > 1:
+        buckets: dict[str, list[dict]] = {}
+        for item in ranked:
+            topic = str(item.get("topic") or "")
+            if topic in {"spacex", "earth"}:
+                buckets.setdefault(topic, []).append(item)
+        ordered = []
+        while any(buckets.values()):
+            for topic in ("spacex", "earth"):
+                if buckets.get(topic):
+                    ordered.append(buckets[topic].pop(0))
+        ordered.extend(item for item in ranked if item.get("topic") not in {"spacex", "earth"})
+    else:
+        ordered = ranked
     chosen: list[dict] = []
     for item in ordered:
         if seen.repeat(item):
@@ -774,9 +1182,11 @@ def fallback_pick(
     prefer_terms: tuple[str, ...] = (),
     max_chars: int = 300,
     feed_url: str = "",
+    likes: tuple[str, ...] = (),
+    dislikes: tuple[str, ...] = (),
 ) -> list[dict]:
     eligible = eligible_candidates(candidates, seen)
-    chosen = fallback_from_eligible(eligible, count, seen, prefer_terms, max_chars)
+    chosen = fallback_from_eligible(eligible, count, seen, prefer_terms, max_chars, likes, dislikes)
     if chosen:
         return [_public_item(item) for item in chosen]
     return [placeholder_item(feed_url or "https://example.invalid/feed")]
@@ -795,7 +1205,8 @@ def _system_prompt(count: int, max_chars: int) -> str:
         "You choose items for a morning news receipt shared by two adults. "
         "Pick the most newsworthy and interesting candidates. Reject obituaries, "
         "advertisements, clickbait, and investing spam such as last-chance-to-buy alerts. "
-        "Prefer concrete events over commentary. Follow the taste note and each section's purpose. "
+        "Prefer concrete events over commentary. Follow the taste note, the interests profile, and each section's purpose. "
+        "When the profile dislikes a candidate, do not spend a slot on it if anything else is left. "
         f"Use only the candidate urls, copied exactly. Choose at most {count} items per section "
         "and use each url at most once. Do not invent items. "
         f"Write each summary as one or two sentences in plain words, at most {max_chars} characters, "
@@ -806,7 +1217,13 @@ def _system_prompt(count: int, max_chars: int) -> str:
     )
 
 
-def _user_payload(groups: list[tuple[str, str, list[dict]]], taste: str, count: int, max_chars: int) -> str:
+def _user_payload(
+    groups: list[tuple[str, str, list[dict]]],
+    taste: str,
+    count: int,
+    max_chars: int,
+    interests: str = "",
+) -> str:
     sections = []
     for title, purpose, eligible in groups:
         candidates = []
@@ -824,6 +1241,7 @@ def _user_payload(groups: list[tuple[str, str, list[dict]]], taste: str, count: 
     return json.dumps(
         {
             "taste": taste,
+            "interests": interests,
             "items_per_section": count,
             "summary_max_chars": max_chars,
             "sections": sections,
@@ -955,6 +1373,7 @@ def llm_pick(
     taste: str,
     opener,
     deadline: float | None = None,
+    interests: str = "",
 ) -> list[dict]:
     key = settings.llm_api_key()
     if not key or any(char.isspace() for char in key):
@@ -962,7 +1381,7 @@ def llm_pick(
     url = _chat_url()
     messages = [
         {"role": "system", "content": _system_prompt(count, max_chars)},
-        {"role": "user", "content": _user_payload(groups, taste, count, max_chars)},
+        {"role": "user", "content": _user_payload(groups, taste, count, max_chars, interests)},
     ]
     full = {
         "model": settings.llm_model(),
@@ -1019,6 +1438,8 @@ def pick_news(
     item_count: int | None = None,
     summary_chars: int | None = None,
     deadline: float | None = None,
+    profile: dict | None = None,
+    crowded: bool = False,
 ) -> tuple[dict[str, list[dict]], dict, list[dict], list[dict]]:
     """Pick items for each news section.
 
@@ -1026,8 +1447,10 @@ def pick_news(
     and candidates. Returns items by section id, picker metadata, source errors,
     and history records.
     """
-    count = item_count if item_count is not None else settings.news_item_count(has_bots)
-    max_chars = summary_chars if summary_chars is not None else settings.summary_limit(has_bots)
+    count = item_count if item_count is not None else settings.news_item_count(has_bots, crowded=crowded)
+    max_chars = summary_chars if summary_chars is not None else settings.summary_limit(has_bots, crowded=crowded)
+    profile = profile or empty_profile()
+    interests = profile_brief(profile)
     seen = Seen(history, digest_date, settings.history_days())
     prepared: list[tuple[dict, list[dict]]] = []
     for request in requests:
@@ -1051,6 +1474,7 @@ def pick_news(
                 taste=taste if taste is not None else settings.taste(),
                 opener=opener,
                 deadline=deadline,
+                interests=interests,
             )
             reason = "ok"
         except LLMError as exc:
@@ -1074,11 +1498,14 @@ def pick_news(
     items_by_id: dict[str, list[dict]] = {}
     records: list[dict] = []
     for request, eligible in prepared:
+        section_count = count
+        if isinstance(request.get("item_count"), int) and request["item_count"] > 0:
+            section_count = request["item_count"]
         chosen: list[dict] = []
         if llm_picks is not None:
             by_url = {item["url"]: item for item in eligible}
             for pick in picks_by_title.get(request["title"], []):
-                if len(chosen) >= count:
+                if len(chosen) >= section_count:
                     break
                 candidate = by_url.get(pick["url"])
                 if candidate is None or seen.repeat(candidate):
@@ -1093,13 +1520,16 @@ def pick_news(
                 seen.mark(picked)
                 chosen.append(picked)
                 used_llm = True
-        if len(chosen) < count:
+        if len(chosen) < section_count:
+            likes, dislikes = profile_terms(profile, str(request.get("section_id") or ""))
             extra = fallback_from_eligible(
                 eligible,
-                count - len(chosen),
+                section_count - len(chosen),
                 seen,
                 tuple(request.get("prefer_terms") or ()),
                 max_chars,
+                likes,
+                dislikes,
             )
             if extra:
                 if llm_picks is not None:
@@ -1153,14 +1583,17 @@ def load_history(path: Path) -> tuple[list[dict], str | None]:
         url = item.get("url")
         title = item.get("title")
         if isinstance(recorded_date, str) and isinstance(url, str) and isinstance(title, str):
-            items.append(
-                {
-                    "digest_date": recorded_date[:32],
-                    "section": item.get("section") if isinstance(item.get("section"), str) else "",
-                    "url": strip_userinfo(url)[:HISTORY_URL_MAX],
-                    "title": title[:HISTORY_TITLE_MAX],
-                }
-            )
+            loaded = {
+                "digest_date": recorded_date[:32],
+                "section": item.get("section") if isinstance(item.get("section"), str) else "",
+                "url": strip_userinfo(url)[:HISTORY_URL_MAX],
+                "title": title[:HISTORY_TITLE_MAX],
+            }
+            for extra_key in ("show_id", "event_start", "phase"):
+                extra = item.get(extra_key)
+                if isinstance(extra, str) and extra.strip():
+                    loaded[extra_key] = extra.strip()[:80]
+            items.append(loaded)
     return items, None
 
 
@@ -1228,14 +1661,17 @@ def save_history(path: Path, digest_date: str, records: list[dict], keep_days: i
             if item["digest_date"] >= cutoff and item["digest_date"] != digest_date
         ]
         for record in records:
-            kept.append(
-                {
-                    "digest_date": str(record.get("digest_date") or digest_date)[:32],
-                    "section": str(record.get("section") or "")[:40],
-                    "url": strip_userinfo(str(record.get("url") or ""))[:HISTORY_URL_MAX],
-                    "title": str(record.get("title") or "")[:HISTORY_TITLE_MAX],
-                }
-            )
+            stored = {
+                "digest_date": str(record.get("digest_date") or digest_date)[:32],
+                "section": str(record.get("section") or "")[:40],
+                "url": strip_userinfo(str(record.get("url") or ""))[:HISTORY_URL_MAX],
+                "title": str(record.get("title") or "")[:HISTORY_TITLE_MAX],
+            }
+            for extra_key in ("show_id", "event_start", "phase"):
+                extra = record.get(extra_key)
+                if isinstance(extra, str) and extra.strip():
+                    stored[extra_key] = extra.strip()[:80]
+            kept.append(stored)
         _atomic_json(path, {"version": 1, "items": kept})
         return True
 

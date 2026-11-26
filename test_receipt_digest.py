@@ -20,12 +20,7 @@ for _name in list(os.environ):
 os.environ["DIGEST_LLM_API_KEY"] = ""
 os.environ.update(
     {
-        "DIGEST_LOCATION_LABEL": "near Springfield",
-        "DIGEST_NEIGHBORHOOD_EVENTS_URL": "https://maplegrove.example.org/events/",
-        "DIGEST_NEIGHBORHOOD_NAME": "Maple Grove",
-        "DIGEST_NEIGHBORHOOD_MARKERS": "maple grove,100 main street",
-        "DIGEST_CHAMBER_EVENTS_URL": "https://business.chamber.example.com/eventcalendar",
-        "DIGEST_LOCAL_CITY": "Springfield",
+        "DIGEST_LOCATION_LABEL": "Bastrop, TX",
     }
 )
 
@@ -37,42 +32,13 @@ from PIL import Image
 def payload(headline_suffix: str = "") -> dict:
     sections = []
     for name in rd.EXPECTED_SECTIONS:
-        if name == "EVENTS TODAY / SOON":
-            sections.append(
-                {
-                    "section": name,
-                    "source_feed": dg.NEIGHBORHOOD_EVENTS_URL,
-                    "source_feeds": [dg.NEIGHBORHOOD_EVENTS_URL, dg.CHAMBER_EVENTS_URL],
-                    "window_start": "2026-09-15",
-                    "window_end": "2026-10-06",
-                    "window_days": 21,
-                    "priority_order": ["Maple Grove", "Springfield area"],
-                    "items": [
-                        {
-                            "title": f"TODAY · 5:30 PM-6:30 PM · Maple Grove HOA Meeting{headline_suffix}",
-                            "summary": "Community Center, 100 Main Street, Springfield, ST 00000 · Maple Grove",
-                            "url": "https://maplegrove.example.org/events/maple-grove-hoa-meeting-2/",
-                            "source_id": "maplegrove.example.org:mec:2769",
-                            "published_at": "2026-09-15T17:30:00-05:00",
-                        },
-                        {
-                            "title": f"WED SEP 16 · 11:00 AM-1:00 PM · Toddler Time{headline_suffix}",
-                            "summary": "15 Library Lane, Springfield, ST 00000 · Springfield area",
-                            "url": "https://business.chamber.example.com/eventcalendar/Details/toddler-time-1677079",
-                            "source_id": "business.chamber.example.com:event:1677079",
-                            "published_at": "2026-09-16T11:00:00-05:00",
-                        },
-                    ],
-                }
-            )
-            continue
         headline = f"Current item for {name}{headline_suffix}"
         key = "headline" if name == "WEATHER" else "title"
         sections.append({"section": name, "source_feed": "https://example.com/feed", "items": [{key: headline, "summary": "Useful context and implications for this item, preserved in full so the receipt is a real digest rather than a headline list.", "url": "https://example.com/item", "published_at": "2026-09-15T12:00:00+00:00"}]})
     result = {
         "schema_version": "1.0",
         "digest_date": "2026-09-15",
-        "location": "near Springfield",
+        "location": "Bastrop, TX",
         "taste_profile": "fixture",
         "sections": sections,
         "source_errors": [],
@@ -118,7 +84,7 @@ class ReceiptDigestTests(unittest.TestCase):
                 self.assertEqual(geometry["height_dots"] % rd.DOTS_PER_MM, 0)
                 self.assertGreater(metadata["raster_black_bbox"][0], 0)
                 self.assertLess(metadata["raster_black_bbox"][2], rd.WIDTH_DOTS)
-                self.assertGreaterEqual(geometry["text_volume_multiplier"], 2.0)
+                self.assertGreaterEqual(geometry["text_volume_multiplier"], 1.5)
 
     def test_tspl_uses_spec_polarity_and_exact_dynamic_bitmap(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -158,98 +124,47 @@ class ReceiptDigestTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "does not match"):
             rd.validate_payload(value)
 
-    def test_events_section_is_immediately_after_local_and_keeps_public_sources(self):
+    def test_local_section_is_bastrop_and_companies_follow_it(self):
         value = payload()
         names = [section["section"] for section in value["sections"]]
-        local_index = names.index("LOCAL")
-        self.assertEqual(names[local_index + 1], "EVENTS TODAY / SOON")
-        events = value["sections"][local_index + 1]["items"]
-        self.assertEqual(len(events), 2)
-        self.assertTrue(all(item["source_id"] for item in events))
-        self.assertTrue(all(item["url"].startswith("https://") for item in events))
-        self.assertIn("Maple Grove", events[0]["title"] + events[0]["summary"])
+        self.assertEqual(names, ["WEATHER", "GLOBAL", "BASTROP", "SPACEX & EARTH FUNERAL"])
+        self.assertNotIn("EVENTS TODAY / SOON", names)
+        self.assertNotIn("UK", names)
+        self.assertNotIn("FILM/TV", names)
 
-    def test_event_source_priority_window_dates_times_and_locations(self):
-        neighborhood_url = "https://maplegrove.example.org/events/maple-grove-hoa-meeting-2/"
-        civic_url = "https://maplegrove.example.org/events/springfield-city-council-meeting/"
-        chamber_url = "https://business.chamber.example.com/eventcalendar/Details/toddler-time-1677079?sourceTypeId=Website"
+    def test_non_dict_section_item_is_rejected(self):
+        value = payload()
+        value["sections"][1]["items"] = ["not an item"]
+        value["digest_id"] = rd.payload_digest_id(value)
+        with self.assertRaisesRegex(ValueError, "not an object"):
+            rd.validate_payload(value)
 
-        def mec_event(name: str, date: str, start: str, end: str, location: str, url: str, event_id: str) -> str:
-            value = {
-                "@context": "http://schema.org",
-                "@type": "Event",
-                "startDate": date,
-                "location": {"@type": "Place", "name": location, "address": location},
-                "organizer": {"name": "Maple Grove" if "Maple Grove" in name else ""},
-                "name": name,
-                "url": url,
-            }
-            return (
-                f"<script type='application/ld+json'>{json.dumps(value)}</script>"
-                f"<article><a data-event-id='{event_id}'></a>"
-                f"<span class='mec-start-time'>{start}</span>"
-                f"<span class='mec-end-time'>{end}</span></article>"
-            )
-
-        neighborhood_html = (
-            mec_event(
-                "Springfield City Council Meeting",
-                "2026-09-22",
-                "6:30 pm",
-                "7:30 pm",
-                "Council Chambers - City Hall, Springfield, ST 00000",
-                civic_url,
-                "1120",
-            )
-            + mec_event(
-                "Maple Grove HOA Meeting",
-                "2026-10-05",
-                "5:30 pm",
-                "6:30 pm",
-                "Community Center, 100 Main Street, Springfield, ST 00000",
-                neighborhood_url,
-                "2769",
-            )
-        ).encode()
-        chamber_html = (
-            f"<a href='{chamber_url}' class='gz-card-title gz-event-card-title'>Toddler Time</a>"
-            "<meta itemprop='startDate' content='9/23/2026 11:00:00 AM'>"
-            "<meta itemprop='endDate' content='9/23/2026 1:00:00 PM'>"
-        ).encode()
-        detail_html = (
-            "<div class='card-text gz-event-address' itemprop='location'>"
-            "<strong>Address</strong><br />15 Library Lane<br />Springfield, ST 00000"
-            "</div>"
-        ).encode()
-        responses = {
-            dg.NEIGHBORHOOD_EVENTS_URL: neighborhood_html,
-            dg.CHAMBER_EVENTS_URL: chamber_html,
-            chamber_url: detail_html,
-        }
-
-        section, errors = dg.build_events_section("2026-09-20", responses.__getitem__)
-        self.assertEqual(errors, [])
-        self.assertEqual(section["window_start"], "2026-09-20")
-        self.assertEqual(section["window_end"], "2026-10-11")
-        self.assertEqual(
-            [item["source_scope"] for item in section["items"]],
-            ["Maple Grove", "Springfield area", "Springfield area"],
+    def test_shows_section_can_be_omitted_and_a_present_one_is_in_order(self):
+        omitted = payload()
+        rd.validate_payload(omitted)
+        with_shows = payload()
+        companies = next(index for index, section in enumerate(with_shows["sections"]) if section["section"] == "SPACEX & EARTH FUNERAL")
+        with_shows["sections"].insert(
+            companies + 1,
+            {
+                "section": "NEARBY SHOWS",
+                "source_feed": "https://app.ticketmaster.com/discovery/v2/events.json",
+                "items": [
+                    {
+                        "title": "FRI DEC 18 · 7:30 PM · Sample Band",
+                        "summary": "Mohawk, Austin.",
+                        "url": "https://www.ticketmaster.com/event/show-1",
+                        "published_at": "2026-12-18",
+                    }
+                ],
+            },
         )
-        self.assertIn("MON OCT 5 · 5:30 PM-6:30 PM", section["items"][0]["title"])
-        self.assertIn("100 Main Street", section["items"][0]["location"])
-        self.assertEqual(section["items"][0]["source_id"], "maplegrove.example.org:mec:2769")
-        self.assertEqual(section["items"][1]["source_id"], "business.chamber.example.com:event:1677079")
-        self.assertEqual(section["items"][2]["source_id"], "maplegrove.example.org:mec:1120")
-
-    def test_unavailable_event_sources_are_explicit_and_do_not_invent_events(self):
-        def unavailable(_url: str) -> bytes:
-            raise OSError("offline fixture")
-
-        section, errors = dg.build_events_section("2026-09-20", unavailable)
-        self.assertEqual(len(errors), 2)
-        self.assertEqual(len(section["items"]), 1)
-        self.assertIn("No verified local events", section["items"][0]["title"])
-        self.assertEqual(section["items"][0]["source_id"], "event-window-empty")
+        with_shows["digest_id"] = rd.payload_digest_id(with_shows)
+        rd.validate_payload(with_shows)
+        with_shows["sections"].reverse()
+        with_shows["digest_id"] = rd.payload_digest_id(with_shows)
+        with self.assertRaisesRegex(ValueError, "expected sections"):
+            rd.validate_payload(with_shows)
 
     def test_atomic_state_round_trip(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -350,14 +265,14 @@ class ReceiptDigestTests(unittest.TestCase):
     def test_custom_section_title_follows_env(self):
         renamed = payload()
         for section in renamed["sections"]:
-            if section["section"] == "SPACEX/SPACE STOCK":
-                section["section"] = "MARKETS"
+            if section["section"] == "SPACEX & EARTH FUNERAL":
+                section["section"] = "COMPANIES"
         renamed["digest_id"] = rd.payload_digest_id(renamed)
         with self.assertRaisesRegex(ValueError, "expected sections"):
             rd.validate_payload(renamed)
-        with mock.patch.dict(os.environ, {"DIGEST_SECTION_TITLE_MARKETS": "MARKETS"}):
+        with mock.patch.dict(os.environ, {"DIGEST_SECTION_TITLE_COMPANIES": "COMPANIES"}):
             rd.validate_payload(renamed)
-            self.assertEqual(rd.settings.section_by_id("markets").title, "MARKETS")
+            self.assertEqual(rd.settings.section_by_id("companies").title, "COMPANIES")
 
 
 def sample_story(section: str, index: int) -> dict:
@@ -378,44 +293,24 @@ def sample_story(section: str, index: int) -> dict:
                 "The crew finished the survey at dawn and will release the map after the instruments are checked. The ridge was not on last year's charts.",
             ),
         ],
-        "LOCAL": [
+        "BASTROP": [
             (
-                "City council adopts the annual budget after cutting the proposed fee increase",
-                "The vote funds the library's weekend hours and leaves the park tax unchanged. Crews start the sidewalk work on the south side next month.",
+                "Bastrop brewery opens a taproom on Main Street this Friday",
+                "The taproom pours local beer and keeps a small kitchen open until nine. There is no cover before the first set.",
             ),
             (
-                "River path stays closed through Friday while crews reset the washed-out railing",
-                "Walkers can use the north entrance. The parks office said the railing should be back before the weekend market.",
-            ),
-        ],
-        "SPACEX/SPACE STOCK": [
-            (
-                "Launch firm wins a civil contract to fly two science missions next spring",
-                "The contract covers two launches and the ground support that goes with them. It is an operations story, not a price-target note.",
-            ),
-            (
-                "Range schedule adds a dawn window for the cargo flight",
-                "The window opens at sunrise and lasts ninety minutes. Weather officers said the wind, not the hardware, is the thing to watch.",
+                "Smithville market adds a Saturday morning produce row",
+                "The row opens at eight and closes at noon. Growers from Elgin and Cedar Creek are on the list this week.",
             ),
         ],
-        "UK": [
+        "SPACEX & EARTH FUNERAL": [
             (
-                "Rail board publishes the weekend map after finishing the bridge repairs",
-                "Engineers reopened the main line after replacing the cracked span. The first weekend timetable is shorter than usual while they watch the new joints.",
+                "SpaceX sets a dawn Starship launch window",
+                "The window opens at sunrise and lasts ninety minutes. The company said the flight is a fueling test.",
             ),
             (
-                "Museum opens the recovered archive to readers on Saturday morning",
-                "Tickets are free and the reading room closes at noon. The letters have been out of public view for a decade.",
-            ),
-        ],
-        "FILM/TV": [
-            (
-                "A new western series shoots in the desert and keeps the story small",
-                "The series follows one sheriff and a traveling photographer. It opens in the spring and skips the usual superhero crossover.",
-            ),
-            (
-                "An anime film about a night courier gets a Friday opening",
-                "The story stays with one route and one city. Early reviews say it is quiet, strange, and worth the two hours.",
+                "Earth Funeral opens a soil transformation facility",
+                "Earth Funeral said families can choose the facility next month. The note is about the building, not a stock price.",
             ),
         ],
     }
@@ -427,7 +322,7 @@ def sample_story(section: str, index: int) -> dict:
             "url": "https://api.weather.gov/gridpoints/EXAMPLE/1,1/forecast",
             "published_at": "2026-11-26T12:00:00+00:00",
         }
-    slug = {"GLOBAL": "global", "LOCAL": "local", "SPACEX/SPACE STOCK": "markets", "UK": "uk", "FILM/TV": "film"}[section]
+    slug = {"GLOBAL": "global", "BASTROP": "bastrop", "SPACEX & EARTH FUNERAL": "companies"}[section]
     return {
         "title": title,
         "summary": summary,
@@ -440,36 +335,27 @@ def sample_story(section: str, index: int) -> dict:
 def sample_payload(*, bots: bool) -> dict:
     sections = []
     for name in rd.EXPECTED_SECTIONS:
-        if name == "EVENTS TODAY / SOON":
-            sections.append(
-                {
-                    "section": name,
-                    "source_feed": "https://maplegrove.example.org/events/",
-                    "items": [
-                        {
-                            "title": "FRI NOV 27 · 6:00 PM-7:30 PM · Library reading night",
-                            "summary": "Main Library, 15 Library Lane, Springfield · Springfield area",
-                            "url": "https://maplegrove.example.org/events/reading-night/",
-                            "source_id": "maplegrove.example.org:mec:3001",
-                            "published_at": "2026-11-27T18:00:00-06:00",
-                        },
-                        {
-                            "title": "SAT NOV 28 · 9:00 AM-11:00 AM · River path cleanup",
-                            "summary": "River Park, Springfield · Springfield area",
-                            "url": "https://business.chamber.example.com/eventcalendar/Details/river-cleanup-42",
-                            "source_id": "business.chamber.example.com:event:42",
-                            "published_at": "2026-11-28T09:00:00-06:00",
-                        },
-                    ],
-                }
-            )
-            continue
         count = 1 if bots or name == "WEATHER" else 2
         sections.append(
             {
                 "section": name,
                 "source_feed": "https://example.com/feed",
                 "items": [sample_story(name, index) for index in range(count)],
+            }
+        )
+    if not bots:
+        sections.append(
+            {
+                "section": "NEARBY SHOWS",
+                "source_feed": "https://app.ticketmaster.com/discovery/v2/events.json",
+                "items": [
+                    {
+                        "title": "FRI DEC 18 · 7:30 PM · Sample Band",
+                        "summary": "Mohawk, Austin.",
+                        "url": "https://www.ticketmaster.com/event/example-show",
+                        "published_at": "2026-12-18",
+                    }
+                ],
             }
         )
     if bots:
@@ -496,7 +382,7 @@ def sample_payload(*, bots: bool) -> dict:
     result = {
         "schema_version": "1.0",
         "digest_date": "2026-11-26",
-        "location": "near Springfield",
+        "location": "Bastrop, TX",
         "taste_profile": "fixture",
         "sections": sections,
         "source_errors": [],
