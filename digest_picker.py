@@ -13,6 +13,7 @@ import errno
 import fcntl
 import http.client
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -26,6 +27,7 @@ import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
+from zoneinfo import ZoneInfo
 
 import digest_settings as settings
 
@@ -40,10 +42,11 @@ _ABBREV = re.compile(
     re.IGNORECASE,
 )
 _OBITUARY = re.compile(
-    r"\b(?:obituary|obituaries|obit|in memoriam|passed away|passes away|funeral service|"
-    r"celebration of life)\b|\b(?:dies|died|dead) at \d",
+    r"\b(?:obituary|obituaries|obit|in memoriam|passed away|passes away)\b|\b(?:dies|died|dead) at \d",
     re.IGNORECASE,
 )
+# A funeral-home announcement. Earth Funeral, the company, is not an obituary.
+_FUNERAL_SERVICE = re.compile(r"\b(?:funeral service|celebration of life)\b", re.IGNORECASE)
 # Person-death phrasing only. "Senate killed the bill" is legislation, not an obituary.
 _DEATH = re.compile(
     r"\b(?:dies|died)\b|\bdeath of\b|\bkilled in\b|\bwas killed\b|\bkilled by\b",
@@ -63,21 +66,43 @@ _LOCAL_PLACE = re.compile(
     r"\bbastrop\b|\bsmithville\b|\belgin\b|\bcedar creek\b|\beast austin\b",
     re.IGNORECASE,
 )
-_LOCAL_CIVIC = re.compile(
-    r"\bcity council\b|\bschool board\b|\bcommissioners?\b|\bordinance\b|"
+# Crime and government process. "City council" is handled separately so a passing mention can stay.
+_LOCAL_HARD = re.compile(
+    r"\bschool board\b|\bcommissioners?\b|\bordinance\b|"
     r"\barrested\b|\bshooting\b|\bhomicide\b|\bmurder(?:ed)?\b|\bobituary\b|"
     r"\bindicted\b|\bpolice said\b|\blegislature\b|\bgovernment\b|"
     r"\bschool district\b|\bisd\b|\bcounty judge\b|\bzoning\b",
     re.IGNORECASE,
 )
+_LOCAL_COUNCIL = re.compile(r"\bcity council\b", re.IGNORECASE)
+_LOCAL_ACTIVITY = re.compile(
+    r"\b(?:open(?:s|ed|ing)?|grand opening|restaurant|bar|brewery|breweries|coffee|cafe|café|"
+    r"shop|shops|market|markets|festival|live music|concert|trail|trails|park|parks|outdoor|"
+    r"taproom|bakery|winery|distillery|food truck|hike|hiking|kayak)\b",
+    re.IGNORECASE,
+)
+# Price talk, not the noun "stock" (a stock of engines, in stock).
 _STOCK = re.compile(
-    r"\bstocks?\b|\bshares?\b|\bnasdaq\b|\bnyse\b|\bprice target\b|"
-    r"\bdowngrade\b|\bupgrade\b|\bbuy the dip\b|\bshare price\b|\bmarket cap\b|\bticker\b",
+    r"\bshares\b|\b(?:share|stock)\s+prices?\b|\bprice targets?\b|"
+    r"\bnasdaq\b|\bnyse\b|\bbuy the dip\b|\bmarket cap\b",
     re.IGNORECASE,
 )
 _SPACEX = re.compile(r"\b(?:spacex|starship|falcon|starlink)\b", re.IGNORECASE)
-_LEADING_ARTICLE = re.compile(r"^(?:the|a|an)\s+")
+_LEADING_ARTICLE = {"the", "a", "an"}
 _TRIBUTE = re.compile(r"\b(?:tribute|tributes|cover band|the music of)\b|\bexperience\b", re.IGNORECASE)
+_CATEGORY_SYNONYMS = {
+    "sports": frozenset(
+        "sport sports football soccer basketball baseball hockey nfl nba mlb nhl golf tennis "
+        "cricket touchdown playoff playoffs athlete athletes olympic olympics coach".split()
+    ),
+    "politics": frozenset(
+        "politics political politician election elections senator congress parliament campaign "
+        "democrat republican ballot".split()
+    ),
+    "celebrity gossip": frozenset("celebrity celebrities gossip rumor rumored".split()),
+}
+PROFILE_MAX_BYTES = 65536
+ARTISTS_MAX_BYTES = 65536
 _SPAM = re.compile(
     r"last chance to buy|stock alert|penny stocks?|stocks? to buy|shares? to buy|"
     r"buy alert|hot stock tip|buy now|act now|limited[- ]time|you won'?t believe|"
@@ -509,6 +534,9 @@ def is_obituary(text: str) -> bool:
     value = text or ""
     if _OBITUARY.search(value):
         return True
+    # "Earth Funeral" is a company. Its own "funeral service" wording is not a death notice.
+    if "earth funeral" not in value.casefold() and _FUNERAL_SERVICE.search(value):
+        return True
     # Legislative phrasing is not a death notice. A real death later in the same line still is.
     remainder = _COMMITTEE.sub(" ", value)
     if not _DEATH.search(remainder):
@@ -520,7 +548,13 @@ def is_obituary(text: str) -> bool:
 
 def keep_local(item: dict, *, require_place: bool) -> bool:
     blob = f"{item.get('title') or ''} {item.get('summary') or ''}"
-    if _LOCAL_CIVIC.search(blob) or is_obituary(blob):
+    if _LOCAL_HARD.search(blob) or is_obituary(blob):
+        return False
+    has_activity = bool(_LOCAL_ACTIVITY.search(blob))
+    # A story about city council is out. An opening that mentions the building across the street stays.
+    if _LOCAL_COUNCIL.search(blob) and not has_activity:
+        return False
+    if not has_activity:
         return False
     if require_place and not _LOCAL_PLACE.search(blob):
         return False
@@ -552,7 +586,7 @@ def published_age_hours(value: object, now: dt.datetime) -> float | None:
         except (TypeError, ValueError, OverflowError):
             return None
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+        parsed = parsed.replace(tzinfo=_digest_zone())
     moment = now if now.tzinfo else now.replace(tzinfo=dt.timezone.utc)
     return (moment.astimezone(dt.timezone.utc) - parsed.astimezone(dt.timezone.utc)).total_seconds() / 3600
 
@@ -654,16 +688,29 @@ def empty_profile() -> dict:
     return {"*": {"likes": [], "dislikes": []}}
 
 
+def _digest_zone() -> dt.tzinfo:
+    name = os.environ.get("DIGEST_TZ", "").strip() or "America/Chicago"
+    try:
+        return ZoneInfo(name)
+    except Exception:
+        return dt.timezone.utc
+
+
 def load_profile(path: Path | None) -> tuple[dict, str | None]:
+    """Read a profile. A bad, linked, or non-UTF-8 file is skipped, never fatal."""
     if path is None:
         return empty_profile(), None
     try:
-        if not path.is_file():
+        if not path.exists() and not path.is_symlink():
             return empty_profile(), "profile ignored: missing"
-        text = path.read_text(encoding="utf-8")
-    except OSError:
+        raw = _read_regular_nofollow(path, PROFILE_MAX_BYTES + 1)
+    except Exception:
         return empty_profile(), "profile ignored: unreadable"
-    if len(text) > 20000:
+    if len(raw) > PROFILE_MAX_BYTES:
+        return empty_profile(), "profile ignored: unreadable"
+    try:
+        text = raw.decode("utf-8")
+    except Exception:
         return empty_profile(), "profile ignored: unreadable"
     try:
         return parse_profile(text), None
@@ -694,16 +741,27 @@ def profile_brief(profile: dict) -> str:
     return "\n".join(lines)[:2000]
 
 
+def _term_hits(phrase: str, haystack: str) -> bool:
+    """Word or category match. 'sports' catches 'football'; it does not catch 'transport'."""
+    folded = phrase.casefold().strip()
+    if not folded:
+        return False
+    if re.search(rf"(?<!\w){re.escape(folded)}(?!\w)", haystack):
+        return True
+    extras = _CATEGORY_SYNONYMS.get(folded, ())
+    return any(re.search(rf"(?<!\w){re.escape(word)}(?!\w)", haystack) for word in extras)
+
+
 def interest_score(item: dict, likes: tuple[str, ...], dislikes: tuple[str, ...], prefer_terms: tuple[str, ...]) -> int:
     haystack = f"{item.get('title') or ''} {item.get('summary') or ''}".casefold()
     score = 0
     if any(term and term.casefold() in haystack for term in prefer_terms):
         score += 3
     for phrase in likes:
-        if phrase and phrase.casefold() in haystack:
+        if phrase and _term_hits(phrase, haystack):
             score += 2
     for phrase in dislikes:
-        if phrase and phrase.casefold() in haystack:
+        if phrase and _term_hits(phrase, haystack):
             score -= 3
     return score
 
@@ -711,6 +769,10 @@ def interest_score(item: dict, likes: tuple[str, ...], dislikes: tuple[str, ...]
 def significant_tokens(title: str) -> frozenset[str]:
     tokens: list[str] = []
     for token in normalize_title(title).split():
+        # A changed number is a different story. Keep it even when it is short.
+        if token.isdigit():
+            tokens.append(token)
+            continue
         if token in _TITLE_STOP or len(token) <= 2:
             continue
         for suffix in ("ing", "ed", "es", "s"):
@@ -723,22 +785,30 @@ def significant_tokens(title: str) -> frozenset[str]:
 
 
 def titles_similar(left: str, right: str) -> bool:
-    """Same story from two outlets: shared wording, not a shared city or verb."""
+    """Same story from two outlets.
+
+    Every significant word of the shorter title, including numbers and place
+    names, has to appear in the longer one. Extra words on the long side are fine.
+    """
     first = significant_tokens(left)
     second = significant_tokens(right)
     if len(first) < 3 or len(second) < 3:
         return False
-    shared = first & second
-    if len(shared) < 3:
-        return False
-    jaccard = len(shared) / len(first | second)
-    contain = len(shared) / min(len(first), len(second))
-    return jaccard >= 0.62 and contain >= 0.8
+    shorter, longer = (first, second) if len(first) <= len(second) else (second, first)
+    return shorter <= longer
+
+
+def _strip_accents(text: str) -> str:
+    decomposed = unicodedata.normalize("NFKD", text)
+    return "".join(char for char in decomposed if not unicodedata.combining(char))
 
 
 def artist_key(name: str) -> str:
-    text = _LEADING_ARTICLE.sub("", normalize_title(name)).strip()
-    return text
+    parts = normalize_title(_strip_accents(name)).split()
+    # "The Sample Band" drops "The". "The National" does not, or it would match "National".
+    if len(parts) > 2 and parts[0] in _LEADING_ARTICLE:
+        parts = parts[1:]
+    return " ".join(parts)
 
 
 def names_match_artist(wanted: str, candidate: str) -> bool:
@@ -751,12 +821,27 @@ def names_match_artist(wanted: str, candidate: str) -> bool:
     return True
 
 
+def _title_has_artist(wanted: str, event_name: str) -> bool:
+    left = artist_key(wanted)
+    if not left:
+        return False
+    head = re.split(r"\s*(?:\||:)\s*", event_name, maxsplit=1)[0]
+    if artist_key(head) == left:
+        return True
+    # Multi-word names may sit at the front of "Taylor Swift | The Eras Tour".
+    # A one-word name has to be the whole headliner, so "Prince" is not "Prince Royce".
+    if len(left.split()) < 2:
+        return False
+    full = normalize_title(_strip_accents(event_name))
+    return re.search(rf"(?<!\S){re.escape(left)}(?!\S)", full) is not None
+
+
 def event_matches_artist(wanted: str, event_name: str, attractions: list[str]) -> bool:
+    if attractions:
+        return any(names_match_artist(wanted, name) for name in attractions)
     if _TRIBUTE.search(event_name) and not _TRIBUTE.search(wanted):
         return False
-    if any(names_match_artist(wanted, name) for name in attractions):
-        return True
-    return names_match_artist(wanted, event_name)
+    return _title_has_artist(wanted, event_name)
 
 
 def show_already_mentioned(history: list[dict], show_id: str, phase: str, digest_date: str) -> bool:
@@ -793,6 +878,38 @@ def _show_clock(local_time: str) -> str:
     hour = parsed.hour % 12 or 12
     suffix = "AM" if parsed.hour < 12 else "PM"
     return f"{hour}:{parsed.minute:02d} {suffix}"
+
+
+def _miles_between(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    radius = 3958.8
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    chord = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlon / 2) ** 2
+    return 2 * radius * math.asin(min(1.0, math.sqrt(chord)))
+
+
+def _venue_in_range(venue: dict) -> bool:
+    """Keep a venue inside the show radius, or in Texas when it has no coordinates."""
+    if not isinstance(venue, dict) or not venue:
+        return False
+    location = venue.get("location") if isinstance(venue.get("location"), dict) else {}
+    lat = _coord(location.get("latitude"))
+    lon = _coord(location.get("longitude"))
+    if lat is not None and lon is not None:
+        return _miles_between(settings.shows_lat(), settings.shows_lon(), lat, lon) <= settings.shows_radius_miles()
+    state = venue.get("state") if isinstance(venue.get("state"), dict) else {}
+    code = str(state.get("stateCode") or state.get("name") or "").strip().casefold()
+    return code in {"tx", "texas"}
+
+
+def _coord(value: object) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def shows_from_ticketmaster(
@@ -852,6 +969,8 @@ def shows_from_ticketmaster(
         url = strip_userinfo(url)
         venues = [row for row in (inner.get("venues") or []) if isinstance(row, dict)]
         venue = venues[0] if venues else {}
+        if not _venue_in_range(venue):
+            continue
         venue_name = clean_spaces(str(venue.get("name") or "Venue TBA"))
         city_row = venue.get("city") if isinstance(venue.get("city"), dict) else {}
         city = clean_spaces(str(city_row.get("name") or ""))
@@ -977,7 +1096,7 @@ def short_date(value: str | None) -> str:
     if parsed is None:
         return ""
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+        parsed = parsed.replace(tzinfo=_digest_zone())
     return parsed.astimezone(dt.timezone.utc).strftime("%d %b %Y")
 
 
@@ -1778,7 +1897,7 @@ def _read_regular_nofollow(path: Path, limit: int) -> bytes:
         raise
     if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
         raise OSError(errno.ELOOP, "refusing non-regular bot update file")
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    flags = os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0)
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     fd = os.open(path, flags)

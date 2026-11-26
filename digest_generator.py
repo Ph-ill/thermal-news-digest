@@ -201,9 +201,11 @@ def rss_items(raw: bytes, limit: int | None = None) -> list[dict]:
 
 
 def load_artists(path: Path) -> list[str]:
-    text = path.read_text(encoding="utf-8")
+    raw = digest_picker._read_regular_nofollow(path, digest_picker.ARTISTS_MAX_BYTES + 1)
+    if len(raw) > digest_picker.ARTISTS_MAX_BYTES:
+        raise OSError("artists file is too large")
     artists: list[str] = []
-    for line in text.splitlines():
+    for line in raw.decode("utf-8").splitlines():
         name = line.split("#", 1)[0].strip()
         if name and name not in artists:
             artists.append(name)
@@ -252,8 +254,8 @@ def build_shows_section(
         return None, [], []
     try:
         artists = load_artists(path)
-    except OSError:
-        return None, [], []
+    except Exception:
+        return None, [{"section": spec.title, "url": "artists", "error": "artists file ignored: unreadable"}], []
     if not artists:
         return None, [], []
     try:

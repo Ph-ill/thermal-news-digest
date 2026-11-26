@@ -275,10 +275,12 @@ def feeds_for(section_id: str) -> tuple[FeedSpec, ...]:
         query = env_or("DIGEST_LOCAL_NEWS_QUERY", "")
         if query:
             return (FeedSpec(google_news(query), "local"),)
+        # The Google queries already name the towns, so a headline need not repeat them.
+        # Community Impact and Eater cover a wider area, so those still need a town name.
         return (
-            FeedSpec(google_news(DEFAULT_LOCAL_QUERY), "local", (), True),
-            FeedSpec(google_news(DEFAULT_NEARBY_QUERY), "local", (), True),
-            FeedSpec(google_news(DEFAULT_EAST_AUSTIN_QUERY), "local", (), True),
+            FeedSpec(google_news(DEFAULT_LOCAL_QUERY), "local", (), False),
+            FeedSpec(google_news(DEFAULT_NEARBY_QUERY), "local", (), False),
+            FeedSpec(google_news(DEFAULT_EAST_AUSTIN_QUERY), "local", (), False),
             FeedSpec(env_or("DIGEST_COMMUNITY_IMPACT_FEED", DEFAULT_COMMUNITY_IMPACT_FEED), "local", (), True),
             FeedSpec(env_or("DIGEST_EATER_AUSTIN_FEED", DEFAULT_EATER_AUSTIN_FEED), "local", (), True),
         )

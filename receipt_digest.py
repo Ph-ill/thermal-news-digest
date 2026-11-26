@@ -661,7 +661,9 @@ def _read_state_locked(path: Path) -> dict:
         return _blank_state()
     identity: tuple[int, int] | None = None
     try:
-        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        # O_NONBLOCK so a fifo returns at once. A non-regular file is rejected
+        # before any read, which is what would block on a pipe.
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0))
     except OSError:
         return _blank_state()
     try:

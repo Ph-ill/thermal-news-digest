@@ -1122,6 +1122,24 @@ local:
                 "Bastrop coffee shop opens on Main Street",
             )
         )
+        self.assertFalse(
+            dp.titles_similar(
+                "Starship flight three reaches orbit",
+                "Starship flight four reaches orbit",
+            )
+        )
+        self.assertFalse(
+            dp.titles_similar(
+                "Starship flight 3 reaches orbit",
+                "Starship flight 4 reaches orbit",
+            )
+        )
+        self.assertFalse(
+            dp.titles_similar(
+                "Bastrop brewery opens on Main Street",
+                "Elgin brewery opens on Main Street",
+            )
+        )
         seen = dp.Seen(
             [
                 {
@@ -1220,10 +1238,28 @@ local:
             "summary": "Earth Funeral said the facility starts next month.",
             "topic": "earth",
         }
+        inventory = {
+            "title": "SpaceX keeps a stock of Raptor engines",
+            "summary": "The engines are in stock at the Texas site ahead of the next flight.",
+            "topic": "spacex",
+        }
+        funeral_service = {
+            "title": "Earth Funeral adds a funeral service option",
+            "url": "https://example.com/earth-service",
+            "summary": "Earth Funeral said families can book the funeral service next month at the new facility.",
+            "topic": "earth",
+            "published_at": "Thu, 26 Nov 2026 08:00:00 GMT",
+        }
         self.assertFalse(dp.keep_company(stock))
         self.assertTrue(dp.keep_company(launch))
+        self.assertTrue(dp.keep_company(inventory))
         self.assertFalse(dp.keep_company(other))
         self.assertTrue(dp.keep_company(earth))
+        self.assertFalse(dp.is_obituary(f"{funeral_service['title']} {funeral_service['summary']}"))
+        self.assertTrue(dp.is_obituary("The chapel scheduled a funeral service on Friday."))
+        self.assertTrue(dp.is_obituary("Earth Funeral founder dies at 70."))
+        kept = dp.eligible_candidates([funeral_service], dp.Seen([], "2026-11-26"))
+        self.assertEqual([row["url"] for row in kept], ["https://example.com/earth-service"])
 
     def test_local_filter_keeps_an_opening_and_drops_council_and_crime(self):
         opening = {
@@ -1242,14 +1278,132 @@ local:
             "title": "Houston bakery opens a second room",
             "summary": "The bakery is downtown.",
         }
+        passing = {
+            "title": "Bastrop brewery opens across from city council",
+            "summary": "The taproom is on Main Street.",
+        }
+        quiet = {
+            "title": "Bastrop water main is repaired",
+            "summary": "Crews finished the work on Chestnut Street.",
+        }
         self.assertTrue(dp.keep_local(opening, require_place=True))
+        self.assertTrue(dp.keep_local(passing, require_place=True))
         self.assertFalse(dp.keep_local(council, require_place=True))
         self.assertFalse(dp.keep_local(crime, require_place=True))
+        self.assertFalse(dp.keep_local(quiet, require_place=True))
         self.assertFalse(dp.keep_local(houston, require_place=True))
         self.assertTrue(dp.keep_local(houston, require_place=False))
+        with mock.patch.dict(
+            os.environ,
+            {"DIGEST_LOCAL_FEED": "", "DIGEST_LOCAL_FEEDS": "", "DIGEST_LOCAL_NEWS_QUERY": ""},
+        ):
+            local_feeds = settings.feeds_for("local")
+        scoped = [feed for feed in local_feeds if "news.google.com" in feed.url]
+        wide = [feed for feed in local_feeds if "news.google.com" not in feed.url]
+        self.assertTrue(scoped)
+        self.assertTrue(all(not feed.require_place for feed in scoped))
+        self.assertTrue(wide)
+        self.assertTrue(all(feed.require_place for feed in wide))
+
+    def test_sports_dislike_catches_a_football_headline(self):
+        football = item(
+            "Football team opens the season",
+            "https://example.com/football",
+            "The squad starts Saturday and the coach named the lineup. " + LONG,
+        )
+        hub = item(
+            "Transport hub opens near the river",
+            "https://example.com/hub",
+            "The new hall opens to passengers on Friday and the platforms are ready. " + LONG,
+        )
+        self.assertLess(dp.interest_score(football, (), ("sports",), ()), 0)
+        self.assertEqual(dp.interest_score(hub, (), ("sports",), ()), 0)
+        chosen = dp.fallback_pick([football, hub], 1, dp.Seen([], "2026-11-26"), dislikes=("sports",))
+        self.assertEqual(chosen[0]["title"], "Transport hub opens near the river")
+
+    def test_naive_timestamps_use_the_digest_timezone(self):
+        now = dt.datetime(2026, 11, 26, 18, 0, tzinfo=dt.timezone.utc)
+        age = dp.published_age_hours("2026-11-26T08:00:00", now)
+        self.assertAlmostEqual(age, 4.0, places=2)
+        aware = dp.published_age_hours("2026-11-26T08:00:00Z", now)
+        self.assertAlmostEqual(aware, 10.0, places=2)
+
+    def test_bad_profile_and_artist_files_are_skipped(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            profile = root / "interests.yml"
+            profile.write_bytes("likes:\n  - space\n".encode("utf-16"))
+            loaded, error = dp.load_profile(profile)
+            self.assertEqual(loaded, dp.empty_profile())
+            self.assertEqual(error, "profile ignored: unreadable")
+            invalid = root / "broken.yml"
+            invalid.write_text("{", encoding="utf-8")
+            _loaded, invalid_error = dp.load_profile(invalid)
+            self.assertEqual(invalid_error, "profile ignored: invalid")
+            target = root / "real.yml"
+            target.write_text("likes:\n  - space\n", encoding="utf-8")
+            link = root / "link.yml"
+            link.symlink_to(target)
+            linked, link_error = dp.load_profile(link)
+            self.assertEqual(linked["*"]["likes"], [])
+            self.assertEqual(link_error, "profile ignored: unreadable")
+            artists = root / "artists.txt"
+            artists.write_bytes("Sample Band\n".encode("utf-16"))
+            fifo = root / "artists.fifo"
+            os.mkfifo(fifo)
+            started = dt.datetime.now()
+            with self.assertRaises(OSError):
+                dg.load_artists(fifo)
+            self.assertLess((dt.datetime.now() - started).total_seconds(), 2)
+            bots = root / "bots"
+            bots.mkdir()
+
+            def fetcher(_url):
+                return b""
+
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "DIGEST_PROFILE_FILE": str(profile),
+                    "DIGEST_ARTISTS_FILE": str(artists),
+                    "DIGEST_TICKETMASTER_KEY": "tm-test-key",
+                    "DIGEST_GLOBAL_FEED": "https://example.com/global.xml",
+                    "DIGEST_LOCAL_FEED": "https://example.com/local.xml",
+                    "DIGEST_COMPANIES_FEED": "https://example.com/companies.xml",
+                },
+            ):
+                payload = dg.make_payload(
+                    "2026-11-26",
+                    fetcher,
+                    now=dt.datetime(2026, 11, 26, 11, 0, tzinfo=dt.timezone.utc),
+                    history_file=root / "history.json",
+                    bot_directory=bots,
+                    persist_history=False,
+                )
+            self.assertIn("sections", payload)
+            self.assertNotEqual(payload["picker"].get("reason"), "generator_error")
+            notes = [row.get("error") for row in payload["source_errors"]]
+            self.assertIn("profile ignored: unreadable", notes)
+            self.assertIn("artists file ignored: unreadable", notes)
 
 
-def _ticketmaster_event(name, attractions, event_id, day, url, venue="Mohawk", city="Austin"):
+def _ticketmaster_event(
+    name,
+    attractions,
+    event_id,
+    day,
+    url,
+    venue="Mohawk",
+    city="Austin",
+    state="TX",
+    latitude=None,
+    longitude=None,
+):
+    venue_row = {"name": venue, "city": {"name": city}}
+    if state:
+        venue_row["state"] = {"stateCode": state}
+    if latitude is not None and longitude is not None:
+        venue_row["location"] = {"latitude": str(latitude), "longitude": str(longitude)}
     return {
         "id": event_id,
         "name": name,
@@ -1257,7 +1411,7 @@ def _ticketmaster_event(name, attractions, event_id, day, url, venue="Mohawk", c
         "dates": {"start": {"localDate": day, "localTime": "19:30:00"}},
         "_embedded": {
             "attractions": [{"name": attraction} for attraction in attractions],
-            "venues": [{"name": venue, "city": {"name": city}}],
+            "venues": [venue_row],
         },
     }
 
@@ -1266,9 +1420,17 @@ class ShowTests(unittest.TestCase):
     def test_artist_match_ignores_the_case_punctuation_and_tributes(self):
         self.assertTrue(dp.names_match_artist("The Sample Band", "sample band"))
         self.assertTrue(dp.names_match_artist("Sample Band", "Sample-Band"))
+        self.assertTrue(dp.names_match_artist("Sigur Rós", "Sigur Ros"))
+        self.assertFalse(dp.names_match_artist("The National", "National"))
         self.assertFalse(dp.names_match_artist("Prince", "Prince Royce"))
         self.assertFalse(dp.event_matches_artist("Sample Band", "Sample Band Tribute", ["Sample Band Tribute"]))
-        self.assertFalse(dp.event_matches_artist("The Sample Band", "The Music of Sample Band", ["Sample Band"]))
+        self.assertTrue(dp.event_matches_artist("The Sample Band", "The Music of Sample Band", ["Sample Band"]))
+        self.assertFalse(dp.event_matches_artist("The Sample Band", "The Music of Sample Band", []))
+        self.assertTrue(dp.event_matches_artist("Taylor Swift", "Taylor Swift | The Eras Tour", []))
+        self.assertTrue(dp.event_matches_artist("Taylor Swift", "Taylor Swift Experience", ["Taylor Swift"]))
+        self.assertFalse(dp.event_matches_artist("Taylor Swift", "Taylor Swift Experience", []))
+        self.assertFalse(dp.event_matches_artist("Prince", "Prince Royce | The Tour", []))
+        self.assertFalse(dp.event_matches_artist("The National", "National", []))
 
     def test_shows_skip_without_a_key_file_or_match_and_mention_once_until_the_week(self):
         body = json.dumps(
@@ -1379,6 +1541,61 @@ class ShowTests(unittest.TestCase):
             self.assertTrue(all("apikey" not in error.get("url", "") for error in errors))
             self.assertIn("geoPoint=", calls[0])
             self.assertIn("latlong=", calls[0])
+
+    def test_shows_drop_venues_outside_the_radius_or_outside_texas(self):
+        def body(event):
+            return json.dumps({"_embedded": {"events": [event]}}).encode()
+
+        def one(event):
+            return dp.shows_from_ticketmaster(body(event), "Sample Band", "2026-11-26", [], 90)
+
+        near = _ticketmaster_event(
+            "Sample Band",
+            ["Sample Band"],
+            "near",
+            "2026-12-02",
+            "https://www.ticketmaster.com/event/near",
+            latitude="30.2672",
+            longitude="-97.7431",
+        )
+        far = _ticketmaster_event(
+            "Sample Band",
+            ["Sample Band"],
+            "far",
+            "2026-12-02",
+            "https://www.ticketmaster.com/event/far",
+            state="TX",
+            latitude="31.7619",
+            longitude="-106.4850",
+        )
+        other_state = _ticketmaster_event(
+            "Sample Band",
+            ["Sample Band"],
+            "ny",
+            "2026-12-02",
+            "https://www.ticketmaster.com/event/ny",
+            state="NY",
+        )
+        texas = _ticketmaster_event(
+            "Sample Band",
+            ["Sample Band"],
+            "tx",
+            "2026-12-02",
+            "https://www.ticketmaster.com/event/tx",
+            state="TX",
+        )
+        self.assertEqual(len(one(near)), 1)
+        self.assertEqual(one(far), [])
+        self.assertEqual(one(other_state), [])
+        self.assertEqual(len(one(texas)), 1)
+        missing = {
+            "id": "none",
+            "name": "Sample Band",
+            "url": "https://www.ticketmaster.com/event/none",
+            "dates": {"start": {"localDate": "2026-12-02", "localTime": "19:30:00"}},
+            "_embedded": {"attractions": [{"name": "Sample Band"}]},
+        }
+        self.assertEqual(one(missing), [])
 
     def test_geohash_matches_the_known_vector(self):
         self.assertEqual(dg.geohash(57.64911, 10.40744), "u4pruyd")

@@ -1,6 +1,6 @@
 # Nearby shows
 
-NEARBY SHOWS lists upcoming concerts by artists in a private list, within about an hour's drive of Bastrop, Texas. The default search is a 50 mile radius around the public city center, which covers Austin. It is omitted when there is nothing to print. The other sections then keep their usual space, the same way they do when BOT UPDATES is absent.
+NEARBY SHOWS lists upcoming concerts by artists in a private list, within about an hour's drive of Bastrop, Texas. The default search is a 50 mile radius around the public city center, which covers Austin. A venue whose coordinates fall outside that radius is dropped. A venue with no coordinates is kept only when its state is Texas. It is omitted when there is nothing to print. The other sections then keep their usual space, the same way they do when BOT UPDATES is absent.
 
 ## Artist file
 

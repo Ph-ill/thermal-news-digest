@@ -881,6 +881,22 @@ class StateRecoveryTests(unittest.TestCase):
             self.assertEqual(rd.read_state(fresh_state)["version"], 1)
             self.assertFalse(stale.exists())
 
+    def test_fifo_state_returns_without_blocking(self):
+        with tempfile.TemporaryDirectory() as temp:
+            fifo = Path(temp) / "state.json"
+            os.mkfifo(fifo)
+            result: dict = {}
+
+            def run():
+                result["state"] = rd.read_state(fifo)
+
+            thread = threading.Thread(target=run, daemon=True)
+            thread.start()
+            thread.join(2)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(result["state"], {"version": 1, "digests": {}})
+            self.assertTrue(fifo.exists())
+
 
 class SourceUrlTests(unittest.TestCase):
     def test_event_and_forecast_urls_drop_userinfo(self):
@@ -897,7 +913,13 @@ class SourceUrlTests(unittest.TestCase):
                             "dates": {"start": {"localDate": "2026-12-02", "localTime": "19:30:00"}},
                             "_embedded": {
                                 "attractions": [{"name": "Sample Band"}],
-                                "venues": [{"name": "Mohawk", "city": {"name": "Austin"}}],
+                                "venues": [
+                                    {
+                                        "name": "Mohawk",
+                                        "city": {"name": "Austin"},
+                                        "state": {"stateCode": "TX"},
+                                    }
+                                ],
                             },
                         }
                     ]
