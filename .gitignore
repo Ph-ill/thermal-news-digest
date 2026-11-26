@@ -3,6 +3,8 @@
 !.env.example
 output/
 state.json
+digest-history.json
+bot-updates/
 print.lock
 *.tspl
 __pycache__/

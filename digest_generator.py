@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Build the approved daily news digest plus verified local events."""
+"""Build the daily news digest plus verified local events.
+
+News sections collect a handful of candidates, then one chat-completions call
+picks and summarizes them. If that call cannot be used, a deterministic picker
+still drops obituaries, ads, title-echo summaries, and recent repeats.
+"""
 
 from __future__ import annotations
 
@@ -19,30 +24,16 @@ import urllib.request
 import xml.etree.ElementTree as ET
 from zoneinfo import ZoneInfo
 
+import digest_picker
+import digest_settings as settings
+
 # All location- and person-specific settings come from the environment
 # (see .env.example). Defaults are neutral placeholders.
 def _env(name: str, default: str) -> str:
     return os.environ.get(name) or default
 
 
-def _google_news(query: str) -> str:
-    return (
-        "https://news.google.com/rss/search?q="
-        + urllib.parse.quote_plus(query)
-        + "&hl=en-US&gl=US&ceid=US:en"
-    )
-
-
 LOCATION_LABEL = _env("DIGEST_LOCATION_LABEL", "near Springfield")
-LOCAL_NEWS_QUERY = _env("DIGEST_LOCAL_NEWS_QUERY", "Springfield")
-MARKETS_NEWS_QUERY = _env("DIGEST_MARKETS_NEWS_QUERY", "SpaceX OR Rocket Lab OR ASTS stock")
-FEEDS = (
-    ("GLOBAL", "https://feeds.bbci.co.uk/news/world/rss.xml"),
-    ("LOCAL", _google_news(LOCAL_NEWS_QUERY)),
-    ("SPACEX/SPACE STOCK", _google_news(MARKETS_NEWS_QUERY)),
-    ("UK", "https://feeds.bbci.co.uk/news/uk/rss.xml"),
-    ("FILM/TV", "https://www.hollywoodreporter.com/c/movies/movie-news/feed/"),
-)
 # Primary calendar: a WordPress "Modern Events Calendar" (MEC) /events/ page.
 NEIGHBORHOOD_EVENTS_URL = _env("DIGEST_NEIGHBORHOOD_EVENTS_URL", "https://neighborhood.example.org/events/")
 NEIGHBORHOOD_NAME = _env("DIGEST_NEIGHBORHOOD_NAME", "Neighborhood")
@@ -61,20 +52,6 @@ WEATHER_POINT = (
     "https://api.weather.gov/points/"
     f"{_env('DIGEST_WEATHER_LAT', '39.7817')},{_env('DIGEST_WEATHER_LON', '-89.6501')}"
 )
-TASTE = _env(
-    "DIGEST_TASTE",
-    "mystery-box world-building, character-driven thrillers, action anime, "
-    "westerns, offbeat adult animation; exclude generic superheroes.",
-)
-FILM_TERMS = tuple(
-    term.strip().casefold()
-    for term in _env(
-        "DIGEST_FILM_TERMS", "anime,thriller,western,animation"
-    ).split(",")
-    if term.strip()
-)
-
-
 def fetch(url: str) -> bytes:
     request = urllib.request.Request(url, headers={"User-Agent": "daily-digest/2.0"})
     with urllib.request.urlopen(request, timeout=15) as response:
@@ -98,10 +75,11 @@ def parse_timestamp(value: str | None) -> float:
             return 0.0
 
 
-def rss_items(raw: bytes) -> list[dict]:
+def rss_items(raw: bytes, limit: int | None = None) -> list[dict]:
     root = ET.fromstring(raw)
     items: list[dict] = []
-    for node in root.findall(".//item")[:20]:
+    seen_urls: set[str] = set()
+    for node in root.findall(".//item"):
         title = clean(node.findtext("title") or "")
         link = clean(node.findtext("link") or "")
         published = clean(
@@ -109,17 +87,27 @@ def rss_items(raw: bytes) -> list[dict]:
             or node.findtext("{http://purl.org/dc/elements/1.1/}date")
             or ""
         )
-        summary = clean(node.findtext("description") or "")[:240]
-        if title and link:
-            items.append(
-                {
-                    "title": title,
-                    "url": link,
-                    "published_at": published or None,
-                    "summary": summary,
-                }
-            )
-    return items
+        summary = clean(node.findtext("description") or "")[:500]
+        if not title or not link:
+            continue
+        url_key = digest_picker.normalize_url(link)
+        if url_key in seen_urls:
+            continue
+        seen_urls.add(url_key)
+        items.append(
+            {
+                "title": title,
+                "url": link,
+                "published_at": published or None,
+                "summary": summary,
+            }
+        )
+    items.sort(
+        key=lambda item: (parse_timestamp(item.get("published_at")), item["title"]),
+        reverse=True,
+    )
+    cap = settings.candidates_per_section() if limit is None else limit
+    return items[:cap]
 
 
 def _parse_local_datetime(value: str) -> dt.datetime:
@@ -332,10 +320,18 @@ def chamber_event_location(raw: bytes) -> str:
     return ", ".join(parts)
 
 
+def _events_title() -> str:
+    spec = settings.section_by_id("events")
+    if spec is not None:
+        return spec.title
+    return settings.DEFAULT_TITLES["events"]
+
+
 def build_events_section(
     digest_date: str, fetcher: Callable[[str], bytes]
 ) -> tuple[dict, list[dict]]:
     errors: list[dict] = []
+    events_title = _events_title()
     neighborhood: list[dict] = []
     chamber: list[dict] = []
     try:
@@ -343,7 +339,7 @@ def build_events_section(
     except Exception as exc:
         errors.append(
             {
-                "section": "EVENTS TODAY / SOON",
+                "section": events_title,
                 "url": NEIGHBORHOOD_EVENTS_URL,
                 "error": f"{type(exc).__name__}: {exc}",
             }
@@ -358,7 +354,7 @@ def build_events_section(
             except Exception as exc:
                 errors.append(
                     {
-                        "section": "EVENTS TODAY / SOON",
+                        "section": events_title,
                         "url": candidate["url"],
                         "error": f"{type(exc).__name__}: {exc}",
                     }
@@ -386,7 +382,7 @@ def build_events_section(
     except Exception as exc:
         errors.append(
             {
-                "section": "EVENTS TODAY / SOON",
+                "section": events_title,
                 "url": CHAMBER_EVENTS_URL,
                 "error": f"{type(exc).__name__}: {exc}",
             }
@@ -431,7 +427,7 @@ def build_events_section(
         ]
     return (
         {
-            "section": "EVENTS TODAY / SOON",
+            "section": events_title,
             "source_feed": NEIGHBORHOOD_EVENTS_URL,
             "source_feeds": [NEIGHBORHOOD_EVENTS_URL, CHAMBER_EVENTS_URL],
             "window_start": window_start.isoformat(),
@@ -444,23 +440,106 @@ def build_events_section(
     )
 
 
-def weather(fetcher: Callable[[str], bytes]) -> dict:
+def select_daytime_period(
+    periods: list[dict], digest_date: str, tz: ZoneInfo
+) -> tuple[dict, dict | None]:
+    """First isDaytime period whose start falls on the digest date, plus the following night."""
+    if not isinstance(periods, list):
+        raise LookupError("forecast periods missing")
+    today = dt.date.fromisoformat(digest_date)
+    chosen_index: int | None = None
+    for index, period in enumerate(periods):
+        if not isinstance(period, dict) or not period.get("isDaytime"):
+            continue
+        start_raw = period.get("startTime")
+        if not isinstance(start_raw, str):
+            continue
+        try:
+            start = dt.datetime.fromisoformat(start_raw)
+        except ValueError:
+            continue
+        if start.tzinfo is None:
+            start = start.replace(tzinfo=tz)
+        if start.astimezone(tz).date() == today:
+            chosen_index = index
+            break
+    if chosen_index is None:
+        raise LookupError(f"no daytime forecast period on {digest_date}")
+    night = None
+    if chosen_index + 1 < len(periods):
+        following = periods[chosen_index + 1]
+        if isinstance(following, dict) and not following.get("isDaytime"):
+            night = following
+    return periods[chosen_index], night
+
+
+def _temperature_text(period: dict) -> str | None:
+    if period.get("temperature") is None:
+        return None
+    unit = period.get("temperatureUnit") or "F"
+    return f"{period['temperature']}°{unit}"
+
+
+def _trim_words(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    window = text[:limit].rsplit(" ", 1)[0].rstrip(" ,;:")
+    if not window:
+        return text[:limit].rstrip()
+    if window[-1] not in ".!?":
+        window += "."
+    return window
+
+
+def format_weather_item(day: dict, night: dict | None, forecast_url: str) -> dict:
+    high = _temperature_text(day)
+    if high is None:
+        raise KeyError("daytime temperature")
+    name = clean(str(day.get("name") or "Today")) or "Today"
+    pieces = [f"{name}: high {high}"]
+    if night is not None:
+        low = _temperature_text(night)
+        if low is not None:
+            pieces.append(f"low {low}")
+    precipitation = day.get("probabilityOfPrecipitation")
+    if isinstance(precipitation, dict) and isinstance(precipitation.get("value"), (int, float)):
+        pieces.append(f"{int(round(float(precipitation['value'])))}% chance of precipitation")
+    short = clean(str(day.get("shortForecast") or ""))
+    headline = ", ".join(pieces)
+    if short:
+        headline = f"{headline}. {short}"
+    summary = _trim_words(clean(str(day.get("detailedForecast") or "")), 480)
+    if not summary:
+        summary = short or headline
+    return {
+        "headline": headline,
+        "summary": summary,
+        "url": forecast_url,
+        # The period start is stable across repeated renders. now() would change the digest id.
+        "published_at": day.get("startTime"),
+        "rationale": "NOAA daytime forecast for the digest date; the overnight period is not used",
+    }
+
+
+def weather(fetcher: Callable[[str], bytes], digest_date: str) -> dict:
     point = json.loads(fetcher(WEATHER_POINT))
     forecast_url = point["properties"]["forecast"]
     forecast = json.loads(fetcher(forecast_url))
-    period = forecast["properties"]["periods"][0]
-    return {
-        "headline": (
-            f"{period['name']}: {period['temperature']}°{period['temperatureUnit']} · "
-            f"{period['shortForecast']}"
-        ),
-        "summary": clean(period.get("detailedForecast") or ""),
-        "url": forecast_url,
-        # NOAA's period timestamp is stable across repeated renders; using now() here
-        # would defeat digest-id idempotency.
-        "published_at": period.get("startTime"),
-        "rationale": "NOAA forecast for the configured coordinates",
-    }
+    periods = forecast["properties"]["periods"]
+    try:
+        day, night = select_daytime_period(periods, digest_date, LOCAL_TZ)
+    except LookupError:
+        return {
+            "headline": f"No daytime forecast for {digest_date}",
+            "summary": (
+                "NOAA returned forecast periods, but none is a daytime period on this date. "
+                "The overnight period was not used."
+            ),
+            "url": forecast_url,
+            "published_at": None,
+            "rationale": "No daytime period on the digest date",
+        }
+    return format_weather_item(day, night, forecast_url)
 
 
 def compute_digest_id(payload: dict) -> str:
@@ -471,87 +550,148 @@ def compute_digest_id(payload: dict) -> str:
     return hashlib.sha256(canonical).hexdigest()
 
 
+def _unavailable_news_item(feed_url: str, exc: Exception) -> dict:
+    return {
+        "title": "No new update today (source unavailable)",
+        "summary": "The configured source could not be reached for this edition.",
+        "url": feed_url,
+        "published_at": None,
+        "rationale": f"source unavailable: {type(exc).__name__}",
+    }
+
+
 def make_payload(
-    digest_date: str, fetcher: Callable[[str], bytes] = fetch
+    digest_date: str,
+    fetcher: Callable[[str], bytes] = fetch,
+    *,
+    opener: Callable | None = None,
+    now: dt.datetime | None = None,
+    history_file: Path | None = None,
+    bot_directory: Path | None = None,
 ) -> dict:
-    errors: list[dict] = []
-    sections: list[dict] = []
-    try:
-        weather_item = weather(fetcher)
-    except Exception as exc:  # source failure is represented, never invented
-        errors.append({"section": "WEATHER", "url": WEATHER_POINT, "error": f"{type(exc).__name__}: {exc}"})
-        weather_item = {
-            "headline": "No new update today (weather source unavailable)",
-            "summary": "The configured NOAA forecast could not be reached for this edition.",
-            "url": WEATHER_POINT,
-            "published_at": None,
-            "rationale": f"weather unavailable: {type(exc).__name__}",
-        }
-    sections.append({"section": "WEATHER", "source_feed": WEATHER_POINT, "items": [weather_item]})
+    moment = now or dt.datetime.now(dt.timezone.utc)
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=dt.timezone.utc)
+    errors: list[dict] = [
+        {"section": "CONFIG", "url": "env", "error": problem}
+        for problem in settings.configuration_problems()
+    ]
+    specs = settings.sections()
+    by_id: dict[str, dict] = {}
 
-    for name, url in FEEDS:
+    weather_spec = settings.section_by_id("weather")
+    if weather_spec is not None:
         try:
-            candidates = rss_items(fetcher(url))
-            ranked = sorted(
-                candidates,
-                key=lambda item: (parse_timestamp(item.get("published_at")), item["title"]),
-                reverse=True,
+            weather_item = weather(fetcher, digest_date)
+        except Exception as exc:  # source failure is represented, never invented
+            errors.append(
+                {"section": weather_spec.title, "url": WEATHER_POINT, "error": f"{type(exc).__name__}: {exc}"}
             )
-            if name.startswith("FILM"):
-                ranked = [
-                    item
-                    for item in ranked
-                    if any(
-                        term in (item["title"] + " " + item.get("summary", "")).lower()
-                        for term in FILM_TERMS
-                    )
-                ]
-            item = ranked[0] if ranked else {
-                "title": "No new update today",
-                "summary": "No current item matched this section's configured source and relevance rules.",
-                "url": url,
+            weather_item = {
+                "headline": "No new update today (weather source unavailable)",
+                "summary": "The configured NOAA forecast could not be reached for this edition.",
+                "url": WEATHER_POINT,
                 "published_at": None,
-                "rationale": "No source item available or no item matched the configured relevance filter.",
+                "rationale": f"weather unavailable: {type(exc).__name__}",
             }
-            item["rationale"] = item.get("rationale") or f"Ranked newest source item from {url}"
-        except Exception as exc:
-            errors.append({"section": name, "url": url, "error": f"{type(exc).__name__}: {exc}"})
-            item = {
-                "title": "No new update today (source unavailable)",
-                "summary": "The configured source could not be reached for this edition.",
-                "url": url,
-                "published_at": None,
-                "rationale": f"source unavailable: {type(exc).__name__}",
-            }
-        sections.append({"section": name, "source_feed": url, "items": [item]})
-        if name == "LOCAL":
-            events_section, event_errors = build_events_section(digest_date, fetcher)
-            sections.append(events_section)
-            errors.extend(event_errors)
-
-    sections.append(
-        {
-            "section": "MUSIC",
-            "source_feed": "https://open.spotify.com/",
-            "items": [
-                {
-                    "title": "No new update today (Spotify access unavailable)",
-                    "summary": "Music recommendations are paused until read-only Spotify access is available.",
-                    "url": "https://open.spotify.com/",
-                    "published_at": None,
-                    "rationale": "Spotify read-only account access is not available to this generator.",
-                }
-            ],
+        by_id["weather"] = {
+            "section": weather_spec.title,
+            "source_feed": WEATHER_POINT,
+            "items": [weather_item],
         }
+
+    news_requests: list[dict] = []
+    for spec in specs:
+        if spec.kind != "news":
+            continue
+        feed_url, prefer_terms = settings.news_feed(spec.id)
+        try:
+            candidates = rss_items(fetcher(feed_url))
+        except Exception as exc:
+            errors.append({"section": spec.title, "url": feed_url, "error": f"{type(exc).__name__}: {exc}"})
+            by_id[spec.id] = {
+                "section": spec.title,
+                "source_feed": feed_url,
+                "items": [_unavailable_news_item(feed_url, exc)],
+            }
+            continue
+        news_requests.append(
+            {
+                "section_id": spec.id,
+                "title": spec.title,
+                "purpose": spec.purpose,
+                "feed_url": feed_url,
+                "prefer_terms": prefer_terms,
+                "candidates": candidates,
+            }
+        )
+
+    if settings.section_by_id("events") is not None:
+        events_section, event_errors = build_events_section(digest_date, fetcher)
+        by_id["events"] = events_section
+        errors.extend(event_errors)
+
+    bot_spec = settings.section_by_id("bot_updates")
+    if bot_spec is not None:
+        bot_items, bot_error = digest_picker.load_bot_updates(
+            bot_directory or settings.bot_updates_dir(),
+            digest_date,
+            moment,
+        )
+        if bot_error:
+            errors.append(
+                {
+                    "section": bot_spec.title,
+                    "url": str((bot_directory or settings.bot_updates_dir()) / f"{digest_date}.json"),
+                    "error": bot_error,
+                }
+            )
+        if bot_items:
+            by_id["bot_updates"] = {
+                "section": bot_spec.title,
+                "source_feed": str(bot_directory or settings.bot_updates_dir()),
+                "items": bot_items,
+            }
+
+    history_path = history_file or settings.history_path()
+    history, history_error = digest_picker.load_history(history_path)
+    if history_error:
+        errors.append({"section": "HISTORY", "url": str(history_path), "error": history_error})
+    picked, picker_meta, picker_errors, history_records = digest_picker.pick_news(
+        news_requests,
+        digest_date=digest_date,
+        history=history,
+        has_bots="bot_updates" in by_id,
+        taste=settings.taste(),
+        opener=opener,
     )
+    errors.extend(picker_errors)
+    feeds = {request["section_id"]: request["feed_url"] for request in news_requests}
+    for section_id, items in picked.items():
+        spec = settings.section_by_id(section_id)
+        if spec is None:
+            continue
+        by_id[section_id] = {
+            "section": spec.title,
+            "source_feed": feeds.get(section_id, ""),
+            "items": items,
+        }
+
+    try:
+        digest_picker.save_history(history_path, digest_date, history_records)
+    except Exception as exc:
+        errors.append({"section": "HISTORY", "url": str(history_path), "error": f"{type(exc).__name__}: {exc}"})
+
+    ordered = [by_id[spec.id] for spec in specs if spec.id in by_id]
     payload = {
         "schema_version": "1.0",
         "digest_date": digest_date,
         "location": LOCATION_LABEL,
-        "taste_profile": TASTE,
-        "sections": sections,
+        "taste_profile": settings.taste(),
+        "picker": picker_meta,
+        "sections": ordered,
         "source_errors": errors,
-        "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "generated_at": moment.astimezone(dt.timezone.utc).isoformat(),
         "credentials_in_label": False,
     }
     payload["digest_id"] = compute_digest_id(payload)
@@ -578,7 +718,7 @@ def main() -> int:
     args = parser.parse_args()
     payload = make_payload(args.date)
     atomic_json(args.out, payload)
-    print(json.dumps({"digest_id": payload["digest_id"], "sections": len(payload["sections"]), "source_errors": payload["source_errors"], "output": str(args.out.resolve())}, sort_keys=True))
+    print(json.dumps({"digest_id": payload["digest_id"], "picker": payload.get("picker", {}).get("mode"), "sections": len(payload["sections"]), "source_errors": payload["source_errors"], "output": str(args.out.resolve())}, sort_keys=True))
     return 0
 
 

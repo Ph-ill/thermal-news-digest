@@ -5,8 +5,19 @@ from pathlib import Path
 import re
 import tempfile
 import unittest
+from unittest import mock
 
 # Fictional fixture location; set before importing the generator.
+for _name in list(os.environ):
+    if _name.startswith("DIGEST_SECTION") or _name in {
+        "DIGEST_LLM_API_KEY",
+        "DIGEST_READER_IDS",
+        "DIGEST_SECTION_ORDER",
+        "DIGEST_BOT_UPDATES_DIR",
+        "DIGEST_HISTORY_PATH",
+    }:
+        os.environ.pop(_name, None)
+os.environ["DIGEST_LLM_API_KEY"] = ""
 os.environ.update(
     {
         "DIGEST_LOCATION_LABEL": "near Springfield",
@@ -246,6 +257,269 @@ class ReceiptDigestTests(unittest.TestCase):
             expected = {"version": 1, "digests": {"abc": {"status": "completed"}}}
             rd.atomic_json(state_path, expected)
             self.assertEqual(rd.read_state(state_path), expected)
+
+    def test_optional_bot_section_layout_and_rejected_music(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            plain = payload()
+            without = self.render_payload(plain, root / "without")
+            with_bots = payload()
+            with_bots["sections"].append(
+                {
+                    "section": "BOT UPDATES",
+                    "source_feed": "bot-updates",
+                    "items": [
+                        {
+                            "title": "Popcorn: Film picks",
+                            "summary": "A quiet anime about a night courier opens Friday, and the review is the one worth making time for on a narrow receipt.",
+                            "source_label": "Popcorn",
+                            "published_at": "2026-11-26T04:40:00-06:00",
+                        },
+                        {
+                            "title": "Listener: Morning queue (reader-a)",
+                            "summary": "Three new songs from the usual corner of the shelf, none of them loud, queued before the day starts.",
+                            "source_label": "Listener",
+                            "url": "https://example.com/listener/morning",
+                            "published_at": "2026-11-26T04:40:00-06:00",
+                        },
+                    ],
+                }
+            )
+            with_bots["digest_id"] = rd.payload_digest_id(with_bots)
+            rendered = self.render_payload(with_bots, root / "with")
+            self.assertEqual(without["geometry"]["section_count"], len(rd.EXPECTED_SECTIONS))
+            self.assertEqual(rendered["geometry"]["section_count"], len(rd.EXPECTED_SECTIONS) + 1)
+            self.assertGreater(rendered["geometry"]["height_dots"], without["geometry"]["height_dots"])
+            self.assertLessEqual(rendered["geometry"]["height_dots"], rd.MAX_HEIGHT_DOTS)
+            bot = rendered["geometry"]["sections"][-1]
+            self.assertEqual(bot["name"], "BOT UPDATES")
+            self.assertEqual(bot["items"][0]["source"], "Source: Popcorn")
+            self.assertIsNone(bot["items"][0]["source_url"])
+            self.assertEqual(bot["items"][1]["source"], "Source: Listener")
+            self.assertNotIn("MUSIC", [section["name"] for section in rendered["geometry"]["sections"]])
+
+        reordered = payload()
+        reordered["sections"] = [reordered["sections"][-1], *reordered["sections"][:-1]]
+        reordered["digest_id"] = rd.payload_digest_id(reordered)
+        with self.assertRaisesRegex(ValueError, "expected sections"):
+            rd.validate_payload(reordered)
+
+        missing = payload()
+        missing["sections"] = [section for section in missing["sections"] if section["section"] != "WEATHER"]
+        missing["digest_id"] = rd.payload_digest_id(missing)
+        with self.assertRaisesRegex(ValueError, "expected sections"):
+            rd.validate_payload(missing)
+
+        music = payload()
+        music["sections"].append(
+            {
+                "section": "MUSIC",
+                "source_feed": "https://example.com/music",
+                "items": [
+                    {
+                        "title": "A song",
+                        "summary": "This placeholder section is no longer part of the receipt.",
+                        "url": "https://example.com/music",
+                    }
+                ],
+            }
+        )
+        music["digest_id"] = rd.payload_digest_id(music)
+        with self.assertRaisesRegex(ValueError, "expected sections"):
+            rd.validate_payload(music)
+
+        two_items = payload()
+        news = next(section for section in two_items["sections"] if section["section"] == "GLOBAL")
+        news["items"].append(
+            {
+                "title": "Second global item",
+                "summary": "A second item fills the receipt when the bot section is absent, and it still has to stay inside the printable width.",
+                "url": "https://example.com/global-2",
+                "published_at": "2026-11-26T08:00:00+00:00",
+            }
+        )
+        two_items["digest_id"] = rd.payload_digest_id(two_items)
+        rd.validate_payload(two_items)
+
+        empty = payload()
+        empty["sections"][1]["items"] = []
+        empty["digest_id"] = rd.payload_digest_id(empty)
+        with self.assertRaisesRegex(ValueError, "invalid item count"):
+            rd.validate_payload(empty)
+
+    def test_custom_section_title_follows_env(self):
+        renamed = payload()
+        for section in renamed["sections"]:
+            if section["section"] == "SPACEX/SPACE STOCK":
+                section["section"] = "MARKETS"
+        renamed["digest_id"] = rd.payload_digest_id(renamed)
+        with self.assertRaisesRegex(ValueError, "expected sections"):
+            rd.validate_payload(renamed)
+        with mock.patch.dict(os.environ, {"DIGEST_SECTION_TITLE_MARKETS": "MARKETS"}):
+            rd.validate_payload(renamed)
+            self.assertEqual(rd.settings.section_by_id("markets").title, "MARKETS")
+
+
+def sample_story(section: str, index: int) -> dict:
+    stories = {
+        "WEATHER": [
+            (
+                "Thursday: high 64°F, low 41°F, 20% chance of precipitation. Partly cloudy",
+                "Daytime stays dry until late afternoon, then a brief shower is possible. The wind stays light, and the evening cools quickly after sunset.",
+            )
+        ],
+        "GLOBAL": [
+            (
+                "Harbor talks end with a written ceasefire and a date to reopen the port",
+                "Mediators said both sides signed the ceasefire text before dawn and agreed to let aid ships dock on Friday. The port has been closed for nine days.",
+            ),
+            (
+                "Research ship reports the first clear map of the new undersea ridge",
+                "The crew finished the survey at dawn and will release the map after the instruments are checked. The ridge was not on last year's charts.",
+            ),
+        ],
+        "LOCAL": [
+            (
+                "City council adopts the annual budget after cutting the proposed fee increase",
+                "The vote funds the library's weekend hours and leaves the park tax unchanged. Crews start the sidewalk work on the south side next month.",
+            ),
+            (
+                "River path stays closed through Friday while crews reset the washed-out railing",
+                "Walkers can use the north entrance. The parks office said the railing should be back before the weekend market.",
+            ),
+        ],
+        "SPACEX/SPACE STOCK": [
+            (
+                "Launch firm wins a civil contract to fly two science missions next spring",
+                "The contract covers two launches and the ground support that goes with them. It is an operations story, not a price-target note.",
+            ),
+            (
+                "Range schedule adds a dawn window for the cargo flight",
+                "The window opens at sunrise and lasts ninety minutes. Weather officers said the wind, not the hardware, is the thing to watch.",
+            ),
+        ],
+        "UK": [
+            (
+                "Rail board publishes the weekend map after finishing the bridge repairs",
+                "Engineers reopened the main line after replacing the cracked span. The first weekend timetable is shorter than usual while they watch the new joints.",
+            ),
+            (
+                "Museum opens the recovered archive to readers on Saturday morning",
+                "Tickets are free and the reading room closes at noon. The letters have been out of public view for a decade.",
+            ),
+        ],
+        "FILM/TV": [
+            (
+                "A new western series shoots in the desert and keeps the story small",
+                "The series follows one sheriff and a traveling photographer. It opens in the spring and skips the usual superhero crossover.",
+            ),
+            (
+                "An anime film about a night courier gets a Friday opening",
+                "The story stays with one route and one city. Early reviews say it is quiet, strange, and worth the two hours.",
+            ),
+        ],
+    }
+    title, summary = stories[section][index]
+    if section == "WEATHER":
+        return {
+            "headline": title,
+            "summary": summary,
+            "url": "https://api.weather.gov/gridpoints/EXAMPLE/1,1/forecast",
+            "published_at": "2026-11-26T12:00:00+00:00",
+        }
+    slug = {"GLOBAL": "global", "LOCAL": "local", "SPACEX/SPACE STOCK": "markets", "UK": "uk", "FILM/TV": "film"}[section]
+    return {
+        "title": title,
+        "summary": summary,
+        "url": f"https://example.com/{slug}-{index}",
+        "published_at": "2026-11-26T12:00:00+00:00",
+        "source_label": "Example Desk",
+    }
+
+
+def sample_payload(*, bots: bool) -> dict:
+    sections = []
+    for name in rd.EXPECTED_SECTIONS:
+        if name == "EVENTS TODAY / SOON":
+            sections.append(
+                {
+                    "section": name,
+                    "source_feed": "https://maplegrove.example.org/events/",
+                    "items": [
+                        {
+                            "title": "FRI NOV 27 · 6:00 PM-7:30 PM · Library reading night",
+                            "summary": "Main Library, 15 Library Lane, Springfield · Springfield area",
+                            "url": "https://maplegrove.example.org/events/reading-night/",
+                            "source_id": "maplegrove.example.org:mec:3001",
+                            "published_at": "2026-11-27T18:00:00-06:00",
+                        },
+                        {
+                            "title": "SAT NOV 28 · 9:00 AM-11:00 AM · River path cleanup",
+                            "summary": "River Park, Springfield · Springfield area",
+                            "url": "https://business.chamber.example.com/eventcalendar/Details/river-cleanup-42",
+                            "source_id": "business.chamber.example.com:event:42",
+                            "published_at": "2026-11-28T09:00:00-06:00",
+                        },
+                    ],
+                }
+            )
+            continue
+        count = 1 if bots or name == "WEATHER" else 2
+        sections.append(
+            {
+                "section": name,
+                "source_feed": "https://example.com/feed",
+                "items": [sample_story(name, index) for index in range(count)],
+            }
+        )
+    if bots:
+        sections.append(
+            {
+                "section": "BOT UPDATES",
+                "source_feed": "bot-updates",
+                "items": [
+                    {
+                        "title": "Popcorn: Film picks",
+                        "summary": "A quiet anime about a night courier opens Friday. The review is the one worth making time for.",
+                        "source_label": "Popcorn",
+                        "published_at": "2026-11-26T04:40:00-06:00",
+                    },
+                    {
+                        "title": "Listener: Morning queue (reader-a)",
+                        "summary": "Three new songs from the usual corner of the shelf, none of them loud.",
+                        "source_label": "Listener",
+                        "published_at": "2026-11-26T04:40:00-06:00",
+                    },
+                ],
+            }
+        )
+    result = {
+        "schema_version": "1.0",
+        "digest_date": "2026-11-26",
+        "location": "near Springfield",
+        "taste_profile": "fixture",
+        "sections": sections,
+        "source_errors": [],
+        "generated_at": "2026-11-26T11:00:00+00:00",
+        "credentials_in_label": False,
+    }
+    result["digest_id"] = rd.payload_digest_id(result)
+    return result
+
+
+def write_sample_pngs(directory: Path) -> dict[str, Path]:
+    directory.mkdir(parents=True, exist_ok=True)
+    written = {}
+    with tempfile.TemporaryDirectory() as temp:
+        root = Path(temp)
+        for bots, name in ((False, "without-bot-updates"), (True, "with-bot-updates")):
+            source = root / f"{name}.json"
+            source.write_text(json.dumps(sample_payload(bots=bots), indent=2), encoding="utf-8")
+            metadata = rd.render(source, root / name)
+            target = directory / f"{name}.png"
+            target.write_bytes(Path(metadata["png"]).read_bytes())
+            written[name] = target
+    return written
 
 
 if __name__ == "__main__":

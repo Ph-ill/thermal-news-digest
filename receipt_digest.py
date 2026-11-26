@@ -21,6 +21,8 @@ import xml.etree.ElementTree as ET
 
 from PIL import Image, ImageFont
 
+import digest_settings as settings
+
 WIDTH_DOTS = 640
 DOTS_PER_MM = 8
 WIDTH_MM = 80
@@ -50,16 +52,10 @@ PROJECT_DIR = Path(os.environ.get("DIGEST_HOME") or Path(__file__).resolve().par
 DEFAULT_OUTPUT_DIR = PROJECT_DIR / "output"
 DEFAULT_STATE = PROJECT_DIR / "state.json"
 DEFAULT_QUEUE = os.environ.get("DIGEST_PRINTER_QUEUE", "receipt")
-EXPECTED_SECTIONS = (
-    "WEATHER",
-    "GLOBAL",
-    "LOCAL",
-    "EVENTS TODAY / SOON",
-    "SPACEX/SPACE STOCK",
-    "UK",
-    "FILM/TV",
-    "MUSIC",
-)
+# Required titles in the default order, captured at import for existing callers.
+# validate_payload reads the live ordered list so optional sections can be absent
+# and a deployment can rename headers without editing this file.
+EXPECTED_SECTIONS = settings.required_titles()
 
 
 def now_iso() -> str:
@@ -146,30 +142,72 @@ def payload_digest_id(payload: dict) -> str:
     return hashlib.sha256(canonical).hexdigest()
 
 
+def _order_error(expected: tuple[str, ...], names: tuple[str, ...]) -> ValueError:
+    return ValueError(
+        f"expected sections {expected!r} in order (optional may be omitted), got {names!r}"
+    )
+
+
+def check_section_order(names: list[object]) -> None:
+    specs = settings.sections()
+    expected = tuple(spec.title for spec in specs)
+    optional = {spec.title for spec in specs if spec.optional}
+    if len(expected) != len(set(expected)):
+        raise ValueError("expected sections are not unique")
+    position = 0
+    for name in names:
+        if not isinstance(name, str) or name not in expected:
+            raise _order_error(expected, tuple(names))
+        while position < len(expected) and expected[position] != name:
+            if expected[position] not in optional:
+                raise _order_error(expected, tuple(names))
+            position += 1
+        if position >= len(expected):
+            raise _order_error(expected, tuple(names))
+        position += 1
+    while position < len(expected):
+        if expected[position] not in optional:
+            raise _order_error(expected, tuple(names))
+        position += 1
+
+
 def validate_payload(payload: dict) -> None:
     if payload.get("schema_version") != "1.0":
         raise ValueError("unsupported news digest schema")
     sections = payload.get("sections")
-    if not isinstance(sections, list):
+    if not isinstance(sections, list) or not sections:
         raise ValueError("news digest sections are missing")
-    names = tuple(section.get("section") for section in sections)
-    if names != EXPECTED_SECTIONS:
-        raise ValueError(f"expected sections {EXPECTED_SECTIONS!r}, got {names!r}")
+    names = [section.get("section") if isinstance(section, dict) else None for section in sections]
+    check_section_order(names)
+    specs = {spec.title: spec for spec in settings.sections()}
     for section in sections:
+        if not isinstance(section, dict):
+            raise ValueError("news digest section is not an object")
+        spec = specs[section["section"]]
         items = section.get("items")
-        expected_count = range(1, 4) if section.get("section") == "EVENTS TODAY / SOON" else (1,)
-        if not isinstance(items, list) or len(items) not in expected_count:
+        if spec.kind == "events":
+            allowed = range(1, 4)
+        elif spec.kind == "bot_updates":
+            allowed = range(1, settings.max_bot_updates() + 1)
+        else:
+            allowed = range(1, settings.max_news_items() + 1)
+        if not isinstance(items, list) or len(items) not in allowed:
             raise ValueError(
                 f"section {section.get('section')} has invalid item count {len(items) if isinstance(items, list) else None}"
             )
         for item in items:
+            if not isinstance(item, dict):
+                raise ValueError(f"section {section.get('section')} item is not an object")
             if not normalize_text(str(item.get("title") or item.get("headline") or "")):
                 raise ValueError(f"section {section.get('section')} has no printable headline")
             if not normalize_text(str(item.get("summary") or item.get("rationale") or "")):
                 raise ValueError(f"section {section.get('section')} has no printable detail")
-            if not item.get("url"):
+            if spec.kind == "bot_updates":
+                if not normalize_text(str(item.get("source_label") or "")) and not item.get("url"):
+                    raise ValueError(f"section {section.get('section')} has no source label")
+            elif not item.get("url"):
                 raise ValueError(f"section {section.get('section')} has no source URL")
-            if section.get("section") == "EVENTS TODAY / SOON" and not item.get("source_id"):
+            if spec.kind == "events" and not item.get("source_id"):
                 raise ValueError("event item has no public source identifier")
     expected = payload_digest_id(payload)
     if payload.get("digest_id") != expected:
@@ -177,7 +215,10 @@ def validate_payload(payload: dict) -> None:
 
 
 def source_line(item: dict) -> str:
-    host = (urlparse(str(item["url"])).hostname or "source").lower()
+    label = normalize_text(str(item.get("source_label") or ""))
+    if label:
+        return f"Source: {label}"
+    host = (urlparse(str(item.get("url") or "")).hostname or "source").lower()
     if host.startswith("www."):
         host = host[4:]
     return f"Source: {host}"
@@ -254,7 +295,7 @@ def layout_payload(payload: dict) -> tuple[list[dict], int, int, int, int]:
                     "headline": headline,
                     "detail": detail,
                     "source": source,
-                    "source_url": item["url"],
+                    "source_url": item.get("url"),
                     "source_id": item.get("source_id"),
                 }
             )
@@ -423,7 +464,7 @@ def render(source: Path, output_dir: Path) -> dict:
         "source_sha256": hashlib.sha256(raw.encode("utf-8")).hexdigest(),
         "source_errors": payload.get("source_errors", []),
         "digest_id": digest_id,
-        "profile": "receipt-80mm-news-events-v4",
+        "profile": "receipt-80mm-news-events-v5",
         "geometry": geometry,
         "raster_black_bbox": list(bbox),
         "raster_black_ratio": round(black_ratio, 6),
