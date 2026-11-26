@@ -55,7 +55,7 @@ NEARBY SHOWS and GROK BOT UPDATES are optional. The other sections are required 
 
 When either optional section is present, each news section prints one item and a shorter summary. When both are absent, each news section prints two items and a longer summary. If both companies have a real story, that section still prints one of each. Shows stay at most three. The strip still stops at 6000 dots (750 mm).
 
-The sample without bot updates includes one nearby show so that section is visible. A real run leaves it off when nothing matches. The sample with bot updates is the shorter layout: a picture or an initial, the bot's first name underneath, and a speech bubble for each note. Two further samples show four notes, including one missing picture, under a sunny forecast and a night storm. The sunny strip is also rendered with `DIGEST_BOT_UPDATES_STYLE=plain`, which drops the balloons and puts a short dash between notes.
+The sample without bot updates includes one nearby show so that section is visible. A real run leaves it off when nothing matches. The sample with bot updates is the shorter layout: a picture or an initial, the bot's first name underneath, and the note beside it. Two further samples show four notes, including one missing picture, under a sunny forecast and a night storm. Those use the plain layout, which is the default. `DIGEST_BOT_UPDATES_STYLE=bubble` is the comic-balloon alternative.
 
 BASTROP is for a childless couple in their early 30s: new openings, food trucks, bars, tastings, live music, markets, and outdoor plans in Bastrop, Smithville, Elgin, Cedar Creek, and east Austin. The model is the judge of what fits. A headline is dropped when its subject is an obituary, a crime, a council or government meeting or vote (including a bare "council votes"), the school board, or a sport (including golf and high school sports). Crime and obituaries are read in the summary too. A council mention that is only in the summary stays. The exemption is a known event phrase: a murder-mystery dinner, a soccer or sports bar, a football watch party, or a football watch. A photo shoot or a photo shooting is a studio phrase, not a crime. A shooting, arrest, killing, stabbing, crash death, or obituary stays out even when a bar or a brewery is named. "Killed" is a crime when a person is killed (a man, a woman, a person, two, or a number), when the line says "killed near", "killed after", or "killed in", or when it says fatal. "Killed by the storm", the rain, the weather, or the council is not a death, and neither is "Senate killed the bill". A death, including "dies at sea", is an obituary. A bar opening after a zoning change stays, because the opening is the subject. Home is Bastrop, Smithville, Elgin, Cedar Creek, McDade, Paige, Red Rock, Del Valle, and east Austin. A home town in the title keeps the item. A home town in the summary keeps it only when the summary places the event there ("in", "at", or "from" the town, including "opens in"), not when the owners also run a spot there, or the line only mentions regulars or a favorite of that town. Bee Cave, Lakeway, Westlake, Dripping Springs, and the other western suburbs, and the northern suburbs Round Rock, Pflugerville, Georgetown, Hutto, Taylor, Leander, and Cedar Park, are left out when that suburb is the title's location, unless the event is placed in a home town. Nearby shows still use the drive radius and do not use this list. With no model, BASTROP does not pick a story. That section prints a fixed line: Local picks unavailable today (AI offline). Town names and opening wording are not consulted. The Google News searches already name the towns. Community Impact and Eater Austin cover a wider area, so those items still have to name a town. Visit Bastrop's calendar did not offer a feed this client could read, and the Bastrop edition of Community Impact does not currently publish its own `/feed` URL, so those are not hardcoded.
 
@@ -67,11 +67,11 @@ Sample strips, rendered from fixture data:
 
 ![Receipt with bot updates](docs/samples/with-bot-updates.png)
 
-![Sunny receipt with four bot updates](docs/samples/receipt-sunny-four-bots.png)
+![Sunny receipt with four bot updates, plain layout](docs/samples/receipt-sunny-four-bots.png)
 
-![Same sunny receipt with the plain bot layout](docs/samples/receipt-sunny-four-bots-plain.png)
+![Same sunny receipt with comic balloons](docs/samples/receipt-sunny-four-bots-bubble.png)
 
-![Night storm receipt with four bot updates](docs/samples/receipt-night-storm-four-bots.png)
+![Night storm receipt with four bot updates, plain layout](docs/samples/receipt-night-storm-four-bots.png)
 
 ## Printer setup
 
@@ -144,7 +144,7 @@ Copy `.env.example` to `.env`. Empty values fall back to the defaults below. The
 | `DIGEST_BOT_UPDATES_MAX` | `4` | Maximum updates in one file (hard cap 6). |
 | `DIGEST_AVATARS_DIR` | `$DIGEST_HOME/avatars` | Square pictures for bot notes. Gitignored. See [docs/bot-updates.md](docs/bot-updates.md). |
 | `DIGEST_AVATAR_THRESHOLD` | unset | Optional 0–255 dither midpoint. Higher prints more black. |
-| `DIGEST_BOT_UPDATES_STYLE` | `bubble` | `bubble` or `plain`. Anything else stays `bubble`. |
+| `DIGEST_BOT_UPDATES_STYLE` | `plain` | `plain` or `bubble`. Anything else stays `plain`. |
 
 ## LLM setup
 
@@ -187,7 +187,7 @@ See [docs/picks.md](docs/picks.md). The short version: `python3 digest_generator
 
 ## Bot updates
 
-See [docs/bot-updates.md](docs/bot-updates.md) for the file name, the JSON schema, the staleness rules, and the receipt layout. The short version: an external process writes `bot-updates/YYYY-MM-DD.json` before 05:00. A bad or stale file is ignored. A good file becomes the GROK BOT UPDATES section, and each news section drops from two items to one so the notes fit under the length cap. Each note is that bot's picture (or a circle with its initial), the first word of its name underneath, and the first-person text beside it. `DIGEST_BOT_UPDATES_STYLE=bubble` puts that text in a comic balloon. `plain` leaves the balloon off and draws a short dash between notes. Film, television, and music notes belong in that file. Nearby concerts are [docs/shows.md](docs/shows.md), not a bot note. The heading can still be renamed with `DIGEST_SECTION_TITLE_BOT_UPDATES`.
+See [docs/bot-updates.md](docs/bot-updates.md) for the file name, the JSON schema, the staleness rules, and the receipt layout. The short version: an external process writes `bot-updates/YYYY-MM-DD.json` before 05:00. A bad or stale file is ignored. A good file becomes the GROK BOT UPDATES section, and each news section drops from two items to one so the notes fit under the length cap. Each note is that bot's picture (or a circle with its initial), the first word of its name underneath, and the first-person text beside it. The text is centered on the picture and the name. `DIGEST_BOT_UPDATES_STYLE` defaults to `plain`, which leaves the balloon off and draws one em dash between notes. `bubble` puts the text in a comic balloon. Film, television, and music notes belong in that file. Nearby concerts are [docs/shows.md](docs/shows.md), not a bot note. The heading can still be renamed with `DIGEST_SECTION_TITLE_BOT_UPDATES`.
 
 ## Deploy
 

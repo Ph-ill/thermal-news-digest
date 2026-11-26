@@ -430,11 +430,11 @@ def avatars_dir() -> Path:
 
 
 def bot_updates_style() -> str:
-    """``bubble`` (default) or ``plain``. Anything else stays on the balloon."""
-    raw = os.environ.get("DIGEST_BOT_UPDATES_STYLE", "bubble").strip().lower()
-    if raw in {"bubble", "plain"}:
-        return raw
-    return "bubble"
+    """``plain`` (default) or ``bubble``. Anything else stays on the plain layout."""
+    raw = os.environ.get("DIGEST_BOT_UPDATES_STYLE", "plain").strip().lower()
+    if raw == "bubble":
+        return "bubble"
+    return "plain"
 
 
 def avatar_threshold() -> int | None:

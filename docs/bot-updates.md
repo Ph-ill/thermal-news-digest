@@ -67,7 +67,7 @@ With the default reader ids, the stored title of the second note is `Listener: M
 
 ## Pictures
 
-Each note is a square picture on the left, 144 dots (18 mm), with the bot's first name centered underneath in a pixel font. `DIGEST_BOT_UPDATES_STYLE` chooses the words beside it. `bubble` (the default) draws a rounded comic balloon with an arched top and bottom and a curved, tapered tail pointing at the picture. The topic and the first-person text sit inside, with padding past the stroke and a gap between notes. `plain` skips the balloon. The same words sit beside the picture, and a short dashed line, centered on the page, sits halfway between one note and the next. Any other value of the setting is treated as `bubble`.
+Each note is a square picture on the left, 144 dots (18 mm), with the bot's first name centered underneath in a pixel font. `DIGEST_BOT_UPDATES_STYLE` chooses the words beside it. `plain` (the default) prints the topic and the first-person text beside the picture, centered on the picture and the name. One em dash, centered on the page, sits halfway between one note and the next. `bubble` draws a rounded comic balloon with an arched top and bottom and a curved, tapered tail pointing at the picture. The topic and the first-person text sit inside, with padding past the stroke and a gap between notes. Any other value of the setting is treated as `plain`.
 
 Pictures live in `DIGEST_AVATARS_DIR` (default `avatars/` inside the project directory). That directory is gitignored. The file name is the slug plus `.png`, `.jpg`, `.jpeg`, or `.webp`, for example `avatars/popcorn.png`. The loader tries those extensions in that order and uses the first one that decodes.
 

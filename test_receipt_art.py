@@ -335,7 +335,10 @@ class ReceiptArtRenderTests(unittest.TestCase):
             fixtures.portrait(avatars / "garden.png", (70, 150, 80))
             heights = []
             icons = []
-            with mock.patch.dict(os.environ, {"DIGEST_AVATARS_DIR": str(avatars)}):
+            with mock.patch.dict(
+                os.environ,
+                {"DIGEST_AVATARS_DIR": str(avatars), "DIGEST_BOT_UPDATES_STYLE": "bubble"},
+            ):
                 for icon, headline in (
                     ("sun", "Thursday: high 70°F, low 48°F. Sunny"),
                     ("night-storm", "Thursday night: low 55°F. Thunderstorms"),
@@ -414,7 +417,8 @@ class ReceiptArtRenderTests(unittest.TestCase):
             for item in value["sections"][-1]["items"]:
                 item["summary"] = text
             value["digest_id"] = rd.payload_digest_id(value)
-            metadata = fixtures.ReceiptDigestTests().render_payload(value, root / "long")
+            with mock.patch.dict(os.environ, {"DIGEST_BOT_UPDATES_STYLE": "bubble"}):
+                metadata = fixtures.ReceiptDigestTests().render_payload(value, root / "long")
             self.assertLessEqual(metadata["geometry"]["height_dots"], rd.MAX_HEIGHT_DOTS)
             self.assertFalse(metadata["geometry"]["clipping"])
             bubbles = [mark for mark in metadata["geometry"]["art"] if mark["type"] == "bubble"]
@@ -457,13 +461,13 @@ class ReceiptArtRenderTests(unittest.TestCase):
         self.assertEqual(art.bot_display_name("Popcorn · Movie Goblin"), "Popcorn")
         self.assertEqual(art.bot_display_name("Night Owl"), "Night")
         self.assertEqual(art.bot_topic("Listener: Morning queue (reader-a)"), "Morning queue")
-        self.assertEqual(settings.bot_updates_style(), "bubble")
+        self.assertEqual(settings.bot_updates_style(), "plain")
         with mock.patch.dict(os.environ, {"DIGEST_BOT_UPDATES_STYLE": "comic"}):
-            self.assertEqual(settings.bot_updates_style(), "bubble")
-        with mock.patch.dict(os.environ, {"DIGEST_BOT_UPDATES_STYLE": " PLAIN "}):
             self.assertEqual(settings.bot_updates_style(), "plain")
+        with mock.patch.dict(os.environ, {"DIGEST_BOT_UPDATES_STYLE": " BUBBLE "}):
+            self.assertEqual(settings.bot_updates_style(), "bubble")
 
-    def test_plain_style_centers_a_dash_between_notes(self):
+    def test_plain_style_centers_text_and_one_em_dash(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             avatars = root / "avatars"
@@ -474,28 +478,100 @@ class ReceiptArtRenderTests(unittest.TestCase):
                 "Thursday: high 70°F, low 48°F. Sunny",
                 "Clear and mild through the afternoon.",
             )
-            with mock.patch.dict(
-                os.environ,
-                {"DIGEST_AVATARS_DIR": str(avatars), "DIGEST_BOT_UPDATES_STYLE": "plain"},
-            ):
+            with mock.patch.dict(os.environ, {"DIGEST_AVATARS_DIR": str(avatars)}):
                 metadata = fixtures.ReceiptDigestTests().render_payload(value, root / "plain")
             marks = metadata["geometry"]["art"]
             self.assertEqual([mark for mark in marks if mark["type"] == "bubble"], [])
             notes = [mark for mark in marks if mark["type"] == "note"]
-            separators = [mark for mark in marks if mark["type"] == "separator"]
             self.assertEqual(len(notes), 4)
-            self.assertEqual(len(separators), 3)
+            image = Image.open(metadata["png"]).convert("L")
             page_center = rd.WIDTH_DOTS / 2
-            for earlier, dash, later in zip(notes, separators, notes[1:]):
-                self.assertEqual(dash["y"], earlier["bottom"] + (later["top"] - earlier["bottom"]) // 2)
-                self.assertEqual(dash["y"], earlier["bottom"] + art.SEPARATOR_GAP // 2)
-                self.assertLess(earlier["bottom"], dash["y"])
-                self.assertLess(dash["y"] + 2, later["top"])
-                self.assertEqual(dash["x"] + dash["w"] / 2, page_center)
+            for note in notes:
+                column = _ink_box(image, rd.LEFT, note["top"], rd.LEFT + art.AVATAR_PX, note["bottom"] + 1)
+                text = _ink_box(image, note["text_x"], note["top"], rd.WIDTH_DOTS - rd.RIGHT, note["bottom"] + 1)
+                self.assertIsNotNone(column)
+                self.assertIsNotNone(text)
+                self.assertLessEqual(abs(_center(text)[1] - _center(column)[1]), 4)
+            for earlier, later in zip(notes, notes[1:]):
+                dash = _ink_box(image, rd.LEFT, earlier["bottom"] + 1, rd.WIDTH_DOTS - rd.RIGHT, later["top"])
+                self.assertIsNotNone(dash)
+                gap_center = (earlier["bottom"] + later["top"]) / 2
+                dash_x, dash_y = _center(dash)
+                self.assertLessEqual(abs(dash_y - gap_center), 3)
+                self.assertLessEqual(abs(dash_x - page_center), 3)
+                self.assertLess(dash[2] - dash[0], 40)
+                self.assertLess(dash[3] - dash[1], 8)
             svg = Path(metadata["svg"]).read_text(encoding="utf-8")
-            self.assertIn('stroke-dasharray="8 6"', svg)
+            self.assertIn("—", svg)
+            self.assertNotIn("stroke-dasharray", svg)
             self.assertNotIn('stroke-linejoin="round"', svg)
             _assert_names_under_avatars(self, marks)
+
+    def test_weather_icon_ink_centers_on_two_and_three_line_text(self):
+        forecasts = (
+            ("Partly cloudy, high 64F", "Light north wind, dry all day.", 2),
+            (
+                "Partly cloudy, high 64F",
+                "Light north wind through the afternoon, then dry and mild after sunset.",
+                3,
+            ),
+        )
+        for headline, summary, body_lines in forecasts:
+            with self.subTest(body_lines=body_lines):
+                with tempfile.TemporaryDirectory() as temp:
+                    root = Path(temp)
+                    value = fixtures.sample_payload(bots=False)
+                    weather = value["sections"][0]["items"][0]
+                    weather["headline"] = headline
+                    weather["summary"] = summary
+                    weather["weather_icon"] = "partly"
+                    value["digest_id"] = rd.payload_digest_id(value)
+                    metadata = fixtures.ReceiptDigestTests().render_payload(value, root / "weather")
+                    sections = metadata["geometry"]["sections"]
+                    block = next(section for section in sections if section["name"] == "WEATHER")
+                    body = [line for line in block["lines"] if line["kind"] in {"headline", "detail"}]
+                    self.assertEqual(len(body), body_lines)
+                    self.assertTrue(any(line["kind"] == "source" for line in block["lines"]))
+                    image = Image.open(metadata["png"]).convert("L")
+                    index = sections.index(block)
+                    y0 = block["bar_y"] + rd.SECTION_BAR_HEIGHT + 2
+                    y1 = sections[index + 1]["bar_y"] - 2
+                    icon = _ink_box(image, rd.LEFT, y0, rd.LEFT + art.WEATHER_ICON_PX, y1)
+                    text = _ink_box(
+                        image,
+                        rd.LEFT + art.WEATHER_ICON_PX + art.WEATHER_GAP,
+                        y0,
+                        rd.WIDTH_DOTS - rd.RIGHT,
+                        y1,
+                    )
+                    self.assertIsNotNone(icon)
+                    self.assertIsNotNone(text)
+                    self.assertLessEqual(abs(_center(icon)[1] - _center(text)[1]), 4)
+
+
+def _ink_box(image: Image.Image, x0: int, y0: int, x1: int, y1: int) -> tuple[int, int, int, int] | None:
+    """Inclusive dark-pixel box inside the rectangle. ``y1`` and ``x1`` are exclusive."""
+    width, height = image.size
+    x0 = max(0, x0)
+    y0 = max(0, y0)
+    x1 = min(width, x1)
+    y1 = min(height, y1)
+    pixels = image.tobytes()
+    xs: list[int] = []
+    ys: list[int] = []
+    for y in range(y0, y1):
+        row = y * width
+        for x in range(x0, x1):
+            if pixels[row + x] < 185:
+                xs.append(x)
+                ys.append(y)
+    if not xs:
+        return None
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+def _center(box: tuple[int, int, int, int]) -> tuple[float, float]:
+    return (box[0] + box[2]) / 2, (box[1] + box[3]) / 2
 
 
 if __name__ == "__main__":

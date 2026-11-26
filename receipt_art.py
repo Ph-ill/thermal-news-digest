@@ -48,7 +48,6 @@ NAME_FONT_SIZE = 16
 NAME_FONT_PATH = Path(__file__).resolve().parent / "fonts" / "PressStart2P-Regular.ttf"
 # Plain style: air between the picture column and the words, and between notes.
 PLAIN_GAP = 16
-SEPARATOR_W = 96
 SEPARATOR_GAP = 36
 WEATHER_ICON_PX = 64
 WEATHER_GAP = 12
