@@ -9,9 +9,11 @@ import io
 import json
 import os
 from pathlib import Path
+import queue
 import shutil
 import socket
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -285,13 +287,22 @@ class ModelFailureTests(unittest.TestCase):
             def clock():
                 return state["t"]
 
-            def wait(inflight, timeout):
+            def wait(inflight, timeout, done):
                 if timeout <= 0:
-                    return set()
-                for future in list(inflight):
-                    future.result()
+                    return []
+                finished = []
+                want = set(inflight)
+                deadline = time.monotonic() + 2
+                while want and time.monotonic() < deadline:
+                    try:
+                        key, value = done.get(timeout=0.05)
+                    except queue.Empty:
+                        continue
+                    if key in want:
+                        want.discard(key)
+                        finished.append((key, value))
                 state["t"] += delay
-                return set(inflight)
+                return finished
 
             state["t"] = 0.0
             calls.clear()
@@ -331,6 +342,149 @@ class ModelFailureTests(unittest.TestCase):
         self.assertNotIn("No new update today", blob)
         self.assertIn("not fetched", blob)
         self.assertIn("Feed not fetched", blob)
+
+    def test_a_sleeping_worker_cannot_hold_the_fetch_or_the_process(self):
+        artists = Path(tempfile.gettempdir()) / "digest-artists-wall.txt"
+        artists.write_text("\n".join(f"Sample Band {index}" for index in range(8)), encoding="utf-8")
+        self.addCleanup(artists.unlink, missing_ok=True)
+        script = """
+import json, os, time
+from pathlib import Path
+os.environ["DIGEST_GLOBAL_FEED"] = "https://example.test/global.xml"
+os.environ["DIGEST_LOCAL_FEED"] = "https://example.test/local.xml"
+os.environ["DIGEST_SPACEX_FEED"] = "https://example.test/spacex.xml"
+os.environ["DIGEST_EARTH_FUNERAL_FEED"] = "https://example.test/earth.xml"
+os.environ["DIGEST_TICKETMASTER_KEY"] = "tm-test-key"
+os.environ["DIGEST_ARTISTS_FILE"] = %r
+import digest_generator as dg
+dg.FETCH_STAGE_SECONDS = 0.4
+def fetcher(url):
+    time.sleep(30)
+    return b"<rss><channel></channel></rss>"
+started = time.monotonic()
+payload = dg.make_payload(
+    "2026-11-26",
+    fetcher,
+    history_file=Path("/tmp/unused-wall-history.json"),
+    bot_directory=Path("/tmp/unused-wall-bots"),
+    budget_seconds=75,
+    persist_history=False,
+)
+elapsed = time.monotonic() - started
+print(json.dumps({"elapsed": elapsed, "errors": payload["source_errors"], "sections": payload["sections"]}))
+""" % str(artists)
+        proc = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd="/workspace",
+            capture_output=True,
+            text=True,
+            timeout=8,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
+        data = json.loads(proc.stdout)
+        self.assertLess(data["elapsed"], 3.0)
+        blob = json.dumps(data)
+        self.assertIn("timed out", blob)
+        self.assertIn("not fetched", blob)
+        self.assertNotIn("No new update today", blob)
+        self.assertNotIn("tm-test-key", blob)
+
+    def test_google_and_ticketmaster_stay_under_their_caps(self):
+        state = {"google": 0, "ticketmaster": 0, "google_max": 0, "ticketmaster_max": 0}
+        lock = threading.Lock()
+
+        def bump(bucket: str):
+            with lock:
+                state[bucket] += 1
+                state[bucket + "_max"] = max(state[bucket + "_max"], state[bucket])
+            time.sleep(0.15)
+            with lock:
+                state[bucket] -= 1
+            return b"ok"
+
+        jobs = []
+        for index in range(6):
+            jobs.append((f"g{index}", f"https://news.google.com/rss/search?q={index}", lambda bucket="google": bump(bucket)))
+        for index in range(6):
+            jobs.append(
+                (f"t{index}", f"https://app.ticketmaster.com/discovery/v2/events.json?q={index}", lambda bucket="ticketmaster": bump(bucket))
+            )
+        results, missed, overdue = dg._parallel_map(jobs, 10)
+        self.assertEqual(len(results), 12, (missed, overdue))
+        self.assertLessEqual(state["google_max"], 2)
+        self.assertGreaterEqual(state["google_max"], 2)
+        self.assertLessEqual(state["ticketmaster_max"], 3)
+        self.assertGreaterEqual(state["ticketmaster_max"], 2)
+
+    def test_fetch_retries_a_server_error_once(self):
+        calls = []
+
+        class Body:
+            def __init__(self):
+                self._sent = False
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc):
+                return False
+
+            def read(self, _n=8192):
+                if self._sent:
+                    return b""
+                self._sent = True
+                return b"<rss></rss>"
+
+        def open_bounded(request, timeout, deadline):
+            calls.append(getattr(request, "full_url", ""))
+            if len(calls) == 1:
+                raise urllib.error.HTTPError(calls[-1], 503, "busy", Message(), None)
+            return Body()
+
+        with mock.patch.object(dp, "open_bounded", open_bounded), mock.patch.object(dg.time, "sleep"):
+            body = dg.fetch("https://example.test/feed.xml")
+        self.assertEqual(body, b"<rss></rss>")
+        self.assertEqual(len(calls), 2)
+
+        calls.clear()
+
+        def always_busy(request, timeout, deadline):
+            calls.append("x")
+            raise urllib.error.HTTPError("https://example.test/feed.xml", 429, "slow", Message(), None)
+
+        token = dg._budget_var.set(dg.Budget(75))
+        self.addCleanup(dg._budget_var.reset, token)
+        budget = dg._budget_var.get()
+        budget.deadline = time.monotonic() + 0.2
+        with mock.patch.object(dp, "open_bounded", always_busy):
+            with self.assertRaises(urllib.error.HTTPError):
+                dg.fetch("https://example.test/feed.xml")
+        self.assertEqual(len(calls), 1)
+
+    def test_tls_handshake_sets_the_timeout_before_wrap(self):
+        order = []
+        sock = mock.Mock()
+        sock.fileno.side_effect = OSError("no real socket")
+        sock.settimeout.side_effect = lambda _value: order.append("timeout")
+        context = mock.Mock()
+
+        def wrap(_raw, server_hostname=None):
+            order.append("wrap")
+            wrapped = mock.Mock()
+            wrapped.fileno.side_effect = OSError("no real socket")
+            return wrapped
+
+        context.wrap_socket.side_effect = wrap
+        watch = dp._DeadlineWatch(time.monotonic() + 5)
+        self.addCleanup(watch.disarm)
+        conn = dp._DeadlineHTTPSConnection("example.test", timeout=5, context=context, watch=watch)
+
+        def skip_tcp(self):
+            self.sock = sock
+
+        with mock.patch.object(dp._DeadlineHTTPConnection, "connect", skip_tcp):
+            conn.connect()
+        self.assertEqual(order, ["timeout", "wrap"])
 
 
 class WeatherSplitTests(unittest.TestCase):

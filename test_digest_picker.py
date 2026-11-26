@@ -114,7 +114,7 @@ class PickerTests(unittest.TestCase):
         self.assertNotIn("last chance", blob)
         self.assertTrue(dp.is_spam("ASTS stock last chance to buy before the bell"))
         self.assertFalse(dp.is_spam("last chance to see the eclipse from the river"))
-        self.assertFalse(dp.is_obituary(candidates[4]["title"]))
+        self.assertTrue(dp.is_obituary(candidates[4]["title"]))
         self.assertTrue(dp.is_obituary("Mayor dies in a crash"))
         self.assertTrue(dp.is_obituary("Death of a long-serving clerk shocks the town"))
         self.assertTrue(dp.is_obituary("Driver killed in a downtown collision"))
@@ -1140,7 +1140,7 @@ local:
                 "Elgin brewery opens on Main Street",
             )
         )
-        self.assertTrue(
+        self.assertFalse(
             dp.titles_similar(
                 "Brewery opens in Bastrop",
                 "Coffee shop beside the old brewery opens in Bastrop",

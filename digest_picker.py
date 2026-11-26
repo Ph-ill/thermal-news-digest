@@ -52,7 +52,6 @@ _DEATH = re.compile(
     r"\b(?:dies|died)\b|\bdeath of\b|\bkilled in\b|\bwas killed\b|\bkilled by\b",
     re.IGNORECASE,
 )
-_DIES_AT_SEA = re.compile(r"\bdies at sea\b", re.IGNORECASE)
 # "died in committee" / "killed in committee" is a bill, not a person.
 _COMMITTEE = re.compile(
     r"\b(?:dies|died|was killed|killed)\s+in\s+(?:the\s+)?committee\b",
@@ -166,15 +165,23 @@ _CIVIC = re.compile(
 )
 _CRIME = re.compile(
     r"\barrested\b|\bshooting\b|\bhomicide\b|\bmurder(?:ed)?\b|\bindicted\b|\bpolice said\b|"
-    r"\bstabb(?:ed|ing)\b|\bkilling\b|\bcrash deaths?\b",
+    r"\bstabb(?:ed|ing)\b|\bkilling\b|\bkilled\b|\bcrash deaths?\b",
     re.IGNORECASE,
 )
-# A known night out. Stripped before the crime and sports checks, so the phrase can stay.
+# A known night out or a studio phrase. Stripped before the crime and sports checks.
 _KNOWN_EVENT = re.compile(
     r"\bmurder[\s-]+mystery\b|"
     r"\b(?:soccer|football)\s+watch\s+part(?:y|ies)\b|"
+    r"\b(?:soccer|football)\s+watch\b|"
     r"\bwatch\s+part(?:y|ies)\b|"
-    r"\b(?:sports?|soccer|football)\s+bars?\b",
+    r"\b(?:sports?|soccer|football)\s+bars?\b|"
+    r"\bphoto\s+shooting\b|\bphoto\s+shoots?\b",
+    re.IGNORECASE,
+)
+# West of Austin. Local news keeps one of these only when the summary names a Bastrop-area town.
+_WEST_OF_AUSTIN = re.compile(
+    r"\b(?:bee cave|lakeway|dripping springs|cedar park|leander|"
+    r"west lake hills|rollingwood|sunset valley|spicewood|jonestown|lago vista)\b",
     re.IGNORECASE,
 )
 # Unambiguous sports. "coach" and "olympic" are not here; they also describe ordinary local news.
@@ -486,7 +493,20 @@ class _DeadlineHTTPSConnection(_DeadlineHTTPConnection):
 
     def connect(self):
         super().connect()
-        wrapped = self._context.wrap_socket(self.sock, server_hostname=self._tunnel_host or self.host)
+        # The handshake has to honor the same deadline as the TCP connect.
+        # settimeout on the raw socket before wrap, and let the watchdog close it.
+        deadline = None if self._watch is None else self._watch.deadline
+        _apply_idle_timeout(self.sock, self.timeout, deadline)
+        if self._watch is not None:
+            self._watch.arm(self.sock)
+        try:
+            wrapped = self._context.wrap_socket(self.sock, server_hostname=self._tunnel_host or self.host)
+        except TimeoutError:
+            raise
+        except OSError as exc:
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError("budget") from exc
+            raise
         self.sock = wrapped
         if self._watch is not None:
             self._watch.arm(wrapped)
@@ -670,10 +690,7 @@ def is_obituary(text: str) -> bool:
         return True
     # Legislative phrasing is not a death notice. A real death later in the same line still is.
     remainder = _COMMITTEE.sub(" ", value)
-    if not _DEATH.search(remainder):
-        return False
-    # "dies at sea" is a wreck headline, not a death notice. Any other death word still drops it.
-    remainder = _DIES_AT_SEA.sub(" ", remainder)
+    # "dies at sea" is still a death. "died in committee" was already removed above.
     return bool(_DEATH.search(remainder))
 
 
@@ -707,7 +724,10 @@ _NIGHT_OUT = re.compile(
     r"\bice cream\b|\bsoft launch(?:es)?\b|\bbrunch\b|\bgrand opening\b|"
     r"\btastings?\b|\blive music\b|\bconcerts?\b|\bfestivals?\b|\bwine\b|"
     r"\bfarmers markets?\b|\bfood trucks?\b|\btaco trucks?\b|\bbands?\b|"
-    r"\bdinners?\b|\bwatch part(?:y|ies)\b",
+    r"\bdinners?\b|\bwatch part(?:y|ies)\b|\b(?:soccer|football)\s+watch\b|"
+    r"\bkayaks?\b|\bkayaking\b|\bpaddl(?:e|es|ing)\b|\btubing\b|"
+    r"\bnight markets?\b|\bhikes?\b|\bhiking\b|"
+    r"\btrails?\s+reopen(?:s|ed|ing)?\b|\breopen(?:s|ed|ing)?\s+(?:the\s+)?trails?\b",
     re.IGNORECASE,
 )
 _VENUE_NOUN = re.compile(
@@ -732,12 +752,20 @@ def _open_counts(text: str) -> bool:
     return False
 
 
+def _west_of_austin_without_home(title: str, summary: str) -> bool:
+    """Bee Cave, Lakeway, and the other western suburbs stay out unless the summary names home."""
+    if not _WEST_OF_AUSTIN.search(f"{title or ''} {summary or ''}"):
+        return False
+    return _LOCAL_PLACE.search(summary or "") is None
+
+
 def local_opening_signal(title: str, summary: str = "") -> bool:
     """A real opening or night out, in the headline or the summary.
 
     Coffee, a truck, a park, or a trail by itself is not one. 'Shops' or 'plays' alone is not one.
+    Kayak, paddle, tubing, a night market, a trail reopening, and a hike are.
     """
-    if is_hard_local_exclude(title, summary):
+    if _west_of_austin_without_home(title, summary) or is_hard_local_exclude(title, summary):
         return False
     text = f"{title or ''} {summary or ''}"
     if _NIGHT_OUT.search(text):
@@ -749,7 +777,7 @@ def keep_local(item: dict, *, require_place: bool) -> bool:
     """Crime and obituaries use the headline and the summary. A town may be in either."""
     title = item.get("title") or ""
     summary = item.get("summary") or ""
-    if is_hard_local_exclude(title, summary):
+    if _west_of_austin_without_home(title, summary) or is_hard_local_exclude(title, summary):
         return False
     if require_place and not _LOCAL_PLACE.search(f"{title} {summary}"):
         return False
@@ -1124,10 +1152,11 @@ def titles_similar(left: str, right: str) -> bool:
     """Same story from two outlets.
 
     Filler is ignored and verbs are stemmed, so 'set to open' matches 'opening'
-    and 'lifts off' matches 'launches'. Headlines split only when both name a
-    business or a town and those names disagree, or a flight number differs.
-    An extra shop, Texas, or Street on one side still matches. first/second
-    count only beside a flight, a launch, or another count word.
+    and 'lifts off' matches 'launches'. Headlines split when both name a
+    business or a town and those names disagree, when the longer headline adds
+    a business the shorter does not have, or when a flight number differs.
+    An extra Texas or Street on one side still matches. first/second count
+    only beside a flight, a launch, or another count word.
     """
     first, places_left, numbers_left = _title_parts(left)
     second, places_right, numbers_right = _title_parts(right)
@@ -1137,7 +1166,14 @@ def titles_similar(left: str, right: str) -> bool:
         return False
     if _labels_conflict(places_left, places_right):
         return False
-    if _labels_conflict(_named_subset(first, _BUSINESS_NOUNS), _named_subset(second, _BUSINESS_NOUNS)):
+    short_tokens, long_tokens = (first, second) if len(first) <= len(second) else (second, first)
+    short_business = _named_subset(short_tokens, _BUSINESS_NOUNS)
+    long_business = _named_subset(long_tokens, _BUSINESS_NOUNS)
+    if long_business - short_business:
+        return False
+    if len(first) == len(second) and short_business != long_business:
+        return False
+    if _labels_conflict(short_business, long_business):
         return False
     shorter, longer = (first, second) if len(first) <= len(second) else (second, first)
     if shorter <= longer:

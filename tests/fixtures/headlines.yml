@@ -110,7 +110,7 @@ headlines:
   - title: "Park trail reopens after the rain"
     summary: "The path is muddy in spots."
     section: local
-    expect: keep
+    expect: fallback-prints
   - title: "Coffee prices rise downtown"
     summary: "A pound costs more this month."
     section: local
@@ -255,9 +255,9 @@ headlines:
     section: global
     expect: keep
   - title: "Actor dies at sea"
-    summary: "The notice names a wreck, not a funeral."
+    summary: "The notice names a person."
     section: global
-    expect: keep
+    expect: exclude
   - title: "Funeral service for a local resident"
     summary: "The chapel posted the time."
     section: global
@@ -289,7 +289,7 @@ headlines:
   - title: "Kayak rentals resume on the river"
     summary: "The dock opens at dawn."
     section: local
-    expect: keep
+    expect: fallback-prints
   - title: "Library book sale this Saturday"
     summary: "Paperbacks are a dollar."
     section: local
@@ -309,7 +309,7 @@ headlines:
   - title: "Winery soft opening in Dripping Springs"
     summary: "Neighbors are invited first."
     section: local
-    expect: fallback-prints
+    expect: exclude
   - title: "Concert in the park this Saturday"
     summary: "The set is free."
     section: local
@@ -333,7 +333,7 @@ headlines:
   - title: "Del Valle night market adds vendors"
     summary: "The lot fills after five."
     section: local
-    expect: keep
+    expect: fallback-prints
   - title: "Red Rock picnic draws a crowd"
     summary: "Blankets line the grass."
     section: local
@@ -361,11 +361,11 @@ headlines:
   - title: "Bee Cave restaurant debuts a patio menu"
     summary: "Dinner starts at five."
     section: local
-    expect: fallback-prints
+    expect: exclude
   - title: "Lakeway trail work day"
     summary: "Volunteers bring gloves."
     section: local
-    expect: keep
+    expect: exclude
   - title: "Manchaca coffee roaster posts hours"
     summary: "The door is open on weekdays."
     section: local
@@ -382,6 +382,58 @@ headlines:
     summary: "The first weekend is for neighbors."
     section: local
     expect: fallback-prints
+  - title: "Photo shooting at a downtown studio"
+    summary: "The session is for a menu."
+    section: local
+    expect: keep
+  - title: "Man killed near the new brewery"
+    summary: "The street was closed for an hour."
+    section: local
+    expect: exclude
+  - title: "Brewery hosts a football watch"
+    summary: "The game is on the patio screen."
+    section: local
+    expect: fallback-prints
+  - title: "Paddle boats return to the Bastrop river"
+    summary: "Rentals start at nine."
+    section: local
+    expect: fallback-prints
+  - title: "Tubing starts on the Smithville stretch"
+    summary: "The put-in is below the bridge."
+    section: local
+    expect: fallback-prints
+  - title: "Guided hike near Elgin this Saturday"
+    summary: "The group meets at the trailhead."
+    section: local
+    expect: fallback-prints
+  - title: "Cedar Creek trail reopens after the storm"
+    summary: "The path is open at dawn."
+    section: local
+    expect: fallback-prints
+  - title: "Cedar Park brewery opens this weekend"
+    summary: "The taproom is west of the city."
+    section: local
+    expect: exclude
+  - title: "Leander food truck parks by the mall"
+    summary: "Tacos until eight."
+    section: local
+    expect: exclude
+  - title: "West Lake Hills concert on Saturday"
+    summary: "The lawn opens at six."
+    section: local
+    expect: exclude
+  - title: "Bee Cave restaurant debuts a second patio"
+    summary: "The owners also run a spot in Bastrop."
+    section: local
+    expect: fallback-prints
+  - title: "Lakeway kayak rentals this month"
+    summary: "They launch from Bastrop on weekends."
+    section: local
+    expect: fallback-prints
+  - title: "Captain dies at sea off the coast"
+    summary: "The notice names the officer."
+    section: global
+    expect: exclude
 
 pairs:
   - left: "Harbor ferry delayed after storm"
@@ -395,7 +447,7 @@ pairs:
     expect: same
   - left: "Bastrop brewery opens on Main Street"
     right: "Bastrop brewery shop opens on Main Street"
-    expect: same
+    expect: different
   - left: "SpaceX launches Starship"
     right: "SpaceX launches Starship from Texas"
     expect: same
@@ -410,7 +462,7 @@ pairs:
     expect: same
   - left: "Brewery opens in Bastrop"
     right: "Coffee shop beside the old brewery opens in Bastrop"
-    expect: same
+    expect: different
   - left: "Bastrop brewery opens on Main Street"
     right: "Bastrop coffee shop opens on Main Street"
     expect: different

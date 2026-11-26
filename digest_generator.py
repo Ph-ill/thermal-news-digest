@@ -12,16 +12,19 @@ import argparse
 import contextvars
 import datetime as dt
 from email.utils import parsedate_to_datetime
-from concurrent.futures import ThreadPoolExecutor, wait as wait_futures
 import hashlib
 import html
 import json
 import os
 from pathlib import Path
+import queue
+import random
 import re
 import tempfile
+import threading
 import time
 from typing import Callable
+import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
@@ -42,6 +45,9 @@ FETCH_TIMEOUT_CAP = 8.0
 # Weather, news, and show lookups share this wall so the model still has about 30s.
 FETCH_STAGE_SECONDS = 35.0
 FETCH_WORKERS = 8
+GOOGLE_CONCURRENCY = 2
+TICKETMASTER_CONCURRENCY = 3
+_RETRY_STATUS = frozenset({429, 500, 502, 503, 504})
 FETCH_READ_CAP = 1_048_576
 TITLE_CAP = 240
 MAX_SHOWS = 3
@@ -114,12 +120,34 @@ def _clock() -> float:
     return time.monotonic()
 
 
-def _wait_wave(inflight: dict, timeout: float) -> set:
-    """Wait until the in-flight calls finish, or the stage wall passes."""
-    if timeout <= 0:
-        return set()
-    done, _pending = wait_futures(set(inflight), timeout=timeout)
-    return set(done)
+def _wait_wave(inflight: dict, timeout: float, done: queue.Queue) -> list:
+    """Collect finished jobs until the wall passes. Never joins a worker."""
+    if timeout <= 0 or not inflight:
+        return []
+    want = set(inflight)
+    finished: list[tuple[str, object]] = []
+    deadline = time.monotonic() + timeout
+    while want and time.monotonic() < deadline:
+        try:
+            key, value = done.get(timeout=max(0.0, deadline - time.monotonic()))
+        except queue.Empty:
+            break
+        if key in want:
+            want.discard(key)
+            finished.append((key, value))
+    return finished
+
+
+def _host_bucket(url: str) -> str:
+    host = (urllib.parse.urlsplit(url or "").hostname or "").lower()
+    if host == "news.google.com" or host.endswith(".news.google.com"):
+        return "google"
+    if host == "ticketmaster.com" or host.endswith(".ticketmaster.com"):
+        return "ticketmaster"
+    return ""
+
+
+_HOST_CAP = {"google": GOOGLE_CONCURRENCY, "ticketmaster": TICKETMASTER_CONCURRENCY}
 
 
 def local_zone() -> ZoneInfo:
@@ -146,7 +174,35 @@ def _fetch_wall() -> float:
     return max(0.0, min(FETCH_STAGE_SECONDS, budget.remaining()))
 
 
-def fetch(url: str) -> bytes:
+def _retry_allowed() -> bool:
+    """One retry fits only when the stage and the generator budget still have a moment."""
+    now = _clock()
+    budget = _budget_var.get()
+    if budget is not None and budget.remaining() < 0.4:
+        return False
+    stage = _stage_deadline.get()
+    if stage is not None and stage - now < 0.4:
+        return False
+    return True
+
+
+def _retry_pause() -> None:
+    delay = random.uniform(0.05, 0.25)
+    now = _clock()
+    caps = []
+    budget = _budget_var.get()
+    if budget is not None:
+        caps.append(budget.remaining())
+    stage = _stage_deadline.get()
+    if stage is not None:
+        caps.append(stage - now)
+    if caps:
+        delay = min(delay, max(0.0, min(caps) - 0.05))
+    if delay > 0:
+        time.sleep(delay)
+
+
+def _fetch_once(url: str) -> bytes:
     budget = _budget_var.get()
     timeout = FETCH_TIMEOUT_CAP
     deadline = None
@@ -172,6 +228,20 @@ def fetch(url: str) -> bytes:
         if deadline is not None and time.monotonic() >= deadline:
             raise TimeoutError("budget") from exc
         raise
+
+
+def fetch(url: str) -> bytes:
+    try:
+        return _fetch_once(url)
+    except urllib.error.HTTPError as exc:
+        if exc.code not in _RETRY_STATUS or not _retry_allowed():
+            raise
+        try:
+            exc.close()
+        except Exception:
+            pass
+        _retry_pause()
+        return _fetch_once(url)
 
 
 def clean(value: str) -> str:
@@ -304,6 +374,9 @@ def build_shows_section(
             raw = bodies.get(url, None)
             if raw is None:
                 errors.append({"section": spec.title, "url": TICKETMASTER_EVENTS, "error": "not fetched"})
+                continue
+            if isinstance(raw, _StageTimeout):
+                errors.append({"section": spec.title, "url": TICKETMASTER_EVENTS, "error": "timed out"})
                 continue
             if isinstance(raw, BaseException):
                 errors.append({"section": spec.title, "url": TICKETMASTER_EVENTS, "error": _failure_name(raw)})
@@ -507,54 +580,76 @@ def _guarded(fetcher: Callable[[str], bytes]) -> Callable[[str], bytes]:
     return wrapped
 
 
-def _parallel_map(jobs: list[tuple[str, Callable[[], object]]], wall: float) -> tuple[dict[str, object], list[str]]:
-    """Run jobs together. A job that never starts is returned as not fetched.
+class _StageTimeout(TimeoutError):
+    """A fetch was started and was still running when the stage wall passed."""
 
-    ``wall`` is a hard deadline for the whole stage, measured on ``_clock``.
-    Each call still has its own socket deadline inside ``fetch``.
+
+def _parallel_map(
+    jobs: list[tuple[str, str, Callable[[], object]]],
+    wall: float,
+) -> tuple[dict[str, object], list[str], list[str]]:
+    """Run jobs on daemon threads. The caller never joins them.
+
+    A job that never starts is not fetched. A job still running at the wall is
+    timed out. ``wall`` is measured on ``_clock``.
     """
     if wall <= 0 or not jobs:
-        return {}, [key for key, _fn in jobs]
-    start = _clock()
-    end = start + wall
+        return {}, [key for key, _url, _fn in jobs], []
+    end = _clock() + wall
     results: dict[str, object] = {}
     not_fetched: list[str] = []
-    queue = list(jobs)
+    timed_out: list[str] = []
+    pending = list(jobs)
+    inflight: dict[str, str] = {}
+    sink: queue.Queue = queue.Queue()
 
-    def invoke(fn: Callable[[], object]) -> object:
-        token = _stage_deadline.set(end)
-        try:
+    def start(key: str, fn: Callable[[], object]) -> None:
+        context = contextvars.copy_context()
+
+        def run() -> None:
+            token = _stage_deadline.set(end)
             try:
-                return fn()
-            except Exception as exc:
-                return exc
-        finally:
-            _stage_deadline.reset(token)
-
-    with ThreadPoolExecutor(max_workers=FETCH_WORKERS) as pool:
-        inflight: dict = {}
-        while queue or inflight:
-            while queue and len(inflight) < FETCH_WORKERS and _clock() < end:
-                key, fn = queue.pop(0)
-                # A context can be entered by one thread at a time, so each job gets its own copy.
-                inflight[pool.submit(contextvars.copy_context().run, invoke, fn)] = key
-            if not inflight:
-                not_fetched.extend(key for key, _fn in queue)
-                break
-            done = _wait_wave(inflight, end - _clock())
-            if not done:
-                not_fetched.extend(inflight.values())
-                not_fetched.extend(key for key, _fn in queue)
-                for future in inflight:
-                    future.cancel()
-                break
-            for future in done:
-                key = inflight.pop(future)
                 try:
-                    results[key] = future.result()
+                    value = fn()
                 except Exception as exc:
-                    results[key] = exc
-    return results, not_fetched
+                    value = exc
+            finally:
+                _stage_deadline.reset(token)
+            sink.put((key, value))
+
+        threading.Thread(target=context.run, args=(run,), name="digest-fetch", daemon=True).start()
+
+    while pending or inflight:
+        while pending and len(inflight) < FETCH_WORKERS and _clock() < end:
+            counts: dict[str, int] = {}
+            for host in inflight.values():
+                if host:
+                    counts[host] = counts.get(host, 0) + 1
+            chosen = None
+            for index, (key, url, _fn) in enumerate(pending):
+                host = _host_bucket(url)
+                cap = _HOST_CAP.get(host)
+                if cap is not None and counts.get(host, 0) >= cap:
+                    continue
+                chosen = index
+                break
+            if chosen is None:
+                break
+            key, url, fn = pending.pop(chosen)
+            inflight[key] = _host_bucket(url)
+            start(key, fn)
+        if not inflight:
+            not_fetched.extend(key for key, _url, _fn in pending)
+            break
+        finished = _wait_wave(inflight, end - _clock(), sink)
+        if not finished:
+            timed_out.extend(inflight)
+            not_fetched.extend(key for key, _url, _fn in pending)
+            break
+        for key, value in finished:
+            inflight.pop(key, None)
+            results[key] = value
+    return results, not_fetched, timed_out
 
 
 def _not_fetched_item(feed_url: str) -> dict:
@@ -564,6 +659,16 @@ def _not_fetched_item(feed_url: str) -> dict:
         "url": digest_picker.strip_userinfo(feed_url) or "https://example.invalid/not-fetched",
         "published_at": None,
         "rationale": "not fetched",
+    }
+
+
+def _timed_out_item(feed_url: str) -> dict:
+    return {
+        "title": "Feed timed out",
+        "summary": "This feed was requested and did not finish before the fetch stage ended.",
+        "url": digest_picker.strip_userinfo(feed_url) or "https://example.invalid/timed-out",
+        "published_at": None,
+        "rationale": "timed out",
     }
 
 
@@ -658,7 +763,7 @@ def _make_payload(
     feed_plan: list[tuple] = []
     weather_spec = settings.section_by_id("weather")
     if weather_spec is not None:
-        jobs.append(("weather", lambda: weather(bounded, digest_date)))
+        jobs.append(("weather", WEATHER_POINT, lambda: weather(bounded, digest_date)))
 
     for spec in specs:
         if spec.kind != "news":
@@ -671,7 +776,7 @@ def _make_payload(
         for index, feed in enumerate(feeds):
             key = f"feed:{spec.id}:{index}"
             feed_plan.append((key, spec, feed))
-            jobs.append((key, lambda url=feed.url: bounded(url)))
+            jobs.append((key, feed.url, lambda url=feed.url: bounded(url)))
 
     show_plan: list[tuple[str, str, str]] = []
     shows_spec = settings.section_by_id("shows")
@@ -693,10 +798,11 @@ def _make_payload(
         for artist in artist_names:
             url = ticketmaster_events_url(artist, window_start, window_end)
             show_plan.append((f"artist:{artist}", artist, url))
-            jobs.append((f"artist:{artist}", lambda target=url: bounded(target)))
+            jobs.append((f"artist:{artist}", url, lambda target=url: bounded(target)))
 
-    fetched, not_fetched = _parallel_map(jobs, _fetch_wall())
+    fetched, not_fetched, timed_out = _parallel_map(jobs, _fetch_wall())
     missed = set(not_fetched)
+    overdue = set(timed_out)
 
     if weather_spec is not None:
         if "weather" in missed:
@@ -707,6 +813,15 @@ def _make_payload(
                 "url": WEATHER_POINT,
                 "published_at": None,
                 "rationale": "not fetched",
+            }
+        elif "weather" in overdue:
+            errors.append({"section": weather_spec.title, "url": WEATHER_POINT, "error": "timed out"})
+            weather_item = {
+                "headline": "Forecast timed out",
+                "summary": "The forecast was requested and did not finish before the fetch stage ended.",
+                "url": WEATHER_POINT,
+                "published_at": None,
+                "rationale": "timed out",
             }
         else:
             weather_result = fetched.get("weather")
@@ -741,12 +856,17 @@ def _make_payload(
         failures = 0
         attempted = 0
         skipped = 0
+        overdue_count = 0
         for key, _spec, feed in rows:
             public = digest_picker.strip_userinfo(feed.url)
             public_urls.append(public)
             if key in missed:
                 skipped += 1
                 errors.append({"section": spec.title, "url": public, "error": "not fetched"})
+                continue
+            if key in overdue:
+                overdue_count += 1
+                errors.append({"section": spec.title, "url": public, "error": "timed out"})
                 continue
             attempted += 1
             result = fetched.get(key)
@@ -774,12 +894,13 @@ def _make_payload(
                 if spec.id == "companies" and not digest_picker.keep_company(item):
                     continue
                 collected.append(item)
-        if rows and skipped == len(rows):
+        if rows and skipped + overdue_count == len(rows) and not collected:
             first = public_urls[0]
+            item = _timed_out_item(first) if overdue_count else _not_fetched_item(first)
             by_id[spec.id] = {
                 "section": spec.title,
                 "source_feed": first,
-                "items": [_not_fetched_item(first)],
+                "items": [item],
             }
             continue
         if rows and attempted and failures == attempted and not collected:
@@ -850,7 +971,12 @@ def _make_payload(
     elif show_plan:
         bodies = {}
         for key, _artist, url in show_plan:
-            bodies[url] = None if key in missed else fetched.get(key)
+            if key in missed:
+                bodies[url] = None
+            elif key in overdue:
+                bodies[url] = _StageTimeout("timed out")
+            else:
+                bodies[url] = fetched.get(key)
         shows_section, show_errors, show_records = build_shows_section(
             digest_date, bounded, history, bodies=bodies
         )
