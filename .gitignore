@@ -1,0 +1,14 @@
+.env
+.env.*
+!.env.example
+output/
+state.json
+print.lock
+*.tspl
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.bak
+*.log
+.pytest_cache/

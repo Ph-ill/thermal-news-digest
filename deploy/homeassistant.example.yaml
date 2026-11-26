@@ -1,0 +1,21 @@
+# Home Assistant must run with host networking so it can reach the loopback trigger.
+
+# configuration.yaml
+shell_command:
+  print_digest_safe_dry_run: >-
+    curl --silent --show-error --fail --max-time 120 --request POST http://127.0.0.1:8793/v1/digest/dry-run
+  print_digest_safe_submit: >-
+    curl --silent --show-error --fail --max-time 120 --request POST http://127.0.0.1:8793/v1/digest/submit
+
+# automations.yaml
+- id: daily_digest_print_0500
+  alias: Daily Digest Print
+  description: Print the daily digest at 05:00 local Home Assistant time.
+  initial_state: true
+  trigger:
+  - platform: time
+    at: 05:00:00
+  condition: []
+  action:
+  - service: shell_command.print_digest_safe_submit
+  mode: single

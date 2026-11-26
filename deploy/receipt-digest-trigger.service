@@ -1,0 +1,21 @@
+# systemd --user unit. Install to ~/.config/systemd/user/ and adjust the path
+# below to wherever you cloned the repo (%h = your home directory).
+[Unit]
+Description=Loopback Home Assistant receipt digest trigger
+After=network-online.target cups.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=-%h/daily-digest/.env
+ExecStart=/usr/bin/python3 %h/daily-digest/receipt_digest_trigger.py
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/daily-digest
+
+[Install]
+WantedBy=default.target
