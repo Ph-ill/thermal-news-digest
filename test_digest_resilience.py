@@ -262,39 +262,75 @@ class ModelFailureTests(unittest.TestCase):
         self.assertNotIn("taste_profile", payload)
         self.assertTrue(payload["digest_id"])
 
-    def test_a_full_edition_leaves_the_model_thirty_seconds(self):
-        budget = dg.Budget(75)
-        token = dg._budget_var.set(budget)
-        self.addCleanup(dg._budget_var.reset, token)
-        budget.deadline = time.monotonic() + 20
-        self.assertFalse(dg.feeds_may_fetch())
-        budget.deadline = time.monotonic() + 50
-        self.assertTrue(dg.feeds_may_fetch())
-        short = dg.Budget(5)
-        short_token = dg._budget_var.set(short)
-        self.addCleanup(dg._budget_var.reset, short_token)
-        short.deadline = time.monotonic() + 4
-        self.assertTrue(dg.feeds_may_fetch())
+    def test_parallel_fetch_runs_companies_and_artists_on_a_slow_clock(self):
+        artists = Path(tempfile.gettempdir()) / "digest-artists-slow.txt"
+        artists.write_text("\n".join(f"Sample Band {index}" for index in range(8)), encoding="utf-8")
+        self.addCleanup(artists.unlink, missing_ok=True)
+        env = {
+            "DIGEST_GLOBAL_FEED": "https://example.test/global.xml",
+            "DIGEST_LOCAL_FEED": "https://example.test/local.xml",
+            "DIGEST_SPACEX_FEED": "https://example.test/spacex.xml",
+            "DIGEST_EARTH_FUNERAL_FEED": "https://example.test/earth.xml",
+            "DIGEST_TICKETMASTER_KEY": "tm-test-key",
+            "DIGEST_ARTISTS_FILE": str(artists),
+        }
+        for delay in (3, 8):
+            calls = []
+            state = {"t": 0.0}
 
-        calls = []
+            def fetcher(url, _calls=calls):
+                _calls.append(url)
+                return b"<rss><channel></channel></rss>"
 
-        def fetcher(url):
-            calls.append(url)
-            return b"{}"
+            def clock():
+                return state["t"]
 
-        with mock.patch.object(dg.Budget, "remaining", return_value=10.0):
-            dg.make_payload(
-                "2026-11-26",
-                fetcher,
-                now=NOW,
-                history_file=Path(tempfile.gettempdir()) / "unused-history-reserve.json",
-                bot_directory=Path(tempfile.gettempdir()) / "unused-bots-reserve",
-                budget_seconds=75,
-                persist_history=False,
-            )
-        self.assertTrue(calls)
-        self.assertTrue(all("api.weather.gov" in url for url in calls))
-        self.assertFalse(any("news.google" in url or "ticketmaster" in url for url in calls))
+            def wait(inflight, timeout):
+                if timeout <= 0:
+                    return set()
+                for future in list(inflight):
+                    future.result()
+                state["t"] += delay
+                return set(inflight)
+
+            state["t"] = 0.0
+            calls.clear()
+            with mock.patch.dict(os.environ, env), mock.patch.object(dg, "_clock", clock), mock.patch.object(
+                dg, "_wait_wave", wait
+            ):
+                payload = dg.make_payload(
+                    "2026-11-26",
+                    fetcher,
+                    now=NOW,
+                    history_file=Path(tempfile.gettempdir()) / "unused-history-parallel.json",
+                    bot_directory=Path(tempfile.gettempdir()) / "unused-bots-parallel",
+                    budget_seconds=75,
+                    persist_history=False,
+                )
+            joined = "\n".join(calls)
+            self.assertIn("https://example.test/spacex.xml", joined, delay)
+            self.assertIn("https://example.test/earth.xml", joined, delay)
+            for index in range(8):
+                self.assertIn(f"Sample+Band+{index}", joined, delay)
+            self.assertLessEqual(state["t"], 35, delay)
+            self.assertIn("fetched, no story", json.dumps(payload["source_errors"]))
+
+        def quiet(_url):
+            raise AssertionError("a spent budget must not request a feed")
+
+        skipped = dg.make_payload(
+            "2026-11-26",
+            quiet,
+            now=NOW,
+            history_file=Path(tempfile.gettempdir()) / "unused-history-unfetched.json",
+            bot_directory=Path(tempfile.gettempdir()) / "unused-bots-unfetched",
+            budget_seconds=0,
+            persist_history=False,
+        )
+        blob = json.dumps(skipped)
+        self.assertNotIn("No new update today", blob)
+        self.assertIn("not fetched", blob)
+        self.assertIn("Feed not fetched", blob)
 
 
 class WeatherSplitTests(unittest.TestCase):

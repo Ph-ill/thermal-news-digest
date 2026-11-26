@@ -67,6 +67,11 @@ _TITLE_FILLER = _TITLE_STOP | frozenset(
     "say says said saying set sets new report reports reported owner owners official officials "
     "according source sources just also this that old beside".split()
 )
+# Ordinals count as flight numbers only beside one of these.
+_COUNT_WORDS = frozenset(
+    "flight flights launch launches launched liftoff mission missions test tests "
+    "stage stages booster boosters count".split()
+)
 _NUMBER_WORDS = {
     "one": "1",
     "two": "2",
@@ -149,6 +154,7 @@ _LOCAL_PLACE = re.compile(
 # Unambiguous civic process. A passing "across from city council" is not a meeting.
 _CIVIC = re.compile(
     r"\b(?:school board|school district|isd|commissioners?|ordinance|legislature|county judge|zoning)\b|"
+    r"\bcouncil\s+votes?\b|"
     r"\bcity council\b.{0,80}\b(?:meeting|meets|vote|votes|voted|adopt|adopts|adopted|budget|"
     r"public comment|agenda|hearing|session|ordinance)\b|"
     r"\b(?:meeting|meets|vote|votes|voted|adopt|adopts|adopted|budget|public comment|agenda|hearing|session)\b"
@@ -159,7 +165,16 @@ _CIVIC = re.compile(
     re.IGNORECASE,
 )
 _CRIME = re.compile(
-    r"\barrested\b|\bshooting\b|\bhomicide\b|\bmurder(?:ed)?\b|\bindicted\b|\bpolice said\b",
+    r"\barrested\b|\bshooting\b|\bhomicide\b|\bmurder(?:ed)?\b|\bindicted\b|\bpolice said\b|"
+    r"\bstabb(?:ed|ing)\b|\bkilling\b|\bcrash deaths?\b",
+    re.IGNORECASE,
+)
+# A known night out. Stripped before the crime and sports checks, so the phrase can stay.
+_KNOWN_EVENT = re.compile(
+    r"\bmurder[\s-]+mystery\b|"
+    r"\b(?:soccer|football)\s+watch\s+part(?:y|ies)\b|"
+    r"\bwatch\s+part(?:y|ies)\b|"
+    r"\b(?:sports?|soccer|football)\s+bars?\b",
     re.IGNORECASE,
 )
 # Unambiguous sports. "coach" and "olympic" are not here; they also describe ordinary local news.
@@ -190,8 +205,11 @@ _STOCK_MOVE = re.compile(
     re.IGNORECASE,
 )
 _INVENTORY_STOCK = re.compile(r"\bin stock\b|\bstock of\b", re.IGNORECASE)
-_SPACEX_MARKET = re.compile(
-    r"\b(?:downgrades?|downgraded|upgrades?|upgraded|analysts?)\b",
+_SPACEX_DOWNGRADE = re.compile(r"\b(?:downgrades?|downgraded)\b", re.IGNORECASE)
+_SPACEX_UPGRADE = re.compile(r"\b(?:upgrades?|upgraded)\b", re.IGNORECASE)
+_SPACEX_ANALYST = re.compile(r"\banalysts?\b", re.IGNORECASE)
+_MARKET_NEIGHBOR = re.compile(
+    r"\b(?:ratings?|price targets?|stocks?|shares?)\b",
     re.IGNORECASE,
 )
 _SPACEX = re.compile(r"\b(?:spacex|starship|falcon|starlink)\b", re.IGNORECASE)
@@ -659,55 +677,107 @@ def is_obituary(text: str) -> bool:
     return bool(_DEATH.search(remainder))
 
 
-def _headline_subject_block(title: str) -> bool:
-    """Crime, an obituary, a civic meeting, or a sport is the headline, not a passing word."""
-    return bool(is_obituary(title) or _CRIME.search(title) or _CIVIC.search(title) or _SPORTS_HARD.search(title))
+def _strip_known_events(text: str) -> str:
+    return _KNOWN_EVENT.sub(" ", text or "")
 
 
-def is_hard_local_exclude(text: str) -> bool:
-    """Drop a headline whose subject is crime, a meeting, or sports.
+def is_hard_local_exclude(title: str, summary: str = "") -> bool:
+    """Drop crime, an obituary, a civic meeting, or a sport.
 
-    A venue can mention the word (a soccer bar, a murder-mystery dinner, a zoning note)
-    and still stay. The summary is not consulted.
+    Only a known event phrase (murder mystery, a watch party, a sports bar) is exempt.
+    A shooting, arrest, killing, or death stays out even when a bar or brewery is named.
+    Crime and obituaries are read in the summary too. Civic wording is the headline only.
     """
-    title = text or ""
-    if not _headline_subject_block(title):
-        return False
-    if _EVENT_FRAME.search(title):
-        return False
-    return True
-
-
-def local_opening_signal(title: str) -> bool:
-    """A real opening or night out. 'shops' or 'plays' on their own are not one."""
-    if is_hard_local_exclude(title):
-        return False
-    if _EVENT_FRAME.search(title) or _OUTDOOR.search(title):
+    headline = _strip_known_events(title or "")
+    body = _strip_known_events(f"{title or ''} {summary or ''}")
+    if is_obituary(body) or _CRIME.search(body):
         return True
-    return bool(_OPENING_VERB.search(title))
+    if _SPORTS_HARD.search(headline):
+        return True
+    # A bar opening can mention zoning. A council vote or a meeting cannot hide behind a venue word.
+    if _CIVIC.search(headline) and not (
+        _VENUE_NOUN.search(headline) and (_OPENING_VERB.search(headline) or _NIGHT_OUT.search(headline))
+    ):
+        return True
+    return False
+
+
+_NIGHT_OUT = re.compile(
+    r"\bdebuts?\b|\bwelcomes?\b|\bnew eatery\b|\bnew spot\b|\bfood trailers?\b|"
+    r"\bice cream\b|\bsoft launch(?:es)?\b|\bbrunch\b|\bgrand opening\b|"
+    r"\btastings?\b|\blive music\b|\bconcerts?\b|\bfestivals?\b|\bwine\b|"
+    r"\bfarmers markets?\b|\bfood trucks?\b|\btaco trucks?\b|\bbands?\b|"
+    r"\bdinners?\b|\bwatch part(?:y|ies)\b",
+    re.IGNORECASE,
+)
+_VENUE_NOUN = re.compile(
+    r"\b(?:bars?|brewer(?:y|ies)|restaurants?|baker(?:y|ies)|cafes?|cafés?|taprooms?|"
+    r"eater(?:y|ies)|spots?|diners?|taquerias?|winer(?:y|ies)|distiller(?:y|ies)|"
+    r"markets?|studios?|venues?|kitchens?)\b",
+    re.IGNORECASE,
+)
+_NOT_AN_OPENING = re.compile(
+    r"\bopening arguments\b|\bopening prices?\b|\bopening fees?\b|\bclosures?\b|\bclosed\b",
+    re.IGNORECASE,
+)
+
+
+def _open_counts(text: str) -> bool:
+    """'Open' counts beside a venue noun or 'new', not in a price, a fee, or a closing."""
+    scrubbed = _NOT_AN_OPENING.sub(" ", text or "")
+    for match in re.finditer(r"\b(?:grand opening|open(?:s|ed|ing)?)\b", scrubbed, flags=re.IGNORECASE):
+        window = scrubbed[max(0, match.start() - 48) : match.end() + 48]
+        if _VENUE_NOUN.search(window) or re.search(r"\bnew\b", window, flags=re.IGNORECASE):
+            return True
+    return False
+
+
+def local_opening_signal(title: str, summary: str = "") -> bool:
+    """A real opening or night out, in the headline or the summary.
+
+    Coffee, a truck, a park, or a trail by itself is not one. 'Shops' or 'plays' alone is not one.
+    """
+    if is_hard_local_exclude(title, summary):
+        return False
+    text = f"{title or ''} {summary or ''}"
+    if _NIGHT_OUT.search(text):
+        return True
+    return _open_counts(text)
 
 
 def keep_local(item: dict, *, require_place: bool) -> bool:
-    """Use the headline for the hard exclude. A town may still be named in the summary."""
-    if is_hard_local_exclude(item.get("title") or ""):
+    """Crime and obituaries use the headline and the summary. A town may be in either."""
+    title = item.get("title") or ""
+    summary = item.get("summary") or ""
+    if is_hard_local_exclude(title, summary):
         return False
-    if require_place and not _LOCAL_PLACE.search(f"{item.get('title') or ''} {item.get('summary') or ''}"):
+    if require_place and not _LOCAL_PLACE.search(f"{title} {summary}"):
         return False
     return True
+
+
+def _beside_market_word(text: str, match: re.Match[str]) -> bool:
+    window = text[max(0, match.start() - 48) : match.end() + 48]
+    return bool(_MARKET_NEIGHBOR.search(window))
 
 
 def is_stock_chatter(text: str) -> bool:
     """Share-price talk, or stock/share next to a jump, drop, rating, or IPO.
 
     "In stock" and "a stock of engines" are inventory, not a price.
-    On a SpaceX item, downgrade, upgrade, and analyst are chatter even without "stock".
+    On a SpaceX item, a downgrade is chatter on its own. An upgrade or an analyst
+    counts only beside a rating, a price target, or stock/shares.
     """
     blob = text or ""
     cleaned = _INVENTORY_STOCK.sub(" ", blob)
     if _STOCK_PHRASE.search(cleaned):
         return True
-    if _SPACEX.search(blob) and _SPACEX_MARKET.search(cleaned):
+    if _SPACEX.search(blob) and _SPACEX_DOWNGRADE.search(cleaned):
         return True
+    if _SPACEX.search(blob):
+        for pattern in (_SPACEX_UPGRADE, _SPACEX_ANALYST):
+            if any(_beside_market_word(cleaned, match) for match in pattern.finditer(cleaned)):
+                return True
     return bool(_STOCK_WORD.search(cleaned) and _STOCK_MOVE.search(cleaned))
 
 
@@ -935,7 +1005,7 @@ def relevance_score(
 ) -> int:
     """Soft nudge. Used to order the fallback and the candidates sent to the model."""
     score = interest_score(item, likes, dislikes, prefer_terms)
-    if section_id == "local" and local_opening_signal(item.get("title") or ""):
+    if section_id == "local" and local_opening_signal(item.get("title") or "", item.get("summary") or ""):
         score += 3
     return score
 
@@ -951,6 +1021,16 @@ def _stem_token(token: str) -> str:
             token = token[: -len(suffix)]
             break
     return token
+
+
+def _ordinal_counts(raw: list[str], position: int) -> bool:
+    """first/second and the other ordinals count only beside a flight, a launch, or a count word."""
+    neighbors = []
+    if position > 0:
+        neighbors.append(raw[position - 1])
+    if position + 1 < len(raw):
+        neighbors.append(raw[position + 1])
+    return any(neighbor in _COUNT_WORDS for neighbor in neighbors)
 
 
 def _canonical_number(token: str) -> str | None:
@@ -978,6 +1058,8 @@ def _title_parts(title: str) -> tuple[frozenset[str], frozenset[str], frozenset[
     phrases = sorted(_PLACE_PHRASES, key=len, reverse=True)
     consumed: set[int] = set()
     places: list[str] = []
+    # "Main" and "Main Street" are the same place. The word Street is only a suffix.
+    bare_places: list[str] = []
     index = 0
     while index < len(raw):
         matched = None
@@ -990,6 +1072,10 @@ def _title_parts(title: str) -> tuple[frozenset[str], frozenset[str], frozenset[
             index += 1
             continue
         places.append(" ".join(matched))
+        if len(matched) > 1 and matched[-1] in {"street", "road", "avenue", "drive", "lane"}:
+            for word in matched[:-1]:
+                if word not in _TITLE_FILLER and len(word) > 2:
+                    bare_places.append(word)
         consumed.update(range(index, index + len(matched)))
         index += len(matched)
     tokens: list[str] = []
@@ -998,9 +1084,13 @@ def _title_parts(title: str) -> tuple[frozenset[str], frozenset[str], frozenset[
         if position in consumed:
             continue
         canon = _canonical_number(token)
-        if canon is not None:
+        if canon is not None and (token.isdigit() or _ordinal_counts(raw, position)):
             numbers.append(canon)
             tokens.append(canon)
+            continue
+        if canon is not None:
+            if token not in _TITLE_FILLER and len(token) > 2:
+                tokens.append(token)
             continue
         if token in _TITLE_FILLER or len(token) <= 2:
             continue
@@ -1009,6 +1099,7 @@ def _title_parts(title: str) -> tuple[frozenset[str], frozenset[str], frozenset[
             tokens.append(stemmed)
     for place in places:
         tokens.append(_PLACE_TOKEN[tuple(place.split())])
+    tokens.extend(bare_places)
     return frozenset(tokens), frozenset(places), frozenset(numbers)
 
 
@@ -1022,14 +1113,21 @@ def _named_subset(tokens: frozenset[str], names: frozenset[str]) -> frozenset[st
     return frozenset(token for token in tokens if token in names)
 
 
+def _labels_conflict(left: frozenset[str], right: frozenset[str]) -> bool:
+    """Both sides named one, and each has a name the other does not."""
+    if not left or not right:
+        return False
+    return bool(left - right) and bool(right - left)
+
+
 def titles_similar(left: str, right: str) -> bool:
     """Same story from two outlets.
 
     Filler is ignored and verbs are stemmed, so 'set to open' matches 'opening'
-    and 'lifts off' matches 'launches'. A changed number or a different town does not match.
-    Containment merges only when the longer title adds no new business or place.
-    The overlap path uses that same business, place, and number check.
-    A number or ordinal on only one side keeps the headlines apart.
+    and 'lifts off' matches 'launches'. Headlines split only when both name a
+    business or a town and those names disagree, or a flight number differs.
+    An extra shop, Texas, or Street on one side still matches. first/second
+    count only beside a flight, a launch, or another count word.
     """
     first, places_left, numbers_left = _title_parts(left)
     second, places_right, numbers_right = _title_parts(right)
@@ -1037,10 +1135,9 @@ def titles_similar(left: str, right: str) -> bool:
         return False
     if numbers_left != numbers_right:
         return False
-    if places_left and places_right and not (places_left <= places_right or places_right <= places_left):
+    if _labels_conflict(places_left, places_right):
         return False
-    differing = (first - second) | (second - first)
-    if _named_subset(differing, _BUSINESS_NOUNS | _PLACE_NOUNS):
+    if _labels_conflict(_named_subset(first, _BUSINESS_NOUNS), _named_subset(second, _BUSINESS_NOUNS)):
         return False
     shorter, longer = (first, second) if len(first) <= len(second) else (second, first)
     if shorter <= longer:
@@ -1510,7 +1607,7 @@ def eligible_candidates(raw_items: list[dict], seen: Seen) -> list[dict]:
         prepared = prepare_candidate(raw)
         if prepared is None:
             continue
-        if is_obituary(prepared["title"]) or is_spam(_candidate_blob(prepared)):
+        if is_obituary(_candidate_blob(prepared)) or is_spam(_candidate_blob(prepared)):
             continue
         url_key = normalize_url(prepared["url"])
         if url_key in seen_urls or seen.in_history(prepared):
@@ -1585,7 +1682,7 @@ def fallback_from_eligible(
         ordered = [
             item
             for item in ordered
-            if local_opening_signal(item.get("title") or "")
+            if local_opening_signal(item.get("title") or "", item.get("summary") or "")
             and relevance_score(item, likes, dislikes, prefer_terms, section_id) > 0
         ]
     chosen: list[dict] = []

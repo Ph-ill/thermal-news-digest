@@ -1,0 +1,446 @@
+# Labeled headlines for the local filter, the company filter, and title de-dupe.
+# expect is exclude, keep, or fallback-prints. Pairs are same or different.
+# Add a row for a new review case. Do not rewrite the matcher for one headline.
+
+headlines:
+  - title: "Shooting outside a Bastrop bar"
+    summary: "Police said a man was wounded on the sidewalk."
+    section: local
+    expect: exclude
+  - title: "Man arrested at the new brewery"
+    summary: "The arrest happened after closing."
+    section: local
+    expect: exclude
+  - title: "Driver killed in a crash near the brewery"
+    summary: "The wreck was on the highway."
+    section: local
+    expect: exclude
+  - title: "Stabbing reported at a downtown restaurant"
+    summary: "The victim was taken to a hospital."
+    section: local
+    expect: exclude
+  - title: "Crash death outside the sports bar"
+    summary: "A car left the road beside the venue."
+    section: local
+    expect: exclude
+  - title: "Council votes on the downtown budget"
+    summary: "The vote is Thursday night."
+    section: local
+    expect: exclude
+  - title: "A killing near the bar remains unsolved"
+    summary: "Investigators returned to the block."
+    section: local
+    expect: exclude
+  - title: "Murder mystery dinner at a new bar"
+    summary: "Tickets include dinner and a show."
+    section: local
+    expect: fallback-prints
+  - title: "Brewery hosts a football watch party"
+    summary: "The game is on the patio screens."
+    section: local
+    expect: fallback-prints
+  - title: "New sports bar opens in Bastrop"
+    summary: "The room has screens and a full menu."
+    section: local
+    expect: fallback-prints
+  - title: "Soccer bar opens on Main Street"
+    summary: "Match days will use the back room."
+    section: local
+    expect: fallback-prints
+  - title: "Bar opening after a zoning change"
+    summary: "The room seats forty."
+    section: local
+    expect: fallback-prints
+  - title: "Photo shoot at a downtown studio"
+    summary: "The session is Saturday afternoon."
+    section: local
+    expect: keep
+  - title: "Brewery plans a new patio"
+    summary: "The patio faces the council meeting room."
+    section: local
+    expect: keep
+  - title: "Quiet downtown note"
+    summary: "A man was killed in a crash after leaving the brewery."
+    section: local
+    expect: exclude
+  - title: "City council adopts the downtown budget"
+    summary: "The hearing ran long."
+    section: local
+    expect: exclude
+  - title: "City council opens public comment on the budget"
+    summary: "Speakers get two minutes."
+    section: local
+    expect: exclude
+  - title: "Officials open a new inquiry into the budget"
+    summary: "The review starts Monday."
+    section: local
+    expect: exclude
+  - title: "High school football opens the season in Bastrop"
+    summary: "Kickoff is Friday."
+    section: local
+    expect: exclude
+  - title: "Golf course posts the weekend scores"
+    summary: "The clubhouse posted the card."
+    section: local
+    expect: exclude
+  - title: "School board meets on the bond"
+    summary: "The session is Tuesday."
+    section: local
+    expect: exclude
+  - title: "Water main breaks on Main Street"
+    summary: "Crews expect the repair by evening."
+    section: local
+    expect: keep
+  - title: "County sets the property tax rate"
+    summary: "The notice is in the paper."
+    section: local
+    expect: keep
+  - title: "Government shutdown reaches a local office"
+    summary: "The counter is on shorter hours."
+    section: local
+    expect: keep
+  - title: "Someone plays the piano at the library"
+    summary: "The room is open to anyone."
+    section: local
+    expect: keep
+  - title: "New shops on Main Street"
+    summary: "A few storefronts changed hands."
+    section: local
+    expect: keep
+  - title: "Park trail reopens after the rain"
+    summary: "The path is muddy in spots."
+    section: local
+    expect: keep
+  - title: "Coffee prices rise downtown"
+    summary: "A pound costs more this month."
+    section: local
+    expect: keep
+  - title: "Truck traffic slows on the highway"
+    summary: "The lane is down to one."
+    section: local
+    expect: keep
+  - title: "Opening arguments begin in a local case"
+    summary: "The trial is expected to last a week."
+    section: local
+    expect: keep
+  - title: "Opening prices posted for the season"
+    summary: "The list is on the door."
+    section: local
+    expect: keep
+  - title: "Trail closures announced for the weekend"
+    summary: "Two paths stay shut."
+    section: local
+    expect: keep
+  - title: "New brewery opens on Main Street"
+    summary: "The taproom is in the old storefront."
+    section: local
+    expect: fallback-prints
+  - title: "Kitchen debuts in downtown Bastrop"
+    summary: "The first seating is Friday."
+    section: local
+    expect: fallback-prints
+  - title: "Cafe welcomes guests this weekend"
+    summary: "Breakfast starts at eight."
+    section: local
+    expect: fallback-prints
+  - title: "A new eatery opens beside the park"
+    summary: "The menu is short and seasonal."
+    section: local
+    expect: fallback-prints
+  - title: "New spot for tacos opens in Elgin"
+    summary: "The counter faces the square."
+    section: local
+    expect: fallback-prints
+  - title: "Food trailer arrives in Smithville"
+    summary: "It parks beside the market."
+    section: local
+    expect: fallback-prints
+  - title: "Ice cream shop opens for the summer"
+    summary: "The window faces the square."
+    section: local
+    expect: fallback-prints
+  - title: "Soft launch for a new cafe"
+    summary: "Friends and neighbors are invited."
+    section: local
+    expect: fallback-prints
+  - title: "Brunch service starts at the bakery"
+    summary: "Saturdays only at first."
+    section: local
+    expect: fallback-prints
+  - title: "New taco truck parks downtown"
+    summary: "The window opens at eleven."
+    section: local
+    expect: fallback-prints
+  - title: "Band plays Saturday night in Bastrop"
+    summary: "The set starts at nine."
+    section: local
+    expect: fallback-prints
+  - title: "Elgin wine tasting this weekend"
+    summary: "Four bottles are open."
+    section: local
+    expect: fallback-prints
+  - title: "Smithville farmers market returns"
+    summary: "Stalls line the square."
+    section: local
+    expect: fallback-prints
+  - title: "Downtown note"
+    summary: "A new brewery opens on Chestnut this weekend."
+    section: local
+    expect: fallback-prints
+  - title: "Brewery opens in Houston"
+    summary: "The room is far from this county."
+    section: local
+    expect: exclude
+    require_place: true
+  - title: "Brewery opens in Bastrop"
+    summary: "The taproom is on the square."
+    section: local
+    expect: fallback-prints
+    require_place: true
+  - title: "SpaceX faces an analyst downgrade"
+    summary: "The note arrived before the flight."
+    section: companies
+    topic: spacex
+    expect: exclude
+  - title: "Analyst upgrades SpaceX before the next flight"
+    summary: "The note is about the vehicle."
+    section: companies
+    topic: spacex
+    expect: keep
+  - title: "SpaceX upgrades the Raptor engine"
+    summary: "The engine flies on the next test."
+    section: companies
+    topic: spacex
+    expect: keep
+  - title: "NASA analyst watches the launch"
+    summary: "The analyst follows the SpaceX countdown."
+    section: companies
+    topic: spacex
+    expect: keep
+  - title: "SpaceX stock jumps after an analyst upgrade"
+    summary: "The shares moved in the afternoon."
+    section: companies
+    topic: spacex
+    expect: exclude
+  - title: "SpaceX keeps a stock of engines in the hangar"
+    summary: "The engines are for the next vehicle."
+    section: companies
+    topic: spacex
+    expect: keep
+  - title: "The engine is in stock for the next flight"
+    summary: "SpaceX says the part is on hand."
+    section: companies
+    topic: spacex
+    expect: keep
+  - title: "Earth Funeral opens a new facility"
+    summary: "Earth Funeral described the building."
+    section: companies
+    topic: earth
+    expect: keep
+  - title: "SpaceX price target raised before the flight"
+    summary: "The note names a new figure."
+    section: companies
+    topic: spacex
+    expect: exclude
+  - title: "Senate killed the bill"
+    summary: "The vote failed on the floor."
+    section: global
+    expect: keep
+  - title: "Senator dies in committee"
+    summary: "The amendment did not advance."
+    section: global
+    expect: keep
+  - title: "The bill was killed in committee"
+    summary: "Members moved on."
+    section: global
+    expect: keep
+  - title: "Actor dies at sea"
+    summary: "The notice names a wreck, not a funeral."
+    section: global
+    expect: keep
+  - title: "Funeral service for a local resident"
+    summary: "The chapel posted the time."
+    section: global
+    expect: exclude
+  - title: "Earth Funeral holds a funeral service"
+    summary: "The company described the gathering."
+    section: global
+    expect: keep
+  - title: "Smithville bakery grand opening on Saturday"
+    summary: "The ovens are in the old feed store."
+    section: local
+    expect: fallback-prints
+  - title: "Live music on Friday in Elgin"
+    summary: "A trio plays the courtyard."
+    section: local
+    expect: fallback-prints
+  - title: "Cedar Creek farmers market adds a Saturday"
+    summary: "Produce stalls line the lot."
+    section: local
+    expect: fallback-prints
+  - title: "East Austin food truck rolls out a new menu"
+    summary: "The window is on the east side."
+    section: local
+    expect: fallback-prints
+  - title: "Bastrop distillery tasting on Sunday"
+    summary: "Three pours are included."
+    section: local
+    expect: fallback-prints
+  - title: "Kayak rentals resume on the river"
+    summary: "The dock opens at dawn."
+    section: local
+    expect: keep
+  - title: "Library book sale this Saturday"
+    summary: "Paperbacks are a dollar."
+    section: local
+    expect: keep
+  - title: "Lost dog found near the square"
+    summary: "The owner can call the shelter."
+    section: local
+    expect: keep
+  - title: "Highway closure for a paving crew"
+    summary: "The lane reopens Monday."
+    section: local
+    expect: keep
+  - title: "New taqueria opens in Elgin"
+    summary: "The salsa is made in house."
+    section: local
+    expect: fallback-prints
+  - title: "Winery soft opening in Dripping Springs"
+    summary: "Neighbors are invited first."
+    section: local
+    expect: fallback-prints
+  - title: "Concert in the park this Saturday"
+    summary: "The set is free."
+    section: local
+    expect: fallback-prints
+  - title: "Festival returns to Bastrop"
+    summary: "The streets close to cars for the day."
+    section: local
+    expect: fallback-prints
+  - title: "Menu prices at the cafe stay the same"
+    summary: "Breakfast is still the morning draw."
+    section: local
+    expect: keep
+  - title: "Cafe closed for renovations"
+    summary: "The room returns next month."
+    section: local
+    expect: keep
+  - title: "Grand opening of a new diner"
+    summary: "Breakfast starts at seven."
+    section: local
+    expect: fallback-prints
+  - title: "Del Valle night market adds vendors"
+    summary: "The lot fills after five."
+    section: local
+    expect: keep
+  - title: "Red Rock picnic draws a crowd"
+    summary: "Blankets line the grass."
+    section: local
+    expect: keep
+  - title: "Paige volunteer day at the park"
+    summary: "The group meets at the gate."
+    section: local
+    expect: keep
+  - title: "Taylor bakery welcomes a morning crowd"
+    summary: "Kolaches come out of the oven at six."
+    section: local
+    expect: fallback-prints
+  - title: "Hutto food trailer parks by the square"
+    summary: "Tacos until they sell out."
+    section: local
+    expect: fallback-prints
+  - title: "Luling ice cream window opens Friday"
+    summary: "Two flavors to start."
+    section: local
+    expect: fallback-prints
+  - title: "Seguin brunch pop-up at the market"
+    summary: "One Sunday only."
+    section: local
+    expect: fallback-prints
+  - title: "Bee Cave restaurant debuts a patio menu"
+    summary: "Dinner starts at five."
+    section: local
+    expect: fallback-prints
+  - title: "Lakeway trail work day"
+    summary: "Volunteers bring gloves."
+    section: local
+    expect: keep
+  - title: "Manchaca coffee roaster posts hours"
+    summary: "The door is open on weekdays."
+    section: local
+    expect: keep
+  - title: "Camp Swift road work continues"
+    summary: "Flaggers are on the shoulder."
+    section: local
+    expect: keep
+  - title: "McDade dance night at the hall"
+    summary: "The band starts at eight."
+    section: local
+    expect: fallback-prints
+  - title: "Coupland winery lists a soft launch"
+    summary: "The first weekend is for neighbors."
+    section: local
+    expect: fallback-prints
+
+pairs:
+  - left: "Harbor ferry delayed after storm"
+    right: "Storm delays harbor ferry, officials say"
+    expect: same
+  - left: "Bastrop brewery set to open on Main Street"
+    right: "Main Street brewery opening in Bastrop, owners say"
+    expect: same
+  - left: "SpaceX launches Starship from Texas"
+    right: "Starship lifts off from Texas, SpaceX says"
+    expect: same
+  - left: "Bastrop brewery opens on Main Street"
+    right: "Bastrop brewery shop opens on Main Street"
+    expect: same
+  - left: "SpaceX launches Starship"
+    right: "SpaceX launches Starship from Texas"
+    expect: same
+  - left: "Brewery opens on Main"
+    right: "Brewery opens on Main Street"
+    expect: same
+  - left: "The first Bastrop brewery opens this weekend"
+    right: "Bastrop brewery opens this weekend"
+    expect: same
+  - left: "A second tasting room opens at the Bastrop brewery"
+    right: "A tasting room opens at the Bastrop brewery"
+    expect: same
+  - left: "Brewery opens in Bastrop"
+    right: "Coffee shop beside the old brewery opens in Bastrop"
+    expect: same
+  - left: "Bastrop brewery opens on Main Street"
+    right: "Bastrop coffee shop opens on Main Street"
+    expect: different
+  - left: "Saturday morning Bastrop brewery opens on Main Street for neighbors"
+    right: "Saturday morning Bastrop bakery opens on Main Street for neighbors"
+    expect: different
+  - left: "Saturday morning weekend Round Rock brewery opens on Main Street for neighbors"
+    right: "Saturday morning weekend Bastrop brewery opens on Main Street for neighbors"
+    expect: different
+  - left: "Saturday morning weekend early La Grange brewery opens on Main Street for neighbors"
+    right: "Saturday morning weekend early Round Rock brewery opens on Main Street for neighbors"
+    expect: different
+  - left: "Saturday morning weekend early Cedar Creek brewery opens on Main Street patio for neighbors after lunch crowd"
+    right: "Saturday morning weekend early San Marcos brewery opens on Main Street patio for neighbors after lunch crowd"
+    expect: different
+  - left: "SpaceX launches Starship from Texas"
+    right: "SpaceX launches Starship flight 3 from Texas"
+    expect: different
+  - left: "Starship flight reaches orbit"
+    right: "Starship third flight reaches orbit"
+    expect: different
+  - left: "Starship flight three reaches orbit"
+    right: "Starship flight four reaches orbit"
+    expect: different
+  - left: "Starship flight 3 reaches orbit"
+    right: "Starship flight 4 reaches orbit"
+    expect: different
+  - left: "Bastrop brewery opens on Main Street"
+    right: "Elgin brewery opens on Main Street"
+    expect: different
+  - left: "Starship first flight reaches orbit"
+    right: "Starship second flight reaches orbit"
+    expect: different

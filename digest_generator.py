@@ -12,6 +12,7 @@ import argparse
 import contextvars
 import datetime as dt
 from email.utils import parsedate_to_datetime
+from concurrent.futures import ThreadPoolExecutor, wait as wait_futures
 import hashlib
 import html
 import json
@@ -38,6 +39,9 @@ LOCATION_LABEL = _env("DIGEST_LOCATION_LABEL", "Bastrop, TX")
 # Leaves room inside the 120s trigger for render and the CUPS poll.
 GENERATOR_BUDGET_SECONDS = 75.0
 FETCH_TIMEOUT_CAP = 8.0
+# Weather, news, and show lookups share this wall so the model still has about 30s.
+FETCH_STAGE_SECONDS = 35.0
+FETCH_WORKERS = 8
 FETCH_READ_CAP = 1_048_576
 TITLE_CAP = 240
 MAX_SHOWS = 3
@@ -102,25 +106,20 @@ class Budget:
         return self.deadline - time.monotonic()
 
 
-# A full edition stops new feed and show fetches once this much time would be left for the model.
-LLM_RESERVE_SECONDS = 30.0
-
-
-def feeds_may_fetch() -> bool:
-    """True when another feed or show call would still leave the model its slice.
-
-    A short budget cannot spare 30 seconds, so tests and retries keep fetching
-    until the budget itself is gone.
-    """
-    budget = _budget_var.get()
-    if budget is None:
-        return True
-    if budget.seconds < LLM_RESERVE_SECONDS + FETCH_TIMEOUT_CAP + 5:
-        return budget.remaining() >= 0.05
-    return budget.remaining() > LLM_RESERVE_SECONDS + FETCH_TIMEOUT_CAP
-
-
 _budget_var: contextvars.ContextVar[Budget | None] = contextvars.ContextVar("digest_budget", default=None)
+_stage_deadline: contextvars.ContextVar[float | None] = contextvars.ContextVar("digest_stage_deadline", default=None)
+
+
+def _clock() -> float:
+    return time.monotonic()
+
+
+def _wait_wave(inflight: dict, timeout: float) -> set:
+    """Wait until the in-flight calls finish, or the stage wall passes."""
+    if timeout <= 0:
+        return set()
+    done, _pending = wait_futures(set(inflight), timeout=timeout)
+    return set(done)
 
 
 def local_zone() -> ZoneInfo:
@@ -139,15 +138,29 @@ def digest_date(moment: dt.datetime | None = None) -> str:
     return current.astimezone(local_zone()).date().isoformat()
 
 
+def _fetch_wall() -> float:
+    """How long this edition may spend in the fetch stage."""
+    budget = _budget_var.get()
+    if budget is None:
+        return FETCH_STAGE_SECONDS
+    return max(0.0, min(FETCH_STAGE_SECONDS, budget.remaining()))
+
+
 def fetch(url: str) -> bytes:
     budget = _budget_var.get()
     timeout = FETCH_TIMEOUT_CAP
     deadline = None
+    limits = []
     if budget is not None:
-        timeout = min(FETCH_TIMEOUT_CAP, max(0.0, budget.remaining()))
+        limits.append(budget.deadline)
+    stage = _stage_deadline.get()
+    if stage is not None:
+        limits.append(min(stage, _clock() + FETCH_TIMEOUT_CAP))
+    if limits:
+        deadline = min(limits)
+        timeout = min(FETCH_TIMEOUT_CAP, max(0.0, deadline - _clock()))
         if timeout < 0.05:
             raise TimeoutError("budget")
-        deadline = budget.deadline
     request = urllib.request.Request(url, headers={"User-Agent": "daily-digest/2.0"})
     try:
         with digest_picker.open_bounded(request, timeout, deadline) as response:
@@ -263,6 +276,7 @@ def build_shows_section(
     digest_day: str,
     fetcher: Callable[[str], bytes],
     history: list[dict],
+    bodies: dict | None = None,
 ) -> tuple[dict | None, list[dict], list[dict]]:
     """Upcoming concerts. Returns no section when the key, file, or matches are missing."""
     spec = settings.section_by_id("shows")
@@ -284,15 +298,22 @@ def build_shows_section(
     errors: list[dict] = []
     found: list[dict] = []
     for artist in artists:
-        if not feeds_may_fetch():
-            break
         # The request URL contains the API key. Errors cite the bare endpoint instead.
         url = ticketmaster_events_url(artist, start, end)
-        try:
-            raw = fetcher(url)
-        except Exception as exc:
-            errors.append({"section": spec.title, "url": TICKETMASTER_EVENTS, "error": _failure_name(exc)})
-            continue
+        if bodies is not None:
+            raw = bodies.get(url, None)
+            if raw is None:
+                errors.append({"section": spec.title, "url": TICKETMASTER_EVENTS, "error": "not fetched"})
+                continue
+            if isinstance(raw, BaseException):
+                errors.append({"section": spec.title, "url": TICKETMASTER_EVENTS, "error": _failure_name(raw)})
+                continue
+        else:
+            try:
+                raw = fetcher(url)
+            except Exception as exc:
+                errors.append({"section": spec.title, "url": TICKETMASTER_EVENTS, "error": _failure_name(exc)})
+                continue
         try:
             found.extend(
                 digest_picker.shows_from_ticketmaster(
@@ -486,6 +507,66 @@ def _guarded(fetcher: Callable[[str], bytes]) -> Callable[[str], bytes]:
     return wrapped
 
 
+def _parallel_map(jobs: list[tuple[str, Callable[[], object]]], wall: float) -> tuple[dict[str, object], list[str]]:
+    """Run jobs together. A job that never starts is returned as not fetched.
+
+    ``wall`` is a hard deadline for the whole stage, measured on ``_clock``.
+    Each call still has its own socket deadline inside ``fetch``.
+    """
+    if wall <= 0 or not jobs:
+        return {}, [key for key, _fn in jobs]
+    start = _clock()
+    end = start + wall
+    results: dict[str, object] = {}
+    not_fetched: list[str] = []
+    queue = list(jobs)
+
+    def invoke(fn: Callable[[], object]) -> object:
+        token = _stage_deadline.set(end)
+        try:
+            try:
+                return fn()
+            except Exception as exc:
+                return exc
+        finally:
+            _stage_deadline.reset(token)
+
+    with ThreadPoolExecutor(max_workers=FETCH_WORKERS) as pool:
+        inflight: dict = {}
+        while queue or inflight:
+            while queue and len(inflight) < FETCH_WORKERS and _clock() < end:
+                key, fn = queue.pop(0)
+                # A context can be entered by one thread at a time, so each job gets its own copy.
+                inflight[pool.submit(contextvars.copy_context().run, invoke, fn)] = key
+            if not inflight:
+                not_fetched.extend(key for key, _fn in queue)
+                break
+            done = _wait_wave(inflight, end - _clock())
+            if not done:
+                not_fetched.extend(inflight.values())
+                not_fetched.extend(key for key, _fn in queue)
+                for future in inflight:
+                    future.cancel()
+                break
+            for future in done:
+                key = inflight.pop(future)
+                try:
+                    results[key] = future.result()
+                except Exception as exc:
+                    results[key] = exc
+    return results, not_fetched
+
+
+def _not_fetched_item(feed_url: str) -> dict:
+    return {
+        "title": "Feed not fetched",
+        "summary": "This feed was not requested before the fetch stage ended.",
+        "url": digest_picker.strip_userinfo(feed_url) or "https://example.invalid/not-fetched",
+        "published_at": None,
+        "rationale": "not fetched",
+    }
+
+
 def _emergency_payload(digest_date: str, moment: dt.datetime) -> dict:
     """A printable edition used only when building the real one raises."""
     sections = []
@@ -573,28 +654,12 @@ def _make_payload(
     specs = settings.sections()
     by_id: dict[str, dict] = {}
 
+    jobs: list[tuple[str, Callable[[], object]]] = []
+    feed_plan: list[tuple] = []
     weather_spec = settings.section_by_id("weather")
     if weather_spec is not None:
-        try:
-            weather_item = weather(bounded, digest_date)
-        except Exception as exc:  # source failure is represented, never invented
-            errors.append(
-                {"section": weather_spec.title, "url": WEATHER_POINT, "error": _failure_name(exc)}
-            )
-            weather_item = {
-                "headline": "No new update today (weather source unavailable)",
-                "summary": "The configured NOAA forecast could not be reached for this edition.",
-                "url": WEATHER_POINT,
-                "published_at": None,
-                "rationale": f"weather unavailable: {_failure_name(exc)}",
-            }
-        by_id["weather"] = {
-            "section": weather_spec.title,
-            "source_feed": WEATHER_POINT,
-            "items": [weather_item],
-        }
+        jobs.append(("weather", lambda: weather(bounded, digest_date)))
 
-    news_requests: list[dict] = []
     for spec in specs:
         if spec.kind != "news":
             continue
@@ -603,20 +668,101 @@ def _make_payload(
         except Exception as exc:
             errors.append({"section": spec.title, "url": "feeds", "error": _failure_name(exc)})
             continue
+        for index, feed in enumerate(feeds):
+            key = f"feed:{spec.id}:{index}"
+            feed_plan.append((key, spec, feed))
+            jobs.append((key, lambda url=feed.url: bounded(url)))
+
+    show_plan: list[tuple[str, str, str]] = []
+    shows_spec = settings.section_by_id("shows")
+    artist_names: list[str] = []
+    show_window: tuple[str, str] | None = None
+    artists_failed = False
+    if shows_spec is not None and settings.ticketmaster_key():
+        artist_path = settings.artists_path()
+        if artist_path is not None and artist_path.is_file():
+            try:
+                artist_names = load_artists(artist_path)
+                show_window = _shows_window(digest_date)
+            except Exception:
+                artist_names = []
+                artists_failed = True
+                errors.append({"section": shows_spec.title, "url": "artists", "error": "artists file ignored: unreadable"})
+    if show_window is not None:
+        window_start, window_end = show_window
+        for artist in artist_names:
+            url = ticketmaster_events_url(artist, window_start, window_end)
+            show_plan.append((f"artist:{artist}", artist, url))
+            jobs.append((f"artist:{artist}", lambda target=url: bounded(target)))
+
+    fetched, not_fetched = _parallel_map(jobs, _fetch_wall())
+    missed = set(not_fetched)
+
+    if weather_spec is not None:
+        if "weather" in missed:
+            errors.append({"section": weather_spec.title, "url": WEATHER_POINT, "error": "not fetched"})
+            weather_item = {
+                "headline": "Forecast not fetched",
+                "summary": "The forecast was not requested before the fetch stage ended.",
+                "url": WEATHER_POINT,
+                "published_at": None,
+                "rationale": "not fetched",
+            }
+        else:
+            weather_result = fetched.get("weather")
+            if isinstance(weather_result, BaseException) or weather_result is None:
+                exc = weather_result if isinstance(weather_result, BaseException) else TimeoutError("unavailable")
+                errors.append({"section": weather_spec.title, "url": WEATHER_POINT, "error": _failure_name(exc)})
+                weather_item = {
+                    "headline": "No new update today (weather source unavailable)",
+                    "summary": "The configured NOAA forecast could not be reached for this edition.",
+                    "url": WEATHER_POINT,
+                    "published_at": None,
+                    "rationale": f"weather unavailable: {_failure_name(exc)}",
+                }
+            else:
+                weather_item = weather_result
+        by_id["weather"] = {
+            "section": weather_spec.title,
+            "source_feed": WEATHER_POINT,
+            "items": [weather_item],
+        }
+
+    news_requests: list[dict] = []
+    planned_by_section: dict[str, list] = {}
+    for key, spec, feed in feed_plan:
+        planned_by_section.setdefault(spec.id, []).append((key, spec, feed))
+    for spec in specs:
+        if spec.kind != "news" or spec.id not in planned_by_section:
+            continue
+        rows = planned_by_section[spec.id]
         collected: list[dict] = []
         public_urls: list[str] = []
         failures = 0
-        for feed in feeds:
-            if not feeds_may_fetch():
-                break
+        attempted = 0
+        skipped = 0
+        for key, _spec, feed in rows:
             public = digest_picker.strip_userinfo(feed.url)
             public_urls.append(public)
+            if key in missed:
+                skipped += 1
+                errors.append({"section": spec.title, "url": public, "error": "not fetched"})
+                continue
+            attempted += 1
+            result = fetched.get(key)
+            if isinstance(result, BaseException) or result is None:
+                failures += 1
+                exc = result if isinstance(result, BaseException) else TimeoutError("unavailable")
+                errors.append({"section": spec.title, "url": public, "error": _failure_name(exc)})
+                continue
             try:
-                raw_items = rss_items(bounded(feed.url))
+                raw_items = rss_items(result)
             except Exception as exc:
                 failures += 1
                 errors.append({"section": spec.title, "url": public, "error": _failure_name(exc)})
                 continue
+            if not raw_items:
+                errors.append({"section": spec.title, "url": public, "error": "fetched, no story"})
             for raw in raw_items:
                 item = dict(raw)
                 item["topic"] = feed.topic
@@ -628,7 +774,15 @@ def _make_payload(
                 if spec.id == "companies" and not digest_picker.keep_company(item):
                     continue
                 collected.append(item)
-        if feeds and failures == len(feeds):
+        if rows and skipped == len(rows):
+            first = public_urls[0]
+            by_id[spec.id] = {
+                "section": spec.title,
+                "source_feed": first,
+                "items": [_not_fetched_item(first)],
+            }
+            continue
+        if rows and attempted and failures == attempted and not collected:
             first = public_urls[0]
             by_id[spec.id] = {
                 "section": spec.title,
@@ -691,7 +845,17 @@ def _make_payload(
     profile, profile_error = digest_picker.load_profile(settings.profile_path())
     if profile_error:
         errors.append({"section": "PROFILE", "url": "interests", "error": profile_error})
-    shows_section, show_errors, show_records = build_shows_section(digest_date, bounded, history)
+    if artists_failed:
+        shows_section, show_errors, show_records = None, [], []
+    elif show_plan:
+        bodies = {}
+        for key, _artist, url in show_plan:
+            bodies[url] = None if key in missed else fetched.get(key)
+        shows_section, show_errors, show_records = build_shows_section(
+            digest_date, bounded, history, bodies=bodies
+        )
+    else:
+        shows_section, show_errors, show_records = build_shows_section(digest_date, bounded, history)
     errors.extend(show_errors)
     if shows_section is not None:
         by_id["shows"] = shows_section

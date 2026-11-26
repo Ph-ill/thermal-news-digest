@@ -1140,7 +1140,7 @@ local:
                 "Elgin brewery opens on Main Street",
             )
         )
-        self.assertFalse(
+        self.assertTrue(
             dp.titles_similar(
                 "Brewery opens in Bastrop",
                 "Coffee shop beside the old brewery opens in Bastrop",
@@ -1975,8 +1975,18 @@ class ReviewRound6Tests(unittest.TestCase):
             "topic": "spacex",
         }
         self.assertFalse(dp.keep_company(downgrade))
-        self.assertFalse(dp.keep_company(upgrade))
+        self.assertTrue(dp.keep_company(upgrade))
         self.assertTrue(dp.keep_company(inventory))
+        self.assertTrue(
+            dp.keep_company(
+                {
+                    "title": "SpaceX upgrades the Raptor engine",
+                    "summary": "The engine flies on the next test.",
+                    "topic": "spacex",
+                }
+            )
+        )
+        self.assertFalse(dp.is_stock_chatter("NASA analyst watches the launch from the press site."))
         self.assertFalse(dp.is_stock_chatter("Earth Funeral opens a new facility next month."))
 
 
