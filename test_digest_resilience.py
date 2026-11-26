@@ -375,7 +375,7 @@ print(json.dumps({"elapsed": elapsed, "errors": payload["source_errors"], "secti
 """ % str(artists)
         proc = subprocess.run(
             [sys.executable, "-c", script],
-            cwd="/workspace",
+            cwd=Path(__file__).resolve().parent,
             capture_output=True,
             text=True,
             timeout=8,
