@@ -123,6 +123,10 @@ class PickerTests(unittest.TestCase):
         self.assertFalse(dp.is_obituary("The amendment was killed in committee"))
         self.assertTrue(dp.is_obituary("The clerk was killed overnight"))
         self.assertTrue(dp.is_obituary("A guard killed by an intruder"))
+        self.assertFalse(dp.is_obituary("The patio plan was killed by the storm"))
+        self.assertFalse(dp.is_obituary("The tents were killed by the rain"))
+        self.assertFalse(dp.is_obituary("The show was killed by the weather"))
+        self.assertFalse(dp.is_obituary("The lineup was killed by the council"))
         kept = dp.fallback_pick(
             [
                 item(
@@ -1144,6 +1148,24 @@ local:
             dp.titles_similar(
                 "Brewery opens in Bastrop",
                 "Coffee shop beside the old brewery opens in Bastrop",
+            )
+        )
+        self.assertTrue(
+            dp.titles_similar(
+                "Bastrop brewery opens on Main Street",
+                "Bastrop brewery shop opens on Main Street",
+            )
+        )
+        self.assertTrue(
+            dp.titles_similar(
+                "Bastrop brewery opens on Main Street",
+                "Bastrop brewery opens with live music on Main Street",
+            )
+        )
+        self.assertTrue(
+            dp.titles_similar(
+                "Bastrop brewery opens on Main Street",
+                "Bastrop brewery band opens on Main Street",
             )
         )
         self.assertTrue(

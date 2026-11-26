@@ -345,11 +345,11 @@ headlines:
   - title: "Taylor bakery welcomes a morning crowd"
     summary: "Kolaches come out of the oven at six."
     section: local
-    expect: fallback-prints
+    expect: exclude
   - title: "Hutto food trailer parks by the square"
     summary: "Tacos until they sell out."
     section: local
-    expect: fallback-prints
+    expect: exclude
   - title: "Luling ice cream window opens Friday"
     summary: "Two flavors to start."
     section: local
@@ -425,7 +425,7 @@ headlines:
   - title: "Bee Cave restaurant debuts a second patio"
     summary: "The owners also run a spot in Bastrop."
     section: local
-    expect: fallback-prints
+    expect: exclude
   - title: "Lakeway kayak rentals this month"
     summary: "They launch from Bastrop on weekends."
     section: local
@@ -433,6 +433,34 @@ headlines:
   - title: "Captain dies at sea off the coast"
     summary: "The notice names the officer."
     section: global
+    expect: exclude
+  - title: "Bastrop brewery opens a second patio"
+    summary: "The owners also run a Bee Cave restaurant."
+    section: local
+    expect: fallback-prints
+  - title: "Bee Cave restaurant debuts a new room"
+    summary: "The new room opens in Smithville on Friday."
+    section: local
+    expect: fallback-prints
+  - title: "Lakeway restaurant debuts a brunch menu"
+    summary: "A favorite of regulars from Elgin."
+    section: local
+    expect: exclude
+  - title: "Westlake brewery opens this weekend"
+    summary: "The taproom is on the west side."
+    section: local
+    expect: exclude
+  - title: "Georgetown brewery opens this weekend"
+    summary: "The taproom is north of the city."
+    section: local
+    expect: exclude
+  - title: "Brewery posts the weekend hours"
+    summary: "The patio plan was killed by the storm."
+    section: local
+    expect: keep
+  - title: "Two killed near the square"
+    summary: "The block was closed for an hour."
+    section: local
     expect: exclude
 
 pairs:
@@ -447,7 +475,13 @@ pairs:
     expect: same
   - left: "Bastrop brewery opens on Main Street"
     right: "Bastrop brewery shop opens on Main Street"
-    expect: different
+    expect: same
+  - left: "Bastrop brewery opens on Main Street"
+    right: "Bastrop brewery opens with live music on Main Street"
+    expect: same
+  - left: "Bastrop brewery opens on Main Street"
+    right: "Bastrop brewery band opens on Main Street"
+    expect: same
   - left: "SpaceX launches Starship"
     right: "SpaceX launches Starship from Texas"
     expect: same

@@ -57,6 +57,11 @@ _COMMITTEE = re.compile(
     r"\b(?:dies|died|was killed|killed)\s+in\s+(?:the\s+)?committee\b",
     re.IGNORECASE,
 )
+# Weather or a council killing a plan is not a person.
+_KILLED_BY_EVENT = re.compile(
+    r"\bkilled\s+by\s+(?:the\s+|a\s+)?(?:storm|rain|weather|council)\b",
+    re.IGNORECASE,
+)
 _TITLE_STOP = frozenset(
     "a an the of and to in on for with from by at as is was are were be been or its their "
     "after over into about amid says said".split()
@@ -107,6 +112,8 @@ _BUSINESS_NOUNS = frozenset(
     "brewery breweries coffee shop shops cafe bakery bar bars restaurant restaurants truck trucks "
     "market markets winery distillery taproom taco taqueria band music festival".split()
 )
+# Not a different venue. Ignored once both headlines already share a real one.
+_GENERIC_BUSINESS = frozenset("shop shops music band live patio menu".split())
 # Multi-word towns are matched as the consecutive tokens the splitter actually emits
 # ("round" then "rock"), then glued so a later token set can see the whole place.
 _PLACE_PHRASES = (
@@ -146,8 +153,31 @@ _PLACE_PHRASES = (
 )
 _PLACE_TOKEN = {phrase: "".join(phrase) for phrase in _PLACE_PHRASES}
 _PLACE_NOUNS = frozenset(_PLACE_TOKEN.values())
-_LOCAL_PLACE = re.compile(
-    r"\bbastrop\b|\bsmithville\b|\belgin\b|\bcedar creek\b|\beast austin\b",
+# Bastrop-area towns. A home town in the title is where the item is.
+_HOME_TOWNS = (
+    "east austin",
+    "cedar creek",
+    "red rock",
+    "del valle",
+    "bastrop",
+    "smithville",
+    "elgin",
+    "mcdade",
+    "paige",
+)
+_HOME_TOWN = re.compile(
+    r"\b(?:" + "|".join(re.escape(town) for town in _HOME_TOWNS) + r")\b",
+    re.IGNORECASE,
+)
+# "in/at/from <town>" and "opens in <town>" place the event. A passing mention does not.
+_HOME_PLACEMENT = re.compile(
+    r"\b(?:opens\s+in|in|at|from)\s+(?:the\s+)?(?:"
+    + "|".join(re.escape(town) for town in _HOME_TOWNS)
+    + r")\b",
+    re.IGNORECASE,
+)
+_PASSING_PLACE = re.compile(
+    r"\balso\s+runs?\b|\bregulars\b|\bfavorite\s+of\b",
     re.IGNORECASE,
 )
 # Unambiguous civic process. A passing "across from city council" is not a meeting.
@@ -163,9 +193,13 @@ _CIVIC = re.compile(
     r"\bgovernment\b.{0,40}\b(?:meeting|vote|hearing|session)\b",
     re.IGNORECASE,
 )
+# "Killed" is a crime for a person, or "killed near/after/in", or "fatal".
+# "Senate killed the bill" and "killed by the storm" are not.
 _CRIME = re.compile(
     r"\barrested\b|\bshooting\b|\bhomicide\b|\bmurder(?:ed)?\b|\bindicted\b|\bpolice said\b|"
-    r"\bstabb(?:ed|ing)\b|\bkilling\b|\bkilled\b|\bcrash deaths?\b",
+    r"\bstabb(?:ed|ing)\b|\bkilling\b|\bcrash deaths?\b|\bfatal\b|"
+    r"\b(?:man|woman|person|people|two|\d+)\b(?:\s+\w+){0,4}\s+killed\b|"
+    r"\bkilled\s+(?:near|after|in)\b",
     re.IGNORECASE,
 )
 # A known night out or a studio phrase. Stripped before the crime and sports checks.
@@ -178,10 +212,11 @@ _KNOWN_EVENT = re.compile(
     r"\bphoto\s+shooting\b|\bphoto\s+shoots?\b",
     re.IGNORECASE,
 )
-# West of Austin. Local news keeps one of these only when the summary names a Bastrop-area town.
-_WEST_OF_AUSTIN = re.compile(
-    r"\b(?:bee cave|lakeway|dripping springs|cedar park|leander|"
-    r"west lake hills|rollingwood|sunset valley|spicewood|jonestown|lago vista)\b",
+# Not home. Used for the local section only. Shows keep their own radius and city list.
+_NON_HOME = re.compile(
+    r"\b(?:west lake hills|dripping springs|sunset valley|pflugerville|round rock|"
+    r"cedar park|bee cave|lago vista|rollingwood|jonestown|spicewood|georgetown|"
+    r"lakeway|leander|west\s*lake|taylor|hutto)\b",
     re.IGNORECASE,
 )
 # Unambiguous sports. "coach" and "olympic" are not here; they also describe ordinary local news.
@@ -690,6 +725,8 @@ def is_obituary(text: str) -> bool:
         return True
     # Legislative phrasing is not a death notice. A real death later in the same line still is.
     remainder = _COMMITTEE.sub(" ", value)
+    # "killed by the storm/rain/weather/council" is a plan or a patio, not a person.
+    remainder = _KILLED_BY_EVENT.sub(" ", remainder)
     # "dies at sea" is still a death. "died in committee" was already removed above.
     return bool(_DEATH.search(remainder))
 
@@ -752,11 +789,35 @@ def _open_counts(text: str) -> bool:
     return False
 
 
-def _west_of_austin_without_home(title: str, summary: str) -> bool:
-    """Bee Cave, Lakeway, and the other western suburbs stay out unless the summary names home."""
-    if not _WEST_OF_AUSTIN.search(f"{title or ''} {summary or ''}"):
+def _summary_places_home(summary: str) -> bool:
+    """True when the summary puts the event in a home town.
+
+    "in/at/from <town>" and "opens in <town>" count. "also runs", "regulars",
+    and "favorite of" are a passing mention of the town, not the location.
+    """
+    for match in _HOME_PLACEMENT.finditer(summary or ""):
+        window = summary[max(0, match.start() - 48) : match.end()]
+        if _PASSING_PLACE.search(window):
+            continue
+        return True
+    return False
+
+
+def _event_is_home(title: str, summary: str) -> bool:
+    """Where the item is. A home town in the title is enough.
+
+    A home town in the summary counts only when the summary places the event there.
+    """
+    if _HOME_TOWN.search(title or ""):
+        return True
+    return _summary_places_home(summary or "")
+
+
+def _outside_home(title: str, summary: str) -> bool:
+    """The title's location is a west or north suburb, and the event is not at home."""
+    if _event_is_home(title, summary):
         return False
-    return _LOCAL_PLACE.search(summary or "") is None
+    return _NON_HOME.search(title or "") is not None
 
 
 def local_opening_signal(title: str, summary: str = "") -> bool:
@@ -765,7 +826,7 @@ def local_opening_signal(title: str, summary: str = "") -> bool:
     Coffee, a truck, a park, or a trail by itself is not one. 'Shops' or 'plays' alone is not one.
     Kayak, paddle, tubing, a night market, a trail reopening, and a hike are.
     """
-    if _west_of_austin_without_home(title, summary) or is_hard_local_exclude(title, summary):
+    if _outside_home(title, summary) or is_hard_local_exclude(title, summary):
         return False
     text = f"{title or ''} {summary or ''}"
     if _NIGHT_OUT.search(text):
@@ -774,12 +835,17 @@ def local_opening_signal(title: str, summary: str = "") -> bool:
 
 
 def keep_local(item: dict, *, require_place: bool) -> bool:
-    """Crime and obituaries use the headline and the summary. A town may be in either."""
+    """Crime and obituaries use the headline and the summary.
+
+    A home town in the title keeps the item. A home town in the summary keeps it
+    only when the summary places the event there. A west or north suburb as the
+    title's location drops it unless the event is in a home town.
+    """
     title = item.get("title") or ""
     summary = item.get("summary") or ""
-    if _west_of_austin_without_home(title, summary) or is_hard_local_exclude(title, summary):
+    if _outside_home(title, summary) or is_hard_local_exclude(title, summary):
         return False
-    if require_place and not _LOCAL_PLACE.search(f"{title} {summary}"):
+    if require_place and not _event_is_home(title, summary):
         return False
     return True
 
@@ -1155,8 +1221,11 @@ def titles_similar(left: str, right: str) -> bool:
     and 'lifts off' matches 'launches'. Headlines split when both name a
     business or a town and those names disagree, when the longer headline adds
     a business the shorter does not have, or when a flight number differs.
-    An extra Texas or Street on one side still matches. first/second count
-    only beside a flight, a launch, or another count word.
+    Shop, music, band, live, patio, and menu are generic once both headlines
+    already share a venue, so a brewery and that brewery's shop are one story.
+    Coffee against a brewery still splits. An extra Texas or Street on one
+    side still matches. first/second count only beside a flight, a launch,
+    or another count word.
     """
     first, places_left, numbers_left = _title_parts(left)
     second, places_right, numbers_right = _title_parts(right)
@@ -1169,6 +1238,9 @@ def titles_similar(left: str, right: str) -> bool:
     short_tokens, long_tokens = (first, second) if len(first) <= len(second) else (second, first)
     short_business = _named_subset(short_tokens, _BUSINESS_NOUNS)
     long_business = _named_subset(long_tokens, _BUSINESS_NOUNS)
+    if (short_business - _GENERIC_BUSINESS) & (long_business - _GENERIC_BUSINESS):
+        short_business -= _GENERIC_BUSINESS
+        long_business -= _GENERIC_BUSINESS
     if long_business - short_business:
         return False
     if len(first) == len(second) and short_business != long_business:
