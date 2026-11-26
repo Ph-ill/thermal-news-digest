@@ -309,12 +309,6 @@ def feeds_for(section_id: str) -> tuple[FeedSpec, ...]:
     raise KeyError(section_id)
 
 
-def news_feed(section_id: str) -> tuple[str, tuple[str, ...]]:
-    """Primary feed URL. Tests and overrides that want every source use feeds_for."""
-    feeds = feeds_for(section_id)
-    return feeds[0].url, feeds[0].required
-
-
 def fresh_hours() -> int:
     return env_int("DIGEST_FRESH_HOURS", 36, 6, 168)
 
@@ -362,17 +356,6 @@ def shows_radius_miles() -> int:
 
 def shows_horizon_days() -> int:
     return env_int("DIGEST_SHOWS_HORIZON_DAYS", 90, 7, 180)
-
-
-def shows_configured() -> bool:
-    path = artists_path()
-    if not ticketmaster_key() or path is None or not path.is_file():
-        return False
-    try:
-        text = path.read_text(encoding="utf-8")
-    except OSError:
-        return False
-    return any(line.split("#", 1)[0].strip() for line in text.splitlines())
 
 
 def taste() -> str:

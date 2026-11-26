@@ -69,11 +69,13 @@ _KILLED_BY_EVENT = re.compile(
 # The model path still uses the narrower obituary and crime checks above.
 _FALLBACK_VIOLENCE = re.compile(
     r"\b(?:kill(?:ed|ing|s)?|dies|died|dead|deaths?|"
-    r"shoot(?:ing|ings)?|"
+    r"shoot(?:ings|ing|s)?|shot|slain|"
+    r"drown(?:ed|ings|ing|s)?|suicid(?:e|es|al)|wound(?:ed|ing)|assault(?:ed|ing|s)?|"
     r"crash(?:es|ed|ing)?|"
-    r"stabb(?:ed|ing|s)?|"
-    r"murder(?:ed|s|ing)?|homicides?|"
-    r"arrested|fatal(?:ly|ity|ities)?|"
+    r"stab(?:bed|bing|s)?|murder(?:ers|er|ed|ing|ous|s)?|homicid(?:e|es|al)|"
+    r"gunman|gunfire|overdos(?:e|es|ed|ing)|fatal(?:ly|ity|ities)?|"
+    r"injur(?:e|es|ed|ing|y|ies)|"
+    r"arrested|"
     r"passed away|passes away|"
     r"obituary|obituaries|obit)\b",
     re.IGNORECASE,
@@ -903,7 +905,8 @@ def keep_company(item: dict) -> bool:
     return True
 
 
-def published_age_hours(value: object, now: dt.datetime) -> float | None:
+def _parse_published(value: object) -> dt.datetime | None:
+    """Parse a feed timestamp. A value with no zone is read in DIGEST_TZ."""
     if value is None or value == "":
         return None
     text = str(value)
@@ -917,6 +920,13 @@ def published_age_hours(value: object, now: dt.datetime) -> float | None:
             return None
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=_digest_zone())
+    return parsed
+
+
+def published_age_hours(value: object, now: dt.datetime) -> float | None:
+    parsed = _parse_published(value)
+    if parsed is None:
+        return None
     moment = now if now.tzinfo else now.replace(tzinfo=dt.timezone.utc)
     return (moment.astimezone(dt.timezone.utc) - parsed.astimezone(dt.timezone.utc)).total_seconds() / 3600
 
@@ -1211,12 +1221,6 @@ def _title_parts(title: str) -> tuple[frozenset[str], frozenset[str], frozenset[
         tokens.append(_PLACE_TOKEN[tuple(place.split())])
     tokens.extend(bare_places)
     return frozenset(tokens), frozenset(places), frozenset(numbers)
-
-
-def story_tokens(title: str) -> frozenset[str]:
-    """Stemmed content words. Filler and attribution are gone. 'lift off' is 'launch'."""
-    tokens, _places, _numbers = _title_parts(title)
-    return tokens
 
 
 def _named_subset(tokens: frozenset[str], names: frozenset[str]) -> frozenset[str]:
@@ -1741,13 +1745,6 @@ def eligible_candidates(raw_items: list[dict], seen: Seen) -> list[dict]:
     return chosen
 
 
-def _matches_terms(item: dict, terms: tuple[str, ...]) -> bool:
-    if not terms:
-        return False
-    haystack = f"{item['title']} {item.get('summary') or ''}".casefold()
-    return any(term and term in haystack for term in terms)
-
-
 def _public_item(item: dict) -> dict:
     published = {
         "title": item["title"],
@@ -1783,19 +1780,9 @@ def fallback_blocks(item: dict) -> bool:
 
 
 def _published_stamp(value: object) -> float | None:
-    if value is None or value == "":
+    parsed = _parse_published(value)
+    if parsed is None:
         return None
-    text = str(value)
-    parsed = None
-    try:
-        parsed = parsedate_to_datetime(text)
-    except (TypeError, ValueError, OverflowError):
-        try:
-            parsed = dt.datetime.fromisoformat(text.replace("Z", "+00:00"))
-        except (TypeError, ValueError, OverflowError):
-            return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=dt.timezone.utc)
     return parsed.timestamp()
 
 
@@ -1815,9 +1802,7 @@ def fallback_from_eligible(
     still pass a profile do not need a second path. The model uses those terms when it
     orders candidates. This function does not.
     """
-    del prefer_terms, likes, dislikes
-    if section_id == "local":
-        return []
+    del prefer_terms, likes, dislikes, section_id
     ranked_pairs = sorted(
         enumerate(eligible),
         key=lambda pair: (
@@ -1828,7 +1813,7 @@ def fallback_from_eligible(
     )
     ranked = [item for _index, item in ranked_pairs if not fallback_blocks(item)]
     company_topics = [item.get("topic") for item in ranked if item.get("topic") in {"spacex", "earth"}]
-    if len(set(company_topics)) > 1:
+    if count > 1 and len(set(company_topics)) > 1:
         buckets: dict[str, list[dict]] = {}
         for item in ranked:
             topic = str(item.get("topic") or "")
@@ -1893,7 +1878,7 @@ def fallback_pick(
     section_id: str = "",
 ) -> list[dict]:
     if section_id == "local":
-        return [local_offline_item(feed_url)]
+        return [_public_item(local_offline_item(feed_url))]
     eligible = eligible_candidates(candidates, seen)
     chosen = fallback_from_eligible(
         eligible, count, seen, prefer_terms, max_chars, likes, dislikes, section_id
@@ -2303,10 +2288,8 @@ def pick_news(
                 chosen.append(picked)
                 used_llm = True
         section_id = str(request.get("section_id") or "")
-        if section_id == "local" and not chosen:
-            if llm_picks is not None:
-                used_fallback = True
-            items_by_id[section_id] = [local_offline_item(request["feed_url"])]
+        if section_id == "local" and not chosen and llm_picks is None:
+            items_by_id[section_id] = [_public_item(local_offline_item(request["feed_url"]))]
             continue
         if section_id != "local" and len(chosen) < section_count:
             likes, dislikes = profile_terms(profile, section_id)

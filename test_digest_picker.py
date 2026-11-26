@@ -1294,6 +1294,49 @@ local:
         self.assertTrue(any("Earth Funeral" in title for title in titles))
         self.assertFalse(any("tank test" in title for title in titles))
 
+    def test_one_company_slot_takes_the_newest(self):
+        def company(title, url, summary, topic, published):
+            row = item(title, url, summary, published)
+            row["topic"] = topic
+            return row
+
+        picked, _meta, _errors, _records = dp.pick_news(
+            [
+                {
+                    "section_id": "companies",
+                    "title": "SPACEX & EARTH FUNERAL",
+                    "purpose": "company news",
+                    "feed_url": "https://example.com/companies",
+                    "prefer_terms": (),
+                    "item_count": 1,
+                    "candidates": [
+                        company(
+                            "SpaceX sets a dawn Starship launch window",
+                            "https://example.com/starship",
+                            "The window opens at sunrise and the company said the flight is a fueling test.",
+                            "spacex",
+                            "Thu, 26 Nov 2026 06:00:00 GMT",
+                        ),
+                        company(
+                            "Earth Funeral opens a soil transformation facility",
+                            "https://example.com/earth",
+                            "Earth Funeral opened the facility and said families can choose soil transformation there next month.",
+                            "earth",
+                            "Thu, 26 Nov 2026 12:00:00 GMT",
+                        ),
+                    ],
+                }
+            ],
+            digest_date="2026-11-26",
+            history=[],
+            has_bots=True,
+            item_count=1,
+        )
+        self.assertEqual(
+            [row["title"] for row in picked["companies"]],
+            ["Earth Funeral opens a soil transformation facility"],
+        )
+
     def test_company_filter_drops_stock_and_unrelated_funeral_items(self):
         stock = {
             "title": "SpaceX shares jump on a price target",
@@ -1410,6 +1453,10 @@ local:
         self.assertAlmostEqual(age, 4.0, places=2)
         aware = dp.published_age_hours("2026-11-26T08:00:00Z", now)
         self.assertAlmostEqual(aware, 10.0, places=2)
+        naive = item("Morning note from the river", "https://example.com/naive", LONG, "2026-11-26T08:00:00")
+        zulu = item("Earlier harbor note", "https://example.com/zulu", LONG, "2026-11-26T09:00:00Z")
+        ordered = dp.fallback_pick([zulu, naive], 1, dp.Seen([], "2026-11-26"))
+        self.assertEqual(ordered[0]["title"], "Morning note from the river")
 
     def test_bad_profile_and_artist_files_are_skipped(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -1898,6 +1945,19 @@ class ReviewRound6Tests(unittest.TestCase):
             feed_url="https://example.com/feed",
         )
         self.assertEqual(kept[0]["title"], "Harbor ferry resumes morning runs")
+        newer_shot = item(
+            "Man shot outside the station",
+            "https://example.com/shot",
+            LONG,
+            "Thu, 26 Nov 2026 12:00:00 GMT",
+        )
+        shot_kept = dp.fallback_pick(
+            [older_clean, newer_shot],
+            1,
+            dp.Seen([], "2026-11-26"),
+            feed_url="https://example.com/feed",
+        )
+        self.assertEqual(shot_kept[0]["title"], "Harbor ferry resumes morning runs")
         for title in (
             "Senate killed the bill",
             "The band is killing it",
@@ -1905,6 +1965,20 @@ class ReviewRound6Tests(unittest.TestCase):
             "Photo shooting at the studio",
             "Rocket crash ends the test",
             "The patio plan was killed by the storm",
+            "Man shot outside the station",
+            "Officer shot",
+            "Gunman shoots into the crowd",
+            "Five slain in overnight attack",
+            "Teen drowns in the river",
+            "Suicide note found in the hotel",
+            "Assault reported at the station",
+            "Two wounded near the square",
+            "Stabbing reported downtown",
+            "Homicide investigation continues",
+            "Gunfire heard overnight",
+            "Overdose call at the hotel",
+            "Fatal collision on the highway",
+            "Player injury ends the season",
         ):
             picked = dp.fallback_pick(
                 [item(title, "https://example.com/blocked", LONG)],
@@ -1913,12 +1987,138 @@ class ReviewRound6Tests(unittest.TestCase):
                 feed_url="https://example.com/feed",
             )
             self.assertEqual(picked[0]["title"], dp.PLACEHOLDER_TITLE, title)
+        stable = dp.fallback_pick(
+            [item("The stable opens for Saturday rides", "https://example.com/stable", LONG)],
+            1,
+            dp.Seen([], "2026-11-26"),
+            feed_url="https://example.com/feed",
+        )
+        self.assertEqual(stable[0]["title"], "The stable opens for Saturday rides")
         self.assertFalse(dp.is_obituary("Senate killed the bill"))
         self.assertFalse(dp.is_obituary("The band is killing it"))
         self.assertFalse(dp.is_obituary("The patio plan was killed by the storm"))
         self.assertFalse(dp.local_opening_signal("New shops in Bastrop this weekend"))
         self.assertFalse(dp.local_opening_signal("Someone plays Saturday night in Bastrop"))
         self.assertTrue(dp.local_opening_signal("Band plays Saturday night in Bastrop"))
+
+    def test_offline_line_only_when_the_model_was_not_called(self):
+        feed = "https://user:pass@example.com/local"
+        brewery = item(
+            "Bastrop brewery opens on Main Street",
+            "https://example.com/brewery",
+            LONG,
+        )
+        harbor = item(
+            "Harbor talks end with a written ceasefire",
+            "https://example.com/harbor",
+            "Mediators said both sides signed the text before dawn and set Friday for the first aid ship.",
+        )
+        local = {
+            "section_id": "local",
+            "title": "BASTROP",
+            "purpose": "local",
+            "feed_url": feed,
+            "prefer_terms": (),
+            "candidates": [brewery],
+        }
+        world = {
+            "section_id": "global",
+            "title": "GLOBAL",
+            "purpose": "world",
+            "feed_url": "https://example.com/global",
+            "prefer_terms": (),
+            "candidates": [harbor],
+        }
+        harbor_summary = (
+            "Mediators finished a written ceasefire before dawn and named Friday for the first aid ship."
+        )
+
+        def opener_for(local_items):
+            def opener(request, timeout):
+                content = json.dumps(
+                    {
+                        "picks": [
+                            {
+                                "section": "GLOBAL",
+                                "items": [{"url": "https://example.com/harbor", "summary": harbor_summary}],
+                            },
+                            {"section": "BASTROP", "items": local_items},
+                        ]
+                    }
+                )
+                payload = {"choices": [{"message": {"content": content}}]}
+                return FakeResponse(json.dumps(payload).encode())
+
+            return opener
+
+        picked, meta, _errors, _records = dp.pick_news(
+            [local],
+            digest_date="2026-11-26",
+            history=[],
+            has_bots=False,
+            item_count=1,
+            summary_chars=300,
+        )
+        self.assertEqual(meta["mode"], "fallback")
+        self.assertEqual(meta["reason"], "no_api_key")
+        self.assertEqual(picked["local"][0]["title"], dp.LOCAL_OFFLINE_TITLE)
+        self.assertEqual(picked["local"][0]["url"], "https://example.com/local")
+
+        def timed_out(request, timeout):
+            raise TimeoutError("slow")
+
+        with mock.patch.dict(os.environ, {"DIGEST_LLM_API_KEY": SECRET}):
+            failed, failed_meta, failed_errors, _records = dp.pick_news(
+                [local],
+                digest_date="2026-11-26",
+                history=[],
+                has_bots=False,
+                opener=timed_out,
+                item_count=1,
+                summary_chars=300,
+            )
+        self.assertEqual(failed_meta["mode"], "fallback")
+        self.assertEqual(failed_meta["reason"], "timeout")
+        self.assertEqual(failed_errors[0]["error"], "llm fallback: timeout")
+        self.assertEqual(failed["local"][0]["title"], dp.LOCAL_OFFLINE_TITLE)
+        self.assertEqual(failed["local"][0]["url"], "https://example.com/local")
+
+        with mock.patch.dict(os.environ, {"DIGEST_LLM_API_KEY": SECRET}):
+            empty, empty_meta, empty_errors, _records = dp.pick_news(
+                [world, local],
+                digest_date="2026-11-26",
+                history=[],
+                has_bots=False,
+                opener=opener_for([]),
+                item_count=1,
+                summary_chars=300,
+            )
+        self.assertEqual(empty_errors, [])
+        self.assertEqual(empty_meta["mode"], "llm")
+        self.assertEqual(empty["global"][0]["title"], "Harbor talks end with a written ceasefire")
+        self.assertEqual(empty["local"][0]["title"], dp.PLACEHOLDER_TITLE)
+
+        with mock.patch.dict(os.environ, {"DIGEST_LLM_API_KEY": SECRET}):
+            missed, missed_meta, missed_errors, _records = dp.pick_news(
+                [world, local],
+                digest_date="2026-11-26",
+                history=[],
+                has_bots=False,
+                opener=opener_for(
+                    [
+                        {
+                            "url": "https://example.com/not-offered",
+                            "summary": "A taproom opened on Main Street and poured on Friday night.",
+                        }
+                    ]
+                ),
+                item_count=1,
+                summary_chars=300,
+            )
+        self.assertEqual(missed_errors, [])
+        self.assertEqual(missed_meta["mode"], "llm")
+        self.assertEqual(missed["global"][0]["title"], "Harbor talks end with a written ceasefire")
+        self.assertEqual(missed["local"][0]["title"], dp.PLACEHOLDER_TITLE)
 
     def test_prompt_is_capped_and_sends_the_newest_history(self):
         history = []
