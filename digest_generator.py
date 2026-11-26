@@ -433,6 +433,125 @@ def build_shows_section(
     return {"section": spec.title, "source_feed": TICKETMASTER_EVENTS, "items": items}, errors, records
 
 
+def _configured_feed(section_id: str, feed_url: str):
+    """The settings feed this row claims, or None when the URL is not one of ours."""
+    try:
+        feeds = settings.feeds_for(section_id)
+    except Exception:
+        return None
+    wanted = digest_picker.strip_userinfo(feed_url).rstrip("/")
+    for feed in feeds:
+        if digest_picker.strip_userinfo(feed.url).rstrip("/") == wanted:
+            return feed
+    return None
+
+
+def _requests_from_candidates(document: dict, specs: list, now: dt.datetime) -> list[dict]:
+    """News requests from a fresh export.
+
+    The file is untrusted. Section titles and the rubric come from settings.
+    Unknown sections are ignored. Each row is gated like a story just fetched.
+    """
+    by_title: dict[str, dict] = {}
+    for section in document.get("sections") or []:
+        if isinstance(section, dict) and isinstance(section.get("section"), str):
+            by_title.setdefault(section["section"], section)
+    requests: list[dict] = []
+    for spec in specs:
+        if spec.kind != "news":
+            continue
+        exported = by_title.get(spec.title) or {}
+        collected: list[dict] = []
+        first_feed = ""
+        try:
+            configured = settings.feeds_for(spec.id)
+            if configured:
+                first_feed = configured[0].url
+        except Exception:
+            configured = ()
+        for row in exported.get("candidates") or []:
+            if not isinstance(row, dict):
+                continue
+            feed_url = row.get("feed_url")
+            if not isinstance(feed_url, str):
+                continue
+            feed = _configured_feed(spec.id, feed_url)
+            if feed is None:
+                continue
+            title = row.get("full_title") if isinstance(row.get("full_title"), str) and row.get("full_title").strip() else row.get("title")
+            summary = row.get("full_summary") if isinstance(row.get("full_summary"), str) else row.get("summary")
+            item = {
+                "title": title or "",
+                "url": row.get("url") or "",
+                "summary": summary or "",
+                "published_at": row.get("published_at"),
+                "feed_url": digest_picker.strip_userinfo(feed.url),
+            }
+            if isinstance(row.get("source_label"), str):
+                item["source_label"] = row["source_label"]
+            gated = digest_picker.gate_feed_item(item, section_id=spec.id, feed=feed)
+            if gated is not None:
+                collected.append(gated)
+        collected = digest_picker.apply_section_freshness(collected, section_id=spec.id, now=now)
+        request = {
+            "section_id": spec.id,
+            "title": spec.title,
+            "purpose": spec.purpose,
+            "feed_url": first_feed,
+            "prefer_terms": (),
+            "candidates": collected,
+        }
+        topics = {str(item.get("topic") or "") for item in collected if item.get("topic")}
+        if spec.id == "companies" and len(topics) > 1:
+            request["item_count"] = min(2, len(topics))
+        requests.append(request)
+    return requests
+
+
+def supplied_shows_section(
+    digest_day: str,
+    entries: list[dict],
+    history: list[dict],
+) -> tuple[dict | None, list[dict], list[dict]]:
+    """NEARBY SHOWS from the picks file when Ticketmaster is not configured."""
+    spec = settings.section_by_id("shows")
+    if spec is None or not entries:
+        return None, [], []
+    found = digest_picker.shows_from_supplied(entries, digest_day, history, settings.shows_horizon_days())
+    if not found:
+        return None, [], []
+    found.sort(key=lambda item: (item["event_start"], item["title"]))
+    items: list[dict] = []
+    records: list[dict] = []
+    seen_ids: set[str] = set()
+    for item in found:
+        if item["show_id"] in seen_ids:
+            continue
+        seen_ids.add(item["show_id"])
+        items.append(
+            {
+                "title": item["title"],
+                "summary": item["summary"],
+                "url": item["url"],
+                "published_at": item["event_start"],
+            }
+        )
+        records.append(
+            {
+                "digest_date": digest_day,
+                "section": "shows",
+                "url": digest_picker.normalize_url(item["url"]),
+                "title": digest_picker.normalize_title(item["title"]),
+                "show_id": item["show_id"],
+                "event_start": item["event_start"],
+                "phase": item["phase"],
+            }
+        )
+        if len(items) >= MAX_SHOWS:
+            break
+    return {"section": spec.title, "source_feed": "picks", "items": items}, [], records
+
+
 def _period_on_date(period: dict, today: dt.date, tz: ZoneInfo) -> bool:
     start_raw = period.get("startTime")
     if not isinstance(start_raw, str):
@@ -718,6 +837,9 @@ def make_payload(
     budget_seconds: float = GENERATOR_BUDGET_SECONDS,
     persist_history: bool = True,
     history_out: list | None = None,
+    picks_directory: Path | None = None,
+    candidates_directory: Path | None = None,
+    export_only: bool = False,
 ) -> dict:
     moment = now or dt.datetime.now(dt.timezone.utc)
     if moment.tzinfo is None:
@@ -733,6 +855,9 @@ def make_payload(
             bot_directory=bot_directory,
             persist_history=persist_history,
             history_out=history_out,
+            picks_directory=picks_directory,
+            candidates_directory=candidates_directory,
+            export_only=export_only,
         )
     finally:
         _budget_var.reset(token)
@@ -748,6 +873,9 @@ def _make_payload(
     bot_directory: Path | None,
     persist_history: bool,
     history_out: list | None,
+    picks_directory: Path | None = None,
+    candidates_directory: Path | None = None,
+    export_only: bool = False,
 ) -> dict:
     bounded = _guarded(fetcher)
     budget = _budget_var.get()
@@ -761,12 +889,18 @@ def _make_payload(
 
     jobs: list[tuple[str, Callable[[], object]]] = []
     feed_plan: list[tuple] = []
+    saved_candidates = None
+    if not export_only:
+        candidates_root = candidates_directory or settings.candidates_dir()
+        saved_candidates, candidates_error = digest_picker.load_candidates(candidates_root, digest_date, moment)
+        if candidates_error:
+            errors.append({"section": "PICKER", "url": "candidates", "error": candidates_error})
     weather_spec = settings.section_by_id("weather")
-    if weather_spec is not None:
+    if weather_spec is not None and not export_only:
         jobs.append(("weather", WEATHER_POINT, lambda: weather(bounded, digest_date)))
 
     for spec in specs:
-        if spec.kind != "news":
+        if spec.kind != "news" or saved_candidates is not None:
             continue
         try:
             feeds = settings.feeds_for(spec.id)
@@ -783,7 +917,7 @@ def _make_payload(
     artist_names: list[str] = []
     show_window: tuple[str, str] | None = None
     artists_failed = False
-    if shows_spec is not None and settings.ticketmaster_key():
+    if shows_spec is not None and settings.ticketmaster_key() and not export_only:
         artist_path = settings.artists_path()
         if artist_path is not None and artist_path.is_file():
             try:
@@ -804,7 +938,7 @@ def _make_payload(
     missed = set(not_fetched)
     overdue = set(timed_out)
 
-    if weather_spec is not None:
+    if weather_spec is not None and not export_only:
         if "weather" in missed:
             errors.append({"section": weather_spec.title, "url": WEATHER_POINT, "error": "not fetched"})
             weather_item = {
@@ -844,11 +978,13 @@ def _make_payload(
         }
 
     news_requests: list[dict] = []
+    if saved_candidates is not None:
+        news_requests = _requests_from_candidates(saved_candidates, specs, moment)
     planned_by_section: dict[str, list] = {}
     for key, spec, feed in feed_plan:
         planned_by_section.setdefault(spec.id, []).append((key, spec, feed))
     for spec in specs:
-        if spec.kind != "news" or spec.id not in planned_by_section:
+        if saved_candidates is not None or spec.kind != "news" or spec.id not in planned_by_section:
             continue
         rows = planned_by_section[spec.id]
         collected: list[dict] = []
@@ -885,15 +1021,11 @@ def _make_payload(
                 errors.append({"section": spec.title, "url": public, "error": "fetched, no story"})
             for raw in raw_items:
                 item = dict(raw)
-                item["topic"] = feed.topic
-                blob = f"{item.get('title') or ''} {item.get('summary') or ''}"
-                if feed.required and not any(term in blob.casefold() for term in feed.required):
+                item["feed_url"] = public
+                gated = digest_picker.gate_feed_item(item, section_id=spec.id, feed=feed)
+                if gated is None:
                     continue
-                if spec.id == "local" and not digest_picker.keep_local(item, require_place=feed.require_place):
-                    continue
-                if spec.id == "companies" and not digest_picker.keep_company(item):
-                    continue
-                collected.append(item)
+                collected.append(gated)
         if rows and skipped + overdue_count == len(rows) and not collected:
             first = public_urls[0]
             item = _timed_out_item(first) if overdue_count else _not_fetched_item(first)
@@ -911,15 +1043,7 @@ def _make_payload(
                 "items": [_unavailable_news_item(first, TimeoutError("unavailable"))],
             }
             continue
-        if spec.id == "companies":
-            collected = digest_picker.select_company_fresh(
-                collected,
-                moment,
-                settings.fresh_hours(),
-                settings.company_stale_hours(),
-            )
-        else:
-            collected = digest_picker.select_fresh(collected, moment, hours=settings.fresh_hours())
+        collected = digest_picker.apply_section_freshness(collected, section_id=spec.id, now=moment)
         request = {
             "section_id": spec.id,
             "title": spec.title,
@@ -966,6 +1090,29 @@ def _make_payload(
     profile, profile_error = digest_picker.load_profile(settings.profile_path())
     if profile_error:
         errors.append({"section": "PROFILE", "url": "interests", "error": profile_error})
+    if export_only:
+        return digest_picker.candidate_document(
+            news_requests,
+            history,
+            digest_date,
+            profile=profile,
+            taste=settings.taste(),
+            has_bots="bot_updates" in by_id,
+            crowded=False,
+        )
+    picks_root = picks_directory or settings.picks_dir()
+    loaded_picks, picks_error = digest_picker.load_picks(picks_root, digest_date)
+    if picks_error:
+        errors.append({"section": "PICKER", "url": "picks", "error": picks_error})
+    external_picks = None
+    file_shows: list[dict] = []
+    if loaded_picks is not None:
+        allowed = {request["title"] for request in news_requests}
+        if any(pick["section"] not in allowed for pick in loaded_picks["picks"]):
+            errors.append({"section": "PICKER", "url": "picks", "error": "picks ignored: invalid"})
+        else:
+            external_picks = loaded_picks["picks"]
+            file_shows = loaded_picks["shows"]
     if artists_failed:
         shows_section, show_errors, show_records = None, [], []
     elif show_plan:
@@ -980,8 +1127,10 @@ def _make_payload(
         shows_section, show_errors, show_records = build_shows_section(
             digest_date, bounded, history, bodies=bodies
         )
-    else:
+    elif settings.ticketmaster_key():
         shows_section, show_errors, show_records = build_shows_section(digest_date, bounded, history)
+    else:
+        shows_section, show_errors, show_records = supplied_shows_section(digest_date, file_shows, history)
     errors.extend(show_errors)
     if shows_section is not None:
         by_id["shows"] = shows_section
@@ -996,9 +1145,10 @@ def _make_payload(
             opener=opener,
             deadline=deadline,
             profile=profile,
+            external_picks=external_picks,
         )
     except Exception:
-        picked, picker_meta, picker_errors, history_records = {}, {"mode": "fallback", "model": None, "reason": "picker_error"}, [], []
+        picked, picker_meta, picker_errors, history_records = {}, {"mode": "fallback", "model": None, "reason": "picker_error", "source": "fallback"}, [], []
         for request in news_requests:
             picked[request["section_id"]] = [
                 {
@@ -1065,13 +1215,33 @@ def atomic_json(path: Path, value: dict) -> None:
             pass
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--date", default=None)
-    parser.add_argument("--out", type=Path, required=True)
-    args = parser.parse_args()
+    parser.add_argument("--out", type=Path)
+    parser.add_argument("--export-candidates", nargs="?", const="", default=None)
+    args = parser.parse_args(argv)
     day = args.date or digest_date()
     moment = dt.datetime.now(dt.timezone.utc)
+    if args.export_candidates is not None:
+        destination = settings.candidates_path(day) if args.export_candidates == "" else Path(args.export_candidates)
+        document = make_payload(day, now=moment, persist_history=False, export_only=True)
+        atomic_json(destination, document)
+        count = sum(len(section.get("candidates") or []) for section in document.get("sections") or [])
+        print(
+            json.dumps(
+                {
+                    "digest_date": document.get("digest_date"),
+                    "sections": len(document.get("sections") or []),
+                    "candidates": count,
+                    "output": str(destination.resolve()),
+                },
+                sort_keys=True,
+            )
+        )
+        return 0
+    if args.out is None:
+        parser.error("--out is required unless --export-candidates is set")
     records: list = []
     try:
         payload = make_payload(day, now=moment, persist_history=False, history_out=records)
@@ -1083,7 +1253,7 @@ def main() -> int:
         digest_picker.save_history(settings.history_path(), day, records)
     except Exception:
         pass
-    print(json.dumps({"digest_id": payload["digest_id"], "picker": payload.get("picker", {}).get("mode"), "sections": len(payload["sections"]), "source_errors": payload["source_errors"], "output": str(args.out.resolve())}, sort_keys=True))
+    print(json.dumps({"digest_id": payload["digest_id"], "picker": payload.get("picker", {}).get("mode"), "source": payload.get("picker", {}).get("source"), "sections": len(payload["sections"]), "source_errors": payload["source_errors"], "output": str(args.out.resolve())}, sort_keys=True))
     return 0
 
 
