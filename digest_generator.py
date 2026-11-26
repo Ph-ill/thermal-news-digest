@@ -433,54 +433,77 @@ def build_shows_section(
     return {"section": spec.title, "source_feed": TICKETMASTER_EVENTS, "items": items}, errors, records
 
 
-def _requests_from_candidates(document: dict, specs: list) -> list[dict]:
-    """News requests from a fresh export, so 05:00 does not re-fetch the feeds."""
-    by_title = {section["section"]: section for section in document.get("sections") or []}
+def _configured_feed(section_id: str, feed_url: str):
+    """The settings feed this row claims, or None when the URL is not one of ours."""
+    try:
+        feeds = settings.feeds_for(section_id)
+    except Exception:
+        return None
+    wanted = digest_picker.strip_userinfo(feed_url).rstrip("/")
+    for feed in feeds:
+        if digest_picker.strip_userinfo(feed.url).rstrip("/") == wanted:
+            return feed
+    return None
+
+
+def _requests_from_candidates(document: dict, specs: list, now: dt.datetime) -> list[dict]:
+    """News requests from a fresh export.
+
+    The file is untrusted. Section titles and the rubric come from settings.
+    Unknown sections are ignored. Each row is gated like a story just fetched.
+    """
+    by_title: dict[str, dict] = {}
+    for section in document.get("sections") or []:
+        if isinstance(section, dict) and isinstance(section.get("section"), str):
+            by_title.setdefault(section["section"], section)
     requests: list[dict] = []
     for spec in specs:
         if spec.kind != "news":
             continue
         exported = by_title.get(spec.title) or {}
-        candidates = []
-        for row in exported.get("candidates") or []:
-            candidates.append(
-                {
-                    "title": row.get("title") or "",
-                    "url": row.get("url") or "",
-                    "summary": row.get("summary") or "",
-                    "published_at": row.get("published_at"),
-                }
-            )
-        feed_url = ""
+        collected: list[dict] = []
+        first_feed = ""
         try:
-            feeds = settings.feeds_for(spec.id)
-            if feeds:
-                feed_url = feeds[0].url
+            configured = settings.feeds_for(spec.id)
+            if configured:
+                first_feed = configured[0].url
         except Exception:
-            feed_url = ""
+            configured = ()
+        for row in exported.get("candidates") or []:
+            if not isinstance(row, dict):
+                continue
+            feed_url = row.get("feed_url")
+            if not isinstance(feed_url, str):
+                continue
+            feed = _configured_feed(spec.id, feed_url)
+            if feed is None:
+                continue
+            title = row.get("full_title") if isinstance(row.get("full_title"), str) and row.get("full_title").strip() else row.get("title")
+            summary = row.get("full_summary") if isinstance(row.get("full_summary"), str) else row.get("summary")
+            item = {
+                "title": title or "",
+                "url": row.get("url") or "",
+                "summary": summary or "",
+                "published_at": row.get("published_at"),
+                "feed_url": digest_picker.strip_userinfo(feed.url),
+            }
+            if isinstance(row.get("source_label"), str):
+                item["source_label"] = row["source_label"]
+            gated = digest_picker.gate_feed_item(item, section_id=spec.id, feed=feed)
+            if gated is not None:
+                collected.append(gated)
+        collected = digest_picker.apply_section_freshness(collected, section_id=spec.id, now=now)
         request = {
             "section_id": spec.id,
             "title": spec.title,
-            "purpose": exported.get("purpose") or spec.purpose,
-            "feed_url": feed_url,
+            "purpose": spec.purpose,
+            "feed_url": first_feed,
             "prefer_terms": (),
-            "candidates": candidates,
+            "candidates": collected,
         }
-        if spec.id == "companies":
-            topics: set[str] = set()
-            try:
-                for feed in settings.feeds_for("companies"):
-                    if not feed.topic or not feed.required:
-                        continue
-                    for item in candidates:
-                        blob = f"{item.get('title') or ''} {item.get('summary') or ''}".casefold()
-                        if any(term in blob for term in feed.required):
-                            topics.add(feed.topic)
-                            break
-            except Exception:
-                topics = set()
-            if len(topics) > 1:
-                request["item_count"] = min(2, len(topics))
+        topics = {str(item.get("topic") or "") for item in collected if item.get("topic")}
+        if spec.id == "companies" and len(topics) > 1:
+            request["item_count"] = min(2, len(topics))
         requests.append(request)
     return requests
 
@@ -956,7 +979,7 @@ def _make_payload(
 
     news_requests: list[dict] = []
     if saved_candidates is not None:
-        news_requests = _requests_from_candidates(saved_candidates, specs)
+        news_requests = _requests_from_candidates(saved_candidates, specs, moment)
     planned_by_section: dict[str, list] = {}
     for key, spec, feed in feed_plan:
         planned_by_section.setdefault(spec.id, []).append((key, spec, feed))
@@ -998,15 +1021,11 @@ def _make_payload(
                 errors.append({"section": spec.title, "url": public, "error": "fetched, no story"})
             for raw in raw_items:
                 item = dict(raw)
-                item["topic"] = feed.topic
-                blob = f"{item.get('title') or ''} {item.get('summary') or ''}"
-                if feed.required and not any(term in blob.casefold() for term in feed.required):
+                item["feed_url"] = public
+                gated = digest_picker.gate_feed_item(item, section_id=spec.id, feed=feed)
+                if gated is None:
                     continue
-                if spec.id == "local" and not digest_picker.keep_local(item, require_place=feed.require_place):
-                    continue
-                if spec.id == "companies" and not digest_picker.keep_company(item):
-                    continue
-                collected.append(item)
+                collected.append(gated)
         if rows and skipped + overdue_count == len(rows) and not collected:
             first = public_urls[0]
             item = _timed_out_item(first) if overdue_count else _not_fetched_item(first)
@@ -1024,15 +1043,7 @@ def _make_payload(
                 "items": [_unavailable_news_item(first, TimeoutError("unavailable"))],
             }
             continue
-        if spec.id == "companies":
-            collected = digest_picker.select_company_fresh(
-                collected,
-                moment,
-                settings.fresh_hours(),
-                settings.company_stale_hours(),
-            )
-        else:
-            collected = digest_picker.select_fresh(collected, moment, hours=settings.fresh_hours())
+        collected = digest_picker.apply_section_freshness(collected, section_id=spec.id, now=moment)
         request = {
             "section_id": spec.id,
             "title": spec.title,

@@ -31,7 +31,9 @@ The file is what the model would have been shown:
 | `summary_max_chars` | The crowded summary budget, 200 unless `DIGEST_SUMMARY_CHARS_WITH_BOTS` changes it. Write to this limit. Shows or bot notes can shorten the receipt after the export. |
 | `sections` | One object per news section |
 
-Each section has `section` (the printed title, such as `GLOBAL` or `BASTROP`), `purpose` (the rubric), and `candidates`. Each candidate has only `url`, `title`, `summary`, and `published_at`. At most 12 candidates are listed per section. Obituaries, ads, and stories already printed are not listed.
+Each section has `section` (the printed title, such as `GLOBAL` or `BASTROP`), `purpose` (the rubric the bot reads), and `candidates`. At most 12 candidates are listed per section. Obituaries, ads, and stories already printed are not listed.
+
+`title` and `summary` are the clipped text the bot reads. The same row also stores `full_title`, `full_summary`, `feed_url`, and, when they exist, `source_label` and `topic`. The 05:00 print uses the full fields. The section title and the rubric printed or sent to a model come from settings, not from this file.
 
 ```json
 {
@@ -51,6 +53,9 @@ Each section has `section` (the printed title, such as `GLOBAL` or `BASTROP`), `
           "url": "https://example.com/harbor",
           "title": "Harbor talks end with a written ceasefire",
           "summary": "Mediators said both sides signed the text before dawn.",
+          "full_title": "Harbor talks end with a written ceasefire",
+          "full_summary": "Mediators said both sides signed the text before dawn and set Friday for the first aid ship.",
+          "feed_url": "https://news.google.com/rss/search?q=example",
           "published_at": "Thu, 26 Nov 2026 08:00:00 GMT"
         }
       ]
@@ -74,6 +79,8 @@ A picked URL must be one of today's candidates. The comparison uses the raw stri
 A section whose picks are all rejected is sent to the model when `DIGEST_LLM_API_KEY` is set. Otherwise that section uses the deterministic fallback, including the fixed BASTROP line when the model is not called. The section does not stop on the empty placeholder while one of those can still choose a story. Sections the file did fill are not sent to the model.
 
 At 05:00 the generator reuses `$DIGEST_CANDIDATES_DIR/YYYY-MM-DD.json` when it is a regular file, UTF-8, at most 256 KiB, not a symlink, its `digest_date` is the edition date, and its modification time is less than 3 hours old. News feeds are not fetched again, so a Google News token or the 16-item cap cannot drop a URL the bot was shown. Weather is still fetched. Ticketmaster is still fetched when a key is set. A missing file is quiet and the feeds are fetched. A stale, symlinked, or invalid export is ignored and the feeds are fetched.
+
+The export is untrusted. Every reused row goes through the same gates as a story just fetched: the configured feed's required phrases and `require_place`, `keep_local`, `keep_company`, the freshness cut, and the obituary, spam, and history checks. `feed_url` has to be one of that section's configured feeds, and the topic stamped on a company row comes from that feed, so the fallback still alternates SpaceX and Earth Funeral. A row that fails is dropped. A section name that is not one of today's sections is ignored. The file's `purpose` is not used.
 
 A missing picks file is quiet. A symlink, a non-UTF-8 file, a file over 64 KiB, bad JSON, or a stale `generated_at` is ignored. The generator then calls the model if `DIGEST_LLM_API_KEY` is set, and otherwise uses the deterministic fallback. `picker.source` in the source file is `picks`, `llm`, `mixed`, or `fallback`. `picker.mode` is `picks` when the file supplied every printed news item.
 

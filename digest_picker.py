@@ -906,6 +906,37 @@ def keep_company(item: dict) -> bool:
     return True
 
 
+def gate_feed_item(item: dict, *, section_id: str, feed) -> dict | None:
+    """The per-item gates a live fetch uses. The reuse path calls this same function.
+
+    ``feed`` is a configured feed: its topic, required phrases, and require_place
+    win over anything stored in an export row. Obituary and spam checks run here.
+    History is applied later by ``eligible_candidates``, which both paths call.
+    """
+    row = dict(item)
+    row["topic"] = str(getattr(feed, "topic", "") or "")
+    title = str(row.get("title") or "")
+    summary = str(row.get("summary") or "")
+    blob = f"{title} {summary}"
+    required = tuple(getattr(feed, "required", ()) or ())
+    if required and not any(term in blob.casefold() for term in required):
+        return None
+    if section_id == "local" and not keep_local(row, require_place=bool(getattr(feed, "require_place", False))):
+        return None
+    if section_id == "companies" and not keep_company(row):
+        return None
+    if is_obituary(blob) or is_spam(blob):
+        return None
+    return row
+
+
+def apply_section_freshness(items: list[dict], *, section_id: str, now: dt.datetime) -> list[dict]:
+    """The freshness cut a live fetch uses, including the per-company window."""
+    if section_id == "companies":
+        return select_company_fresh(items, now, settings.fresh_hours(), settings.company_stale_hours())
+    return select_fresh(items, now, hours=settings.fresh_hours())
+
+
 def _parse_published(value: object) -> dt.datetime | None:
     """Parse a feed timestamp. A value with no zone is read in DIGEST_TZ."""
     if value is None or value == "":
@@ -1759,6 +1790,9 @@ def prepare_candidate(item: dict) -> dict | None:
         prepared["source_label"] = clean_spaces(str(item["source_label"]))
     if item.get("topic"):
         prepared["topic"] = str(item["topic"])
+    feed_url = item.get("feed_url")
+    if isinstance(feed_url, str) and feed_url.strip():
+        prepared["feed_url"] = feed_url.strip()
     return prepared
 
 
@@ -2340,6 +2374,21 @@ def candidate_document(
     )
     body["schema_version"] = "1"
     body["digest_date"] = digest_date
+    originals = {item["url"]: item for _request, eligible in prepared for item in eligible}
+    for section in body.get("sections") or []:
+        for row in section.get("candidates") or []:
+            item = originals.get(row.get("url"))
+            if not item:
+                continue
+            # Clipped title and summary stay for the bot. Print uses the full fields.
+            row["full_title"] = item.get("raw_title") or item.get("title") or row.get("title") or ""
+            row["full_summary"] = item.get("summary") or ""
+            if item.get("source_label"):
+                row["source_label"] = item["source_label"]
+            if item.get("topic"):
+                row["topic"] = item["topic"]
+            if item.get("feed_url"):
+                row["feed_url"] = item["feed_url"]
     return body
 
 
@@ -2967,34 +3016,53 @@ def _validate_candidates_document(value: object, digest_date: str) -> dict:
         if not isinstance(section, dict):
             raise PicksFileError("invalid")
         title = section.get("section")
-        purpose = section.get("purpose") if isinstance(section.get("purpose"), str) else ""
         rows = section.get("candidates")
         if not isinstance(title, str) or not title.strip() or not isinstance(rows, list):
-            raise PicksFileError("invalid")
+            continue
         candidates: list[dict] = []
         for row in rows:
-            if not isinstance(row, dict):
-                raise PicksFileError("invalid")
-            url = row.get("url")
-            row_title = row.get("title")
-            if not isinstance(url, str) or not url.startswith("http"):
-                raise PicksFileError("invalid")
-            if not isinstance(row_title, str) or not row_title.strip():
-                raise PicksFileError("invalid")
-            summary = row.get("summary") if isinstance(row.get("summary"), str) else ""
-            published = row.get("published_at")
-            if published is not None and not isinstance(published, str):
-                raise PicksFileError("invalid")
-            candidates.append(
-                {
-                    "title": row_title,
-                    "url": url,
-                    "summary": summary,
-                    "published_at": published,
-                }
-            )
-        cleaned.append({"section": title, "purpose": purpose, "candidates": candidates})
+            kept = _candidate_row(row)
+            if kept is not None:
+                candidates.append(kept)
+        cleaned.append({"section": title.strip(), "candidates": candidates})
     return {"digest_date": digest_date, "sections": cleaned}
+
+
+def _bounded_text(value: object, limit: int) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text or len(text) > limit:
+        return None
+    return text
+
+
+def _candidate_row(row: object) -> dict | None:
+    """Keep one export row. A bad row is skipped. The section purpose is not kept."""
+    if not isinstance(row, dict):
+        return None
+    url = row.get("url")
+    row_title = _bounded_text(row.get("title"), 500)
+    if not isinstance(url, str) or not url.startswith("http") or len(url) > 2000 or row_title is None:
+        return None
+    summary = row.get("summary") if isinstance(row.get("summary"), str) else ""
+    if len(summary) > 4000:
+        return None
+    published = row.get("published_at")
+    if published is not None and (not isinstance(published, str) or len(published) > 80):
+        return None
+    kept = {"title": row_title, "url": url, "summary": summary, "published_at": published}
+    for key, limit in (
+        ("full_title", 500),
+        ("full_summary", 4000),
+        ("source_label", 80),
+        ("topic", 40),
+        ("feed_url", 2000),
+    ):
+        text = _bounded_text(row.get(key), limit)
+        if text is not None:
+            kept[key] = text
+    return kept
 
 
 def load_candidates(directory: Path, digest_date: str, now: dt.datetime) -> tuple[dict | None, str | None]:
