@@ -36,6 +36,9 @@ PLACEHOLDER_TITLE = "No new update today"
 PLACEHOLDER_SUMMARY = (
     "No current item passed the obituary, spam, and duplicate checks for this section."
 )
+# Printed for BASTROP when the model is unavailable. Not a story, and not recorded in history.
+LOCAL_OFFLINE_TITLE = "Local picks unavailable today (AI offline)."
+LOCAL_OFFLINE_SUMMARY = "BASTROP is skipped until the model is back."
 BOT_TEXT_MAX = 360
 _ABBREV = re.compile(
     r"\b(?:Mr|Mrs|Ms|Dr|Prof|Sr|Jr|St|vs|etc|U\.S|U\.K|a\.m|p\.m|e\.g|i\.e)\.",
@@ -60,6 +63,19 @@ _COMMITTEE = re.compile(
 # Weather or a council killing a plan is not a person.
 _KILLED_BY_EVENT = re.compile(
     r"\bkilled\s+by\s+(?:the\s+|a\s+)?(?:storm|rain|weather|council)\b",
+    re.IGNORECASE,
+)
+# Fallback only. Any death or violence word excludes the item, with no idiom exemption.
+# The model path still uses the narrower obituary and crime checks above.
+_FALLBACK_VIOLENCE = re.compile(
+    r"\b(?:kill(?:ed|ing|s)?|dies|died|dead|deaths?|"
+    r"shoot(?:ing|ings)?|"
+    r"crash(?:es|ed|ing)?|"
+    r"stabb(?:ed|ing|s)?|"
+    r"murder(?:ed|s|ing)?|homicides?|"
+    r"arrested|fatal(?:ly|ity|ities)?|"
+    r"passed away|passes away|"
+    r"obituary|obituaries|obit)\b",
     re.IGNORECASE,
 )
 _TITLE_STOP = frozenset(
@@ -1755,6 +1771,34 @@ def _history_record(section_id: str, digest_date: str, item: dict) -> dict:
     }
 
 
+def fallback_blocks(item: dict) -> bool:
+    """True when the no-model picker must drop the item.
+
+    Death and violence words match anywhere in the title or summary. "Killed it",
+    "killed the bill", and "killed by the storm" are dropped here. The model path
+    does not use this check.
+    """
+    blob = f"{item.get('title') or ''} {item.get('summary') or ''}"
+    return _FALLBACK_VIOLENCE.search(blob) is not None
+
+
+def _published_stamp(value: object) -> float | None:
+    if value is None or value == "":
+        return None
+    text = str(value)
+    parsed = None
+    try:
+        parsed = parsedate_to_datetime(text)
+    except (TypeError, ValueError, OverflowError):
+        try:
+            parsed = dt.datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except (TypeError, ValueError, OverflowError):
+            return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed.timestamp()
+
+
 def fallback_from_eligible(
     eligible: list[dict],
     count: int,
@@ -1765,11 +1809,24 @@ def fallback_from_eligible(
     dislikes: tuple[str, ...] = (),
     section_id: str = "",
 ) -> list[dict]:
+    """Newest items that pass the hard excludes. Likes, dislikes, and prefer terms are ignored.
+
+    ``prefer_terms``, ``likes``, and ``dislikes`` stay in the signature so callers that
+    still pass a profile do not need a second path. The model uses those terms when it
+    orders candidates. This function does not.
+    """
+    del prefer_terms, likes, dislikes
+    if section_id == "local":
+        return []
     ranked_pairs = sorted(
         enumerate(eligible),
-        key=lambda pair: (-relevance_score(pair[1], likes, dislikes, prefer_terms, section_id), pair[0]),
+        key=lambda pair: (
+            _published_stamp(pair[1].get("published_at")) is None,
+            -(_published_stamp(pair[1].get("published_at")) or 0.0),
+            pair[0],
+        ),
     )
-    ranked = [item for _index, item in ranked_pairs]
+    ranked = [item for _index, item in ranked_pairs if not fallback_blocks(item)]
     company_topics = [item.get("topic") for item in ranked if item.get("topic") in {"spacex", "earth"}]
     if len(set(company_topics)) > 1:
         buckets: dict[str, list[dict]] = {}
@@ -1785,14 +1842,6 @@ def fallback_from_eligible(
         ordered.extend(item for item in ranked if item.get("topic") not in {"spacex", "earth"})
     else:
         ordered = ranked
-    if section_id == "local":
-        # No model: print a local item only when it is a real opening. Otherwise leave the placeholder.
-        ordered = [
-            item
-            for item in ordered
-            if local_opening_signal(item.get("title") or "", item.get("summary") or "")
-            and relevance_score(item, likes, dislikes, prefer_terms, section_id) > 0
-        ]
     chosen: list[dict] = []
     for item in ordered:
         if seen.repeat(item):
@@ -1802,13 +1851,23 @@ def fallback_from_eligible(
             summary = fallback_blurb(item)
         picked = dict(item)
         picked["summary"] = summary
-        picked["rationale"] = "Fallback pick: newest item that was not an obituary, ad, or repeat."
+        picked["rationale"] = "Fallback pick: newest item that passed the hard excludes and was not a repeat."
         picked["record_history"] = True
         seen.mark(picked)
         chosen.append(picked)
         if len(chosen) >= count:
             break
     return chosen
+
+
+def local_offline_item(feed_url: str) -> dict:
+    return {
+        "title": LOCAL_OFFLINE_TITLE,
+        "summary": LOCAL_OFFLINE_SUMMARY,
+        "url": feed_url or "https://example.invalid/feed",
+        "published_at": None,
+        "rationale": LOCAL_OFFLINE_SUMMARY,
+    }
 
 
 def placeholder_item(feed_url: str) -> dict:
@@ -1833,6 +1892,8 @@ def fallback_pick(
     dislikes: tuple[str, ...] = (),
     section_id: str = "",
 ) -> list[dict]:
+    if section_id == "local":
+        return [local_offline_item(feed_url)]
     eligible = eligible_candidates(candidates, seen)
     chosen = fallback_from_eligible(
         eligible, count, seen, prefer_terms, max_chars, likes, dislikes, section_id
@@ -2241,8 +2302,14 @@ def pick_news(
                 seen.mark(picked)
                 chosen.append(picked)
                 used_llm = True
-        if len(chosen) < section_count:
-            likes, dislikes = profile_terms(profile, str(request.get("section_id") or ""))
+        section_id = str(request.get("section_id") or "")
+        if section_id == "local" and not chosen:
+            if llm_picks is not None:
+                used_fallback = True
+            items_by_id[section_id] = [local_offline_item(request["feed_url"])]
+            continue
+        if section_id != "local" and len(chosen) < section_count:
+            likes, dislikes = profile_terms(profile, section_id)
             extra = fallback_from_eligible(
                 eligible,
                 section_count - len(chosen),
@@ -2251,7 +2318,7 @@ def pick_news(
                 max_chars,
                 likes,
                 dislikes,
-                str(request.get("section_id") or ""),
+                section_id,
             )
             if extra:
                 if llm_picks is not None:

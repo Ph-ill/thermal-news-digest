@@ -1,5 +1,7 @@
-# Labeled headlines for the local filter, the company filter, and title de-dupe.
+# Labeled headlines for the local prefilter, the company filter, and title de-dupe.
 # expect is exclude, keep, or fallback-prints. Pairs are same or different.
+# fallback-prints means the model prefilter keeps the item. The no-LLM local
+# section does not print it; that section is a fixed offline line.
 # Add a row for a new review case. Do not rewrite the matcher for one headline.
 
 headlines:

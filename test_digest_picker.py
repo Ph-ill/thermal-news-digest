@@ -141,7 +141,7 @@ class PickerTests(unittest.TestCase):
             max_chars=300,
             feed_url="https://example.com/feed",
         )
-        self.assertEqual(kept[0]["title"], "Senate killed the bill")
+        self.assertEqual(kept[0]["title"], dp.PLACEHOLDER_TITLE)
         self.assertTrue(dp.is_spam("Stocks I'm buying this week"))
         self.assertTrue(dp.is_spam("Stocks to watch before the open"))
 
@@ -171,7 +171,7 @@ class PickerTests(unittest.TestCase):
         )
         self.assertEqual(
             [entry["title"] for entry in chosen],
-            ["New anime film opens in the spring", "Studio announces a sequel"],
+            ["Studio announces a sequel", "New anime film opens in the spring"],
         )
 
     def test_history_skips_recent_urls_and_titles_but_not_today(self):
@@ -892,7 +892,8 @@ class GeneratorTests(unittest.TestCase):
             local_blob = json.dumps(by_name["BASTROP"])
             self.assertNotIn(shared, local_blob)
             self.assertNotIn("City council", local_blob)
-            self.assertIn("Bastrop brewery opens on Main Street", local_blob)
+            self.assertNotIn("Bastrop brewery opens on Main Street", local_blob)
+            self.assertIn(dp.LOCAL_OFFLINE_TITLE, local_blob)
             companies_blob = json.dumps(by_name["SPACEX & EARTH FUNERAL"]).casefold()
             self.assertNotIn("last chance", companies_blob)
             self.assertNotIn("viewing room", companies_blob)
@@ -1020,7 +1021,7 @@ local:
             likes=likes,
             dislikes=dislikes,
         )
-        self.assertEqual(chosen[0]["title"], "A cerebral sci-fi novel about space travel")
+        self.assertEqual(chosen[0]["title"], "Celebrity gossip fills the sports pages")
         captured = {}
 
         def opener(request, timeout):
@@ -1401,7 +1402,7 @@ local:
         self.assertLess(dp.interest_score(football, (), ("sports",), ()), 0)
         self.assertEqual(dp.interest_score(hub, (), ("sports",), ()), 0)
         chosen = dp.fallback_pick([football, hub], 1, dp.Seen([], "2026-11-26"), dislikes=("sports",))
-        self.assertEqual(chosen[0]["title"], "Transport hub opens near the river")
+        self.assertEqual(chosen[0]["title"], "Football team opens the season")
 
     def test_naive_timestamps_use_the_digest_timezone(self):
         now = dt.datetime(2026, 11, 26, 18, 0, tzinfo=dt.timezone.utc)
@@ -1498,7 +1499,7 @@ local:
             dp.relevance_score(quiet, (), (), (), "local"),
         )
         chosen = dp.fallback_pick([quiet, opening], 1, dp.Seen([], "2026-11-26"), section_id="local")
-        self.assertEqual(chosen[0]["title"], "Bastrop brewery opens on Main Street")
+        self.assertEqual(chosen[0]["title"], dp.LOCAL_OFFLINE_TITLE)
 
     def test_local_businesses_stay_neutral_and_space_matches_spacex(self):
         dislikes = ("sports", "politics", "celebrity gossip")
@@ -1863,7 +1864,7 @@ class ReviewRound6Tests(unittest.TestCase):
                 title,
             )
 
-    def test_fallback_prints_only_a_real_local_opening(self):
+    def test_fallback_skips_local_and_drops_violence_words(self):
         seen = dp.Seen([], "2026-11-26")
         weak = [
             item("Bastrop water main is repaired", "https://example.com/main", LONG),
@@ -1873,11 +1874,48 @@ class ReviewRound6Tests(unittest.TestCase):
             item("New shops in Bastrop this weekend", "https://example.com/shops", LONG),
             item("Someone plays Saturday night in Bastrop", "https://example.com/plays", LONG),
         ]
-        chosen = dp.fallback_pick(weak, 1, seen, section_id="local")
-        self.assertEqual(chosen[0]["title"], dp.PLACEHOLDER_TITLE)
         opening = item("Bastrop brewery opens on Main Street", "https://example.com/brewery", LONG)
-        picked = dp.fallback_pick([*weak, opening], 1, dp.Seen([], "2026-11-26"), section_id="local")
-        self.assertEqual(picked[0]["title"], "Bastrop brewery opens on Main Street")
+        for batch in (weak, [*weak, opening]):
+            chosen = dp.fallback_pick(batch, 1, seen, section_id="local", feed_url="https://example.com/local")
+            self.assertEqual(chosen[0]["title"], dp.LOCAL_OFFLINE_TITLE)
+            self.assertNotIn("record_history", chosen[0])
+        newer_killed = item(
+            "The band is killing it tonight",
+            "https://example.com/band",
+            LONG,
+            "Thu, 26 Nov 2026 12:00:00 GMT",
+        )
+        older_clean = item(
+            "Harbor ferry resumes morning runs",
+            "https://example.com/ferry",
+            LONG,
+            "Thu, 26 Nov 2026 06:00:00 GMT",
+        )
+        kept = dp.fallback_pick(
+            [older_clean, newer_killed],
+            1,
+            dp.Seen([], "2026-11-26"),
+            feed_url="https://example.com/feed",
+        )
+        self.assertEqual(kept[0]["title"], "Harbor ferry resumes morning runs")
+        for title in (
+            "Senate killed the bill",
+            "The band is killing it",
+            "Child killed at the brewery opening",
+            "Photo shooting at the studio",
+            "Rocket crash ends the test",
+            "The patio plan was killed by the storm",
+        ):
+            picked = dp.fallback_pick(
+                [item(title, "https://example.com/blocked", LONG)],
+                1,
+                dp.Seen([], "2026-11-26"),
+                feed_url="https://example.com/feed",
+            )
+            self.assertEqual(picked[0]["title"], dp.PLACEHOLDER_TITLE, title)
+        self.assertFalse(dp.is_obituary("Senate killed the bill"))
+        self.assertFalse(dp.is_obituary("The band is killing it"))
+        self.assertFalse(dp.is_obituary("The patio plan was killed by the storm"))
         self.assertFalse(dp.local_opening_signal("New shops in Bastrop this weekend"))
         self.assertFalse(dp.local_opening_signal("Someone plays Saturday night in Bastrop"))
         self.assertTrue(dp.local_opening_signal("Band plays Saturday night in Bastrop"))

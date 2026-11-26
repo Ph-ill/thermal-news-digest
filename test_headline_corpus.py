@@ -87,24 +87,11 @@ class HeadlineCorpusTests(unittest.TestCase):
             with self.subTest(title=title):
                 if section == "local":
                     kept = dp.keep_local(item, require_place=bool(row.get("require_place")))
-                    chosen = dp.fallback_pick(
-                        [item],
-                        1,
-                        dp.Seen([], "2026-11-26"),
-                        section_id="local",
-                    )
-                    printed = chosen[0]["title"] == title
                     if expect == "exclude":
                         self.assertFalse(kept)
-                        if not row.get("require_place"):
-                            self.assertFalse(printed)
-                    elif expect == "keep":
-                        self.assertTrue(kept)
-                        self.assertFalse(printed)
                     else:
-                        self.assertEqual(expect, "fallback-prints")
+                        self.assertIn(expect, {"keep", "fallback-prints"})
                         self.assertTrue(kept)
-                        self.assertTrue(printed)
                 elif section == "companies":
                     kept = dp.keep_company(item)
                     self.assertEqual(kept, expect == "keep")
