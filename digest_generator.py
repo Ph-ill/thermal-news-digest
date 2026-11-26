@@ -32,6 +32,7 @@ from zoneinfo import ZoneInfo
 
 import digest_picker
 import digest_settings as settings
+import receipt_art
 
 # Place defaults are the public city center of Bastrop, Texas. Not a street address.
 def _env(name: str, default: str) -> str:
@@ -640,7 +641,12 @@ def format_weather_item(day: dict, night: dict | None, forecast_url: str) -> dic
     summary = _trim_words(clean(str(day.get("detailedForecast") or "")), 480)
     if not summary:
         summary = short or headline
-    return {
+    icon_kind = receipt_art.classify_weather(
+        short,
+        str(day.get("icon") or ""),
+        nighttime=not bool(day.get("isDaytime", True)),
+    )
+    item = {
         "headline": headline,
         "summary": summary,
         "url": forecast_url,
@@ -648,6 +654,9 @@ def format_weather_item(day: dict, night: dict | None, forecast_url: str) -> dic
         "published_at": day.get("startTime"),
         "rationale": "NOAA daytime forecast for the digest date; the overnight period is not used",
     }
+    if icon_kind:
+        item["weather_icon"] = icon_kind
+    return item
 
 
 def weather(fetcher: Callable[[str], bytes], digest_date: str) -> dict:

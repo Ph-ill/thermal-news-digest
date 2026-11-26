@@ -875,7 +875,7 @@ class GeneratorTests(unittest.TestCase):
             names = [section["section"] for section in first["sections"]]
             self.assertEqual(names, list(settings.required_titles()))
             self.assertNotIn("MUSIC", names)
-            self.assertNotIn("BOT UPDATES", names)
+            self.assertNotIn("GROK BOT UPDATES", names)
             self.assertNotIn("UK", names)
             self.assertNotIn("FILM/TV", names)
             self.assertNotIn("EVENTS TODAY / SOON", names)
@@ -936,7 +936,7 @@ class GeneratorTests(unittest.TestCase):
                 bot_directory=bots,
             )
             bot_names = [section["section"] for section in with_bots["sections"]]
-            self.assertEqual(bot_names[-1], "BOT UPDATES")
+            self.assertEqual(bot_names[-1], "GROK BOT UPDATES")
             self.assertEqual(with_bots["sections"][-1]["items"][0]["source_label"], "Popcorn")
             for section in with_bots["sections"]:
                 if section["section"] in {"GLOBAL", "BASTROP"}:

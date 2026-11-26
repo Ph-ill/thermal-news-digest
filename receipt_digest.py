@@ -24,6 +24,7 @@ from PIL import Image, ImageFont
 
 import digest_picker
 import digest_settings as settings
+import receipt_art
 
 WIDTH_DOTS = 640
 DOTS_PER_MM = 8
@@ -273,12 +274,33 @@ def _public_source_url(url: object) -> str | None:
     return cleaned or None
 
 
+def _section_kind(name: str) -> str:
+    for spec in settings.sections():
+        if spec.title == name:
+            return spec.kind
+    return "news"
+
+
+def _standard_text_width() -> int:
+    return WIDTH_DOTS - LEFT - RIGHT - 16
+
+
+def _weather_text_width() -> int:
+    text_x = LEFT + receipt_art.WEATHER_ICON_PX + receipt_art.WEATHER_GAP
+    return WIDTH_DOTS - RIGHT - 8 - text_x
+
+
+def _bubble_origin() -> tuple[int, int, int]:
+    bubble_x = LEFT + receipt_art.AVATAR_PX + receipt_art.TAIL_GAP + receipt_art.TAIL_W
+    bubble_w = WIDTH_DOTS - RIGHT - bubble_x
+    return bubble_x, bubble_w, bubble_w - 2 * receipt_art.BUBBLE_PAD_X
+
+
 def _prepare_sections(payload: dict) -> tuple[list[dict], bool]:
     regular = ImageFont.truetype(str(FONT_REGULAR), BODY_FONT_SIZE)
     detail_font = ImageFont.truetype(str(FONT_REGULAR), DETAIL_FONT_SIZE)
     source_font = ImageFont.truetype(str(FONT_BOLD), SOURCE_FONT_SIZE)
     section_font = ImageFont.truetype(str(FONT_BOLD), SECTION_FONT_SIZE)
-    text_width = WIDTH_DOTS - LEFT - RIGHT - 16
     bar_width = WIDTH_DOTS - LEFT - RIGHT
     clipped = False
     prepared: list[dict] = []
@@ -287,6 +309,19 @@ def _prepare_sections(payload: dict) -> tuple[list[dict], bool]:
         name = _fit_label(str(section.get("section") or ""), section_font, bar_width - 16)
         if len(name) < len(raw_name):
             clipped = True
+        kind = _section_kind(raw_name)
+        weather_icon = None
+        if kind == "weather" and section.get("items"):
+            first = section["items"][0]
+            if isinstance(first, dict):
+                weather_icon = receipt_art.icon_for_item(first)
+        if kind == "bot_updates":
+            text_width = _bubble_origin()[2]
+        elif weather_icon:
+            text_width = _weather_text_width()
+        else:
+            text_width = _standard_text_width()
+        text_width = max(48, text_width)
         items = []
         for item in section["items"]:
             raw_headline = normalize_text(str(item.get("title") or item.get("headline") or ""))
@@ -298,22 +333,29 @@ def _prepare_sections(payload: dict) -> tuple[list[dict], bool]:
                 clipped = True
             if len(headline) < len(raw_headline) or len(detail) < len(normalize_text(raw_detail)):
                 clipped = True
-            items.append(
-                {
-                    "headline": headline,
-                    "detail": detail,
-                    "source": source,
-                    "headline_lines": [_fit_line(line, regular, text_width) for line in wrap_pixels(headline, regular, text_width)],
-                    "detail_lines": [_fit_line(line, detail_font, text_width) for line in wrap_pixels(detail, detail_font, text_width)],
-                    "source_lines": [_fit_line(line, source_font, text_width) for line in wrap_pixels(source, source_font, text_width)],
-                    "source_url": _public_source_url(item.get("url")),
-                    "source_id": item.get("source_id"),
-                }
-            )
+            prepared_item = {
+                "headline": headline,
+                "detail": detail,
+                "source": source,
+                "headline_lines": [_fit_line(line, regular, text_width) for line in wrap_pixels(headline, regular, text_width)],
+                "detail_lines": [_fit_line(line, detail_font, text_width) for line in wrap_pixels(detail, detail_font, text_width)],
+                "source_lines": [_fit_line(line, source_font, text_width) for line in wrap_pixels(source, source_font, text_width)],
+                "source_url": _public_source_url(item.get("url")),
+                "source_id": item.get("source_id"),
+            }
+            if kind == "bot_updates":
+                prepared_item["initial"] = receipt_art.bot_initial(item)
+                prepared_item["avatar"] = receipt_art.load_avatar(
+                    settings.avatars_dir(),
+                    receipt_art.bot_slug(item),
+                )
+            items.append(prepared_item)
         prepared.append(
             {
                 "section": name,
                 "section_width": int(section_font.getlength(name) + 0.999),
+                "kind": kind,
+                "weather_icon": weather_icon,
                 "items": items,
             }
         )
@@ -336,11 +378,111 @@ def _shrink_prepared(prepared: list[dict]) -> bool:
     return False
 
 
+def _public_item(item: dict) -> dict:
+    return {
+        "headline": item["headline"],
+        "detail": item["detail"],
+        "source": item["source"],
+        "source_url": item["source_url"],
+        "source_id": item["source_id"],
+    }
+
+
+def _append_lines(
+    block: dict,
+    item_index: int,
+    fonts: dict,
+    grouped: tuple,
+    text_x: int,
+    baseline: int,
+    max_width: int,
+) -> tuple[int, int, int]:
+    count = 0
+    last = baseline
+    for kind, lines, line_height, gap in grouped:
+        baseline += gap
+        for line in lines:
+            width = min(max_width, int(fonts[kind].getlength(line) + 0.999))
+            block["lines"].append(
+                {
+                    "text": line,
+                    "x": text_x,
+                    "y": baseline,
+                    "width": width,
+                    "kind": kind,
+                    "item_index": item_index,
+                }
+            )
+            last = baseline
+            baseline += line_height
+            count += 1
+    return baseline, count, last
+
+
+def _place_bots(block: dict, section: dict, y: int, fonts: dict) -> tuple[int, int, int, int]:
+    """Avatar on the left, speech bubble on the right. Returns the y under the last bubble."""
+    bubble_x, bubble_w, text_width = _bubble_origin()
+    text_x = bubble_x + receipt_art.BUBBLE_PAD_X
+    y += 6
+    total_lines = 0
+    headline_chars = 0
+    printable_chars = 0
+    for item_index, item in enumerate(section["items"]):
+        if item_index:
+            y += 8
+        grouped = (
+            ("headline", item["headline_lines"], BODY_LINE_HEIGHT, BODY_FONT_SIZE),
+            ("detail", item["detail_lines"], DETAIL_LINE_HEIGHT, 4),
+        )
+        _baseline, count, last = _append_lines(
+            block, item_index, fonts, grouped, text_x, y + receipt_art.BUBBLE_PAD_Y, text_width
+        )
+        total_lines += count
+        bubble_h = max(receipt_art.AVATAR_PX, last + 8 - y + receipt_art.BUBBLE_PAD_Y)
+        if bubble_h <= receipt_art.AVATAR_PX + 4:
+            avatar_y = y + max(0, (bubble_h - receipt_art.AVATAR_PX) // 2)
+        else:
+            avatar_y = y
+        block["bubbles"].append(
+            {
+                "x": bubble_x,
+                "y": y,
+                "w": bubble_w,
+                "h": bubble_h,
+                "tip_y": avatar_y + receipt_art.AVATAR_PX // 2,
+            }
+        )
+        if item.get("avatar") is not None:
+            block["sprites"].append(
+                {
+                    "image": item["avatar"],
+                    "x": LEFT,
+                    "y": avatar_y,
+                    "mark": {"type": "avatar", "x": LEFT, "y": avatar_y, "size": receipt_art.AVATAR_PX},
+                }
+            )
+        else:
+            block["badges"].append(
+                {
+                    "cx": LEFT + receipt_art.AVATAR_PX // 2,
+                    "cy": avatar_y + receipt_art.AVATAR_PX // 2,
+                    "letter": item.get("initial") or "?",
+                    "x": LEFT,
+                    "y": avatar_y,
+                }
+            )
+        block["items"].append(_public_item(item))
+        headline_chars += len(item["headline"])
+        printable_chars += len(item["headline"]) + len(item["detail"]) + len(item["source"])
+        y += bubble_h
+    return y, total_lines, headline_chars, printable_chars
+
+
 def _place(prepared: list[dict]) -> tuple[list[dict], int, int, int, int]:
     regular = ImageFont.truetype(str(FONT_REGULAR), BODY_FONT_SIZE)
     detail_font = ImageFont.truetype(str(FONT_REGULAR), DETAIL_FONT_SIZE)
     source_font = ImageFont.truetype(str(FONT_BOLD), SOURCE_FONT_SIZE)
-    text_width = WIDTH_DOTS - LEFT - RIGHT - 16
+    fonts = {"headline": regular, "detail": detail_font, "source": source_font}
     y = 112
     blocks: list[dict] = []
     total_lines = 0
@@ -353,15 +495,44 @@ def _place(prepared: list[dict]) -> tuple[list[dict], int, int, int, int]:
             "section_width": section["section_width"],
             "lines": [],
             "items": [],
+            "bubbles": [],
+            "badges": [],
+            "sprites": [],
         }
         y += SECTION_BAR_HEIGHT
+        if section.get("kind") == "bot_updates":
+            y, added_lines, added_head, added_chars = _place_bots(block, section, y, fonts)
+            total_lines += added_lines
+            headline_chars += added_head
+            printable_chars += added_chars
+            y += 12
+            blocks.append(block)
+            continue
+        weather_icon = section.get("weather_icon") if section.get("kind") == "weather" else None
+        if weather_icon:
+            icon_y = y + 6
+            block["sprites"].append(
+                {
+                    "image": receipt_art.draw_weather_icon(weather_icon),
+                    "x": LEFT,
+                    "y": icon_y,
+                    "mark": {
+                        "type": "weather",
+                        "icon": weather_icon,
+                        "x": LEFT,
+                        "y": icon_y,
+                        "size": receipt_art.WEATHER_ICON_PX,
+                    },
+                }
+            )
+            text_x = LEFT + receipt_art.WEATHER_ICON_PX + receipt_art.WEATHER_GAP
+            text_width = _weather_text_width()
+        else:
+            icon_y = None
+            text_x = LEFT + 8
+            text_width = _standard_text_width()
         baseline = y
         for item_index, item in enumerate(section["items"]):
-            fonts = {
-                "headline": regular,
-                "detail": detail_font,
-                "source": source_font,
-            }
             grouped = (
                 ("headline", item["headline_lines"], BODY_LINE_HEIGHT, BODY_FONT_SIZE + 8),
                 ("detail", item["detail_lines"], DETAIL_LINE_HEIGHT, 2),
@@ -369,26 +540,13 @@ def _place(prepared: list[dict]) -> tuple[list[dict], int, int, int, int]:
             )
             if item_index:
                 baseline += 10
-            for kind, lines, line_height, gap in grouped:
-                baseline += gap
-                for line in lines:
-                    width = min(text_width, int(fonts[kind].getlength(line) + 0.999))
-                    block["lines"].append(
-                        {"text": line, "y": baseline, "width": width, "kind": kind, "item_index": item_index}
-                    )
-                    baseline += line_height
-                    total_lines += 1
-            block["items"].append(
-                {
-                    "headline": item["headline"],
-                    "detail": item["detail"],
-                    "source": item["source"],
-                    "source_url": item["source_url"],
-                    "source_id": item["source_id"],
-                }
-            )
+            baseline, count, _last = _append_lines(block, item_index, fonts, grouped, text_x, baseline, text_width)
+            total_lines += count
+            block["items"].append(_public_item(item))
             headline_chars += len(item["headline"])
             printable_chars += len(item["headline"]) + len(item["detail"]) + len(item["source"])
+        if icon_y is not None and baseline < icon_y + receipt_art.WEATHER_ICON_PX + 4:
+            baseline = icon_y + receipt_art.WEATHER_ICON_PX + 4
         y = baseline + 12
         blocks.append(block)
     footer_y = y + 24
@@ -430,6 +588,8 @@ def build_svg(payload: dict) -> tuple[str, dict]:
         f'<text x="{LEFT}" y="{TOP + TITLE_FONT_SIZE + 28}" font-family="DejaVu Sans Mono" font-size="{SUBTITLE_FONT_SIZE}">{html.escape(location)}</text>',
         f'<path d="M{LEFT} 96H{WIDTH_DOTS - RIGHT}" stroke="black" stroke-width="2"/>',
     ]
+    overlays: list[dict] = []
+    art: list[dict] = []
     for block in blocks:
         svg.append(
             f'<rect x="{LEFT}" y="{block["bar_y"]}" width="{WIDTH_DOTS - LEFT - RIGHT}" height="{SECTION_BAR_HEIGHT}" fill="white" stroke="black" stroke-width="2"/>'
@@ -437,11 +597,36 @@ def build_svg(payload: dict) -> tuple[str, dict]:
         svg.append(
             f'<text x="{LEFT + 8}" y="{block["bar_y"] + 22}" font-family="DejaVu Sans Mono" font-size="{SECTION_FONT_SIZE}" font-weight="bold" fill="black">{html.escape(block["section"])}</text>'
         )
+        for bubble in block["bubbles"]:
+            path = receipt_art.bubble_path(bubble["x"], bubble["y"], bubble["w"], bubble["h"], bubble["tip_y"])
+            svg.append(f'<path d="{path}" fill="white" stroke="black" stroke-width="3"/>')
+            art.append({"type": "bubble", "x": bubble["x"], "y": bubble["y"], "w": bubble["w"], "h": bubble["h"]})
+        for badge in block["badges"]:
+            radius = receipt_art.AVATAR_PX // 2 - 2
+            svg.append(
+                f'<circle cx="{badge["cx"]}" cy="{badge["cy"]}" r="{radius}" fill="white" stroke="black" stroke-width="3"/>'
+            )
+            svg.append(
+                f'<text x="{badge["cx"]}" y="{badge["cy"] + 11}" text-anchor="middle" '
+                f'font-family="DejaVu Sans Mono" font-size="32" font-weight="bold" fill="black">{html.escape(badge["letter"])}</text>'
+            )
+            art.append(
+                {
+                    "type": "fallback",
+                    "letter": badge["letter"],
+                    "x": badge["x"],
+                    "y": badge["y"],
+                    "size": receipt_art.AVATAR_PX,
+                }
+            )
+        for sprite in block["sprites"]:
+            overlays.append({"image": sprite["image"], "x": sprite["x"], "y": sprite["y"]})
+            art.append(sprite["mark"])
         for line in block["lines"]:
             size = {"headline": BODY_FONT_SIZE, "detail": DETAIL_FONT_SIZE, "source": SOURCE_FONT_SIZE}[line["kind"]]
             weight = "bold" if line["kind"] in {"headline", "source"} else "normal"
             svg.append(
-                f'<text x="{LEFT + 8}" y="{line["y"]}" font-family="DejaVu Sans Mono" font-size="{size}" font-weight="{weight}" fill="black">{html.escape(line["text"])}</text>'
+                f'<text x="{line["x"]}" y="{line["y"]}" font-family="DejaVu Sans Mono" font-size="{size}" font-weight="{weight}" fill="black">{html.escape(line["text"])}</text>'
             )
     svg.extend(
         [
@@ -471,6 +656,8 @@ def build_svg(payload: dict) -> tuple[str, dict]:
         "content_bottom_dots": last_content_y,
         "footer_y_dots": footer_y,
         "clipping": clipped,
+        "art": art,
+        "overlays": overlays,
         "sections": [
             {
                 "name": block["section"],
@@ -545,6 +732,7 @@ def render(source: Path, output_dir: Path) -> dict:
     validate_payload(payload)
     digest_id = payload["digest_id"]
     svg_text, geometry = build_svg(payload)
+    overlays = geometry.pop("overlays", [])
     output_dir.mkdir(parents=True, exist_ok=True)
     stem = f"daily-digest-{payload['digest_date']}-{digest_id[:12]}"
     svg_path = output_dir / f"{stem}.svg"
@@ -553,11 +741,14 @@ def render(source: Path, output_dir: Path) -> dict:
     metadata_path = output_dir / f"{stem}.json"
     svg_path.write_text(svg_text, encoding="utf-8")
     image = rasterize(svg_path, png_path, geometry["height_dots"])
+    if overlays:
+        image = receipt_art.paste_overlays(image, overlays)
+        image.save(png_path)
     dark = image.point(lambda value: 255 if value < 185 else 0)
     bbox = dark.getbbox()
     if not bbox or bbox[0] <= 0 or bbox[1] <= 0 or bbox[2] >= WIDTH_DOTS or bbox[3] >= geometry["height_dots"]:
         raise ValueError(f"raster content touches page edge: {bbox}")
-    black_pixels = sum(1 for value in image.getdata() if value < 185)
+    black_pixels = sum(image.histogram()[:185])
     black_ratio = black_pixels / (WIDTH_DOTS * geometry["height_dots"])
     if not 0.01 < black_ratio < 0.45:
         raise ValueError(f"unsafe raster black ratio: {black_ratio:.4f}")
@@ -571,7 +762,7 @@ def render(source: Path, output_dir: Path) -> dict:
         "source_sha256": hashlib.sha256(raw.encode("utf-8")).hexdigest(),
         "source_errors": payload.get("source_errors", []),
         "digest_id": digest_id,
-        "profile": "receipt-80mm-news-v6",
+        "profile": "receipt-80mm-news-v7",
         "geometry": geometry,
         "raster_black_bbox": list(bbox),
         "raster_black_ratio": round(black_ratio, 6),

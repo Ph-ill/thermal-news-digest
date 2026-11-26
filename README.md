@@ -14,10 +14,12 @@ Personal values stay in the environment. See `.env.example`. Do not commit names
 | `digest_settings.py` | Reads env settings: feeds, section order, titles, model, history, bot updates. |
 | `digest_picker.py` | Scores candidates, calls the model, validates JSON, and remembers recent URLs and titles. |
 | `receipt_digest.py` | Checks the section list, draws an SVG, rasterizes it, and packs a TSPL2 bitmap. |
+| `receipt_art.py` | Dithers bot avatars and draws the weather icons. |
 | `print_digest_safe.sh` | Holds `print.lock` with `flock`, builds the source file if today's is missing, then renders or submits. |
 | `receipt_digest_trigger.py` | Listens on `127.0.0.1` only. `POST /v1/digest/dry-run` or `POST /v1/digest/submit`. |
 | `digest-history.json` | URLs and normalized titles from recent editions. Gitignored. |
 | `bot-updates/YYYY-MM-DD.json` | Optional notes from household bots. Gitignored. Contract in [docs/bot-updates.md](docs/bot-updates.md). |
+| `avatars/` | Optional bot pictures, one file per slug. Gitignored. |
 | `picks/YYYY-MM-DD.json` | Optional picks and nearby shows from an external bot. Gitignored. Contract in [docs/picks.md](docs/picks.md). |
 
 Pillow wraps text and measures the bitmap. `rsvg-convert` (librsvg) turns the SVG into a PNG. DejaVu Sans Mono is the face on the strip. No other third-party Python packages are required.
@@ -28,7 +30,7 @@ Pillow wraps text and measures the bitmap. `rsvg-convert` (librsvg) turns the SV
 2. The trigger starts `print_digest_safe.sh --submit`. A second press while the lock is held gets HTTP 409.
 3. The shell script takes an exclusive non-blocking `flock` on `print.lock`.
 4. If `output/digest-source-YYYY-MM-DD.json` is missing, empty, or cannot be rendered, `digest_generator.py` builds it. The date is the calendar date in `DIGEST_TZ` (default `America/Chicago`), in both the shell and the generator. The generator stops fetching after about 75 seconds and prints whatever it already has, so the whole trigger stays inside 120 seconds. Weather, the news feeds, and the Ticketmaster artist lookups run together on daemon threads, with a hard stop around 35 seconds, so the model still has about 30 seconds plus the time to render. A thread still running at that wall is abandoned, not joined, and logged as timed out. A feed that was never requested is logged as not fetched. Neither is printed as "No new update today". At most two news.google.com calls run at once, and Ticketmaster stays around three. A 429 or a 5xx is retried once, with a short jitter, when the budget still has time. The TLS handshake uses the same deadline as the rest of the fetch.
-   - NOAA daytime forecast for the digest date (the overnight period is not used). The default point is the public city center of Bastrop, Texas.
+   - NOAA daytime forecast for the digest date (the overnight period is not used). The default point is the public city center of Bastrop, Texas. The short forecast picks a small line-art icon (sun, cloud, rain, storm, snow, fog, wind, and night variants).
    - Up to 16 candidates from each news feed. Stories older than about 36 hours are dropped when the section has anything newer.
    - Nearby shows, only when a Ticketmaster key and an artist file are set and a concert matches. See [docs/shows.md](docs/shows.md).
    - The bot-updates file, if it is valid and newer than about 30 hours.
@@ -47,13 +49,13 @@ Default section order:
 3. BASTROP
 4. SPACEX & EARTH FUNERAL
 5. NEARBY SHOWS, only when a concert matches
-6. BOT UPDATES, only when the day's file is valid
+6. GROK BOT UPDATES, only when the day's file is valid
 
-NEARBY SHOWS and BOT UPDATES are optional. The other sections are required unless `DIGEST_SECTION_ORDER` removes them. A missing required section, a section out of order, or the old MUSIC section is rejected before anything is sent to the printer. Events, UK, Film/TV, and the daily Music section were removed on purpose. Those notes belong in BOT UPDATES. The Bastrop header can be renamed with `DIGEST_SECTION_TITLE_LOCAL`.
+NEARBY SHOWS and GROK BOT UPDATES are optional. The other sections are required unless `DIGEST_SECTION_ORDER` removes them. A missing required section, a section out of order, or the old MUSIC section is rejected before anything is sent to the printer. Events, UK, Film/TV, and the daily Music section were removed on purpose. Those notes belong in GROK BOT UPDATES. The Bastrop header can be renamed with `DIGEST_SECTION_TITLE_LOCAL`.
 
 When either optional section is present, each news section prints one item and a shorter summary. When both are absent, each news section prints two items and a longer summary. If both companies have a real story, that section still prints one of each. Shows stay at most three. The strip still stops at 6000 dots (750 mm).
 
-The sample without bot updates includes one nearby show so that section is visible. A real run leaves it off when nothing matches. The sample with bot updates is the shorter layout.
+The sample without bot updates includes one nearby show so that section is visible. A real run leaves it off when nothing matches. The sample with bot updates is the shorter layout: one picture, one initial, and a speech bubble for each note. Two further samples show four notes, including one missing picture, under a sunny forecast and a night storm.
 
 BASTROP is for a childless couple in their early 30s: new openings, food trucks, bars, tastings, live music, markets, and outdoor plans in Bastrop, Smithville, Elgin, Cedar Creek, and east Austin. The model is the judge of what fits. A headline is dropped when its subject is an obituary, a crime, a council or government meeting or vote (including a bare "council votes"), the school board, or a sport (including golf and high school sports). Crime and obituaries are read in the summary too. A council mention that is only in the summary stays. The exemption is a known event phrase: a murder-mystery dinner, a soccer or sports bar, a football watch party, or a football watch. A photo shoot or a photo shooting is a studio phrase, not a crime. A shooting, arrest, killing, stabbing, crash death, or obituary stays out even when a bar or a brewery is named. "Killed" is a crime when a person is killed (a man, a woman, a person, two, or a number), when the line says "killed near", "killed after", or "killed in", or when it says fatal. "Killed by the storm", the rain, the weather, or the council is not a death, and neither is "Senate killed the bill". A death, including "dies at sea", is an obituary. A bar opening after a zoning change stays, because the opening is the subject. Home is Bastrop, Smithville, Elgin, Cedar Creek, McDade, Paige, Red Rock, Del Valle, and east Austin. A home town in the title keeps the item. A home town in the summary keeps it only when the summary places the event there ("in", "at", or "from" the town, including "opens in"), not when the owners also run a spot there, or the line only mentions regulars or a favorite of that town. Bee Cave, Lakeway, Westlake, Dripping Springs, and the other western suburbs, and the northern suburbs Round Rock, Pflugerville, Georgetown, Hutto, Taylor, Leander, and Cedar Park, are left out when that suburb is the title's location, unless the event is placed in a home town. Nearby shows still use the drive radius and do not use this list. With no model, BASTROP does not pick a story. That section prints a fixed line: Local picks unavailable today (AI offline). Town names and opening wording are not consulted. The Google News searches already name the towns. Community Impact and Eater Austin cover a wider area, so those items still have to name a town. Visit Bastrop's calendar did not offer a feed this client could read, and the Bastrop edition of Community Impact does not currently publish its own `/feed` URL, so those are not hardcoded.
 
@@ -64,6 +66,10 @@ Sample strips, rendered from fixture data:
 ![Receipt without bot updates](docs/samples/without-bot-updates.png)
 
 ![Receipt with bot updates](docs/samples/with-bot-updates.png)
+
+![Sunny receipt with four bot updates](docs/samples/receipt-sunny-four-bots.png)
+
+![Night storm receipt with four bot updates](docs/samples/receipt-night-storm-four-bots.png)
 
 ## Printer setup
 
@@ -134,6 +140,8 @@ Copy `.env.example` to `.env`. Empty values fall back to the defaults below. The
 | `DIGEST_BOT_UPDATES_MAX_AGE_HOURS` | `30` | Older bot files are ignored. |
 | `DIGEST_BOT_UPDATES_FUTURE_SKEW_MINUTES` | `120` | How far ahead `generated_at` may be. |
 | `DIGEST_BOT_UPDATES_MAX` | `4` | Maximum updates in one file (hard cap 6). |
+| `DIGEST_AVATARS_DIR` | `$DIGEST_HOME/avatars` | Square pictures for bot notes. Gitignored. See [docs/bot-updates.md](docs/bot-updates.md). |
+| `DIGEST_AVATAR_THRESHOLD` | unset | Optional 0–255 dither midpoint. Higher prints more black. |
 
 ## LLM setup
 
@@ -176,7 +184,7 @@ See [docs/picks.md](docs/picks.md). The short version: `python3 digest_generator
 
 ## Bot updates
 
-See [docs/bot-updates.md](docs/bot-updates.md) for the file name, the JSON schema, the staleness rules, and the receipt layout. The short version: an external process writes `bot-updates/YYYY-MM-DD.json` before 05:00. A bad or stale file is ignored. A good file becomes the BOT UPDATES section, and each news section drops from two items to one so the notes fit under the length cap. Film, television, and music notes belong in that file. Nearby concerts are [docs/shows.md](docs/shows.md), not a bot note.
+See [docs/bot-updates.md](docs/bot-updates.md) for the file name, the JSON schema, the staleness rules, and the receipt layout. The short version: an external process writes `bot-updates/YYYY-MM-DD.json` before 05:00. A bad or stale file is ignored. A good file becomes the GROK BOT UPDATES section, and each news section drops from two items to one so the notes fit under the length cap. Each note is that bot's picture (or a circle with its initial) beside a speech bubble. The bubble text is first person. Film, television, and music notes belong in that file. Nearby concerts are [docs/shows.md](docs/shows.md), not a bot note. The heading can still be renamed with `DIGEST_SECTION_TITLE_BOT_UPDATES`.
 
 ## Deploy
 
@@ -208,5 +216,5 @@ The tests cover the fallback picker, the interests profile, the 36 hour freshnes
 Regenerate the sample PNGs from the fixture payloads:
 
 ```bash
-python3 -c 'from pathlib import Path; import test_receipt_digest as t; t.write_sample_pngs(Path("docs/samples"))'
+python3 -c 'from pathlib import Path; import test_receipt_digest as t; t.write_sample_pngs(Path("docs/samples")); t.write_showcase_pngs(Path("docs/samples"))'
 ```

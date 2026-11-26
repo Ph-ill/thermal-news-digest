@@ -88,7 +88,7 @@ class HostileFileTests(unittest.TestCase):
                 budget_seconds=5,
             )
             self.assertTrue(payload["sections"])
-            self.assertNotIn("BOT UPDATES", [section["section"] for section in payload["sections"]])
+            self.assertNotIn("GROK BOT UPDATES", [section["section"] for section in payload["sections"]])
             self.assertNotIn(str(outside), json.dumps(payload))
             document = bot_document(
                 updates=[
@@ -112,7 +112,10 @@ class HostileFileTests(unittest.TestCase):
             before = path.read_bytes()
             loaded, error = dp.load_history(path)
             self.assertEqual(loaded, [])
-            self.assertIn("unreadable", error)
+            # A deeply nested file is refused. Python 3.12 raises while parsing
+            # and reports it unreadable. Python 3.14 parses it and reports the
+            # shape invalid. Either way the history is empty and the file stays.
+            self.assertTrue(error)
             saved = dp.save_history(
                 path,
                 "2026-11-26",
@@ -579,7 +582,7 @@ class LayoutFailureTests(unittest.TestCase):
                     item["summary"] = "From example.com, 26 Nov 2026."
         value["sections"].append(
             {
-                "section": "BOT UPDATES",
+                "section": "GROK BOT UPDATES",
                 "source_feed": "bot-updates",
                 "items": [
                     {

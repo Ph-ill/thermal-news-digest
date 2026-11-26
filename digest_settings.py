@@ -30,7 +30,7 @@ DEFAULT_TITLES = {
     "local": "BASTROP",
     "companies": "SPACEX & EARTH FUNERAL",
     "shows": "NEARBY SHOWS",
-    "bot_updates": "BOT UPDATES",
+    "bot_updates": "GROK BOT UPDATES",
 }
 
 TITLE_ENV = {
@@ -420,6 +420,27 @@ def bot_updates_dir() -> Path:
     if raw:
         return Path(raw)
     return project_dir() / "bot-updates"
+
+
+def avatars_dir() -> Path:
+    raw = os.environ.get("DIGEST_AVATARS_DIR", "").strip()
+    if raw:
+        return Path(raw)
+    return project_dir() / "avatars"
+
+
+def avatar_threshold() -> int | None:
+    """Optional 0–255 dither midpoint. Unset keeps the contrast-boosted default."""
+    raw = os.environ.get("DIGEST_AVATAR_THRESHOLD", "").strip()
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        return None
+    if 0 <= value <= 255:
+        return value
+    return None
 
 
 def bot_max_age_hours() -> int:

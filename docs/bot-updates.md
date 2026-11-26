@@ -1,6 +1,6 @@
 # Bot updates
 
-An external process, not this repository, can leave a JSON file for the morning receipt. The generator reads it while building the day's source file. When the file is valid and fresh, the receipt gains a **BOT UPDATES** section. When the file is missing, empty, stale, or invalid, that section is left out and the news sections use the extra room.
+An external process, not this repository, can leave a JSON file for the morning receipt. The generator reads it while building the day's source file. When the file is valid and fresh, the receipt gains a **GROK BOT UPDATES** section. When the file is missing, empty, stale, or invalid, that section is left out and the news sections use the extra room.
 
 Film, television, and music notes belong here. Those daily sections were removed on purpose. NEARBY SHOWS is a separate optional section for concerts from the artist file, not a place for these notes.
 
@@ -25,17 +25,18 @@ The document is one JSON object with exactly these two keys.
 | `generated_at` | string | ISO-8601 timestamp **with a timezone**, for example `2026-11-26T04:40:00-06:00`. `Z` is accepted. A naive timestamp is rejected. |
 | `updates` | array | Zero to `DIGEST_BOT_UPDATES_MAX` objects (default 4, hard cap 6). An empty array is valid and simply prints no section. |
 
-Each update object uses exactly these keys. `url` is optional.
+Each update object uses these keys. `url` and `avatar` are optional. A file that omits `avatar` is still valid.
 
 | Field | Type | Rule |
 | --- | --- | --- |
-| `bot` | string | 1–40 characters. Printed as the source line. |
+| `bot` | string | 1–40 characters. Printed in the bubble heading and used as the source line. |
 | `topic` | string | 1–48 characters. |
-| `text` | string | 8–360 characters, one line. This is the receipt summary. |
+| `text` | string | 8–360 characters, one line, written in first person by the bot. This is the receipt summary inside the speech bubble. |
 | `for` | string | `both`, or one id from `DIGEST_READER_IDS`. |
 | `url` | string | Optional. If present, it must be an `https://` URL with no spaces, at most 300 characters. |
+| `avatar` | string | Optional slug, 1–40 characters: a lowercase letter or digit, then lowercase letters, digits, or hyphens. Names the picture file. When omitted, the slug is the bot name (`Popcorn` becomes `popcorn`). |
 
-`bot`, `topic`, and `text` are plain text: no HTML, no newlines, no other control characters. Unknown keys at either level are rejected. The whole file is ignored when any update is invalid. The generator does not keep the valid ones and drop the rest.
+`bot`, `topic`, and `text` are plain text: no HTML, no newlines, no other control characters. Unknown keys at either level are rejected. The whole file is ignored when any update is invalid. The generator does not keep the valid ones and drop the rest. A bad or missing picture does not reject the file; the note still prints.
 
 `DIGEST_READER_IDS` defaults to `reader-a,reader-b`. A private deployment sets it to its own ids (lowercase letters, digits, and hyphens). Those ids are how a note is marked for one reader. `both` means the note is for the shared receipt without a reader tag.
 
@@ -48,20 +49,33 @@ Each update object uses exactly these keys. `url` is optional.
     {
       "bot": "Popcorn",
       "topic": "Film picks",
-      "text": "A quiet anime about a night courier opens Friday. The review is the one worth making time for.",
-      "for": "both"
+      "text": "I found a quiet anime about a night courier. It opens Friday, and I think the review is the one worth your time.",
+      "for": "both",
+      "avatar": "popcorn"
     },
     {
       "bot": "Listener",
       "topic": "Morning queue",
-      "text": "Three new songs from the usual corner of the shelf, none of them loud.",
+      "text": "I queued three new songs from the usual corner of the shelf. None of them are loud.",
       "for": "reader-a"
     }
   ]
 }
 ```
 
-With the default reader ids, the second note is headed `Listener: Morning queue (reader-a)`. A `both` note is headed `Popcorn: Film picks`. The source line is the bot name.
+With the default reader ids, the second note is headed `Listener: Morning queue (reader-a)`. A `both` note is headed `Popcorn: Film picks`. The source line is the bot name. `text` is what the bot would say out loud, so write it in first person.
+
+## Pictures
+
+Each note is printed as a square picture on the left and a speech bubble on the right. The bubble's tail points at the picture. The heading and the first-person text sit inside the bubble and wrap to the bubble width.
+
+Pictures live in `DIGEST_AVATARS_DIR` (default `avatars/` inside the project directory). That directory is gitignored. The file name is the slug plus `.png`, `.jpg`, `.jpeg`, or `.webp`, for example `avatars/popcorn.png`. The loader tries those extensions in that order and uses the first one that decodes.
+
+A picture has to be a regular file. Symlinks are ignored. The file must be at most 512 KiB, and Pillow must decode it as at most one megapixel. Anything else — missing, truncated, too big, or not an image — is skipped. The note then uses a drawn circle with the bot's initial.
+
+Before printing, the picture is cropped to a square, contrast-boosted, and dithered to 1-bit with Floyd-Steinberg so the thermal head can hold a face. `DIGEST_AVATAR_THRESHOLD` (0–255) is optional. Set it to slide the dither midpoint; a higher value prints more black. Leave it unset for the default midpoint after the contrast boost.
+
+The section heading is `GROK BOT UPDATES` unless `DIGEST_SECTION_TITLE_BOT_UPDATES` sets another title. `DIGEST_BOT_UPDATES_DIR` and the `YYYY-MM-DD.json` file name are unchanged. `avatar` is optional, so an older file that does not have it still loads.
 
 ## Freshness
 
@@ -77,7 +91,7 @@ With the default reader ids, the second note is headed `Listener: Morning queue 
 | File | Result |
 | --- | --- |
 | Missing, or `updates` is `[]` | No bot section. No error. |
-| Valid and fresh | `BOT UPDATES` is printed in its place in the section order (last, unless `DIGEST_SECTION_ORDER` moves it). |
+| Valid and fresh | `GROK BOT UPDATES` is printed in its place in the section order (last, unless `DIGEST_SECTION_ORDER` moves it). |
 | Stale, invalid, unreadable, or too large | No bot section. The source file records a short error that does not quote the file body. |
 
 News sections print `DIGEST_ITEMS_WITH_BOTS` items when the bot section is present (default 1) and `DIGEST_ITEMS_WITHOUT_BOTS` items when it is not (default 2). Summary length follows the same split, so a morning with no bot file gives the other sections the space. The receipt height cap still applies.
