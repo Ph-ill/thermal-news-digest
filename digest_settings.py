@@ -237,6 +237,9 @@ def news_feed(section_id: str) -> tuple[str, tuple[str, ...]]:
     if section_id == "global":
         return env_or("DIGEST_GLOBAL_FEED", DEFAULT_GLOBAL_FEED), ()
     if section_id == "local":
+        explicit = os.environ.get("DIGEST_LOCAL_FEED", "").strip()
+        if explicit:
+            return explicit, ()
         return google_news(env_or("DIGEST_LOCAL_NEWS_QUERY", "Springfield")), ()
     if section_id == "markets":
         explicit = os.environ.get("DIGEST_MARKETS_FEED", "").strip()

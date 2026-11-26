@@ -51,11 +51,14 @@ SECRET = "sk-test-secret-value"
 class FakeResponse:
     def __init__(self, data: bytes):
         self._data = data
+        self._offset = 0
 
     def read(self, limit=-1):
         if limit is None or limit < 0:
-            return self._data
-        return self._data[:limit]
+            limit = len(self._data) - self._offset
+        chunk = self._data[self._offset : self._offset + limit]
+        self._offset += len(chunk)
+        return chunk
 
     def __enter__(self):
         return self
@@ -117,6 +120,11 @@ class PickerTests(unittest.TestCase):
         self.assertTrue(dp.is_spam("ASTS stock last chance to buy before the bell"))
         self.assertFalse(dp.is_spam("last chance to see the eclipse from the river"))
         self.assertFalse(dp.is_obituary(candidates[4]["title"]))
+        self.assertTrue(dp.is_obituary("Mayor dies in a crash"))
+        self.assertTrue(dp.is_obituary("Death of a long-serving clerk shocks the town"))
+        self.assertTrue(dp.is_obituary("Driver killed in a downtown collision"))
+        self.assertTrue(dp.is_spam("Stocks I'm buying this week"))
+        self.assertTrue(dp.is_spam("Stocks to watch before the open"))
 
     def test_film_terms_are_preferred_but_no_longer_required(self):
         seen = dp.Seen([], "2026-11-26")

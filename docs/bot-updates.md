@@ -70,6 +70,7 @@ With the default reader ids, the second note is headed `Listener: Morning queue 
 - Older than `DIGEST_BOT_UPDATES_MAX_AGE_HOURS` (default 30) is stale.
 - More than `DIGEST_BOT_UPDATES_FUTURE_SKEW_MINUTES` ahead (default 120) is rejected.
 - The file must be UTF-8 JSON and at most 64 KiB.
+- The loader opens the date file with `O_NOFOLLOW` and reads at most 64 KiB + 1 from that descriptor. A symlink, a non-UTF-8 file, a nested document that will not parse, or anything over the cap is ignored. The size is enforced on the read, not on a separate `stat`.
 
 ## What the receipt does
 

@@ -26,16 +26,16 @@ Pillow wraps text and measures the bitmap. `rsvg-convert` (librsvg) turns the SV
 1. At 05:00 Home Assistant posts to `http://127.0.0.1:8793/v1/digest/submit` with an empty body.
 2. The trigger starts `print_digest_safe.sh --submit`. A second press while the lock is held gets HTTP 409.
 3. The shell script takes an exclusive non-blocking `flock` on `print.lock`.
-4. If `output/digest-source-YYYY-MM-DD.json` is missing or empty, `digest_generator.py` builds it. The date is the host's local calendar date, so the host timezone should match `DIGEST_TZ`.
+4. If `output/digest-source-YYYY-MM-DD.json` is missing, empty, or cannot be rendered, `digest_generator.py` builds it. The date is the calendar date in `DIGEST_TZ` (default `America/Chicago`), in both the shell and the generator. The generator stops fetching after about 75 seconds and prints whatever it already has, so the whole trigger stays inside 120 seconds.
    - NOAA daytime forecast for the digest date (the overnight period is not used).
    - Up to 16 candidates from each news feed.
    - Verified events from the neighborhood calendar, then the chamber calendar.
    - The bot-updates file, if it is valid and newer than about 30 hours.
    - One chat-completions call to pick and summarize the news. Any failure uses the fallback picker.
    - Recent URLs and titles are skipped, then today's picks are appended to `digest-history.json`.
-5. `receipt_digest.py` checks the section order, draws a strip whose height follows the text, and refuses a bitmap that touches the edge, is too tall, or is almost blank or almost solid.
-6. `--submit` sends the `.tspl` file with `lp -d "$DIGEST_PRINTER_QUEUE" -o raw`. The job id is stored in `state.json`. The same digest id is not submitted twice.
-7. Later presses the same day reuse the source file, so a changing feed cannot sneak a second edition past the duplicate check.
+5. `receipt_digest.py` checks the section order and draws a strip whose height follows the text, up to 6000 dots. Past that, lines are shortened until the strip fits. Characters XML cannot carry are removed, so a damaged source file can still print. A bitmap that touches the edge, or is almost blank or almost solid, is still refused.
+6. `--submit` sends the `.tspl` file with `lp -d "$DIGEST_PRINTER_QUEUE" -o raw`. The job id is stored in `state.json`. A `completed` or still-`submitted` job is not sent again. A `failed` job is sent on the next `--submit`.
+7. Later presses the same day reuse the source file, so the model is not called again. `--reprint` (or `POST /v1/digest/reprint`) prints another physical copy of that same file. The trigger returns a status code and the renderer's JSON. It does not return stderr. If the trigger's 120 seconds run out, it kills the whole process group so `print.lock` is not left held.
 
 `--dry-run` renders the files and does not call `lp`.
 
@@ -90,10 +90,12 @@ Copy `.env.example` to `.env`. Empty values fall back to the defaults below. The
 | `DIGEST_HOME` | script directory | Where `output/`, `state.json`, and the history file live. |
 | `DIGEST_PRINTER_QUEUE` | `receipt` | CUPS raw queue. |
 | `DIGEST_TRIGGER_PORT` | `8793` | Loopback port. |
-| `DIGEST_TZ` | `America/Chicago` | Local time for events and the forecast date. |
+| `DIGEST_TZ` | `America/Chicago` | Edition date, event times, and the forecast date. The host zone can differ. |
 | `DIGEST_LOCATION_LABEL` | `near Springfield` | Line under the title. |
 | `DIGEST_WEATHER_LAT`, `DIGEST_WEATHER_LON` | Springfield, Illinois | NOAA point. |
 | `DIGEST_LOCAL_NEWS_QUERY` | `Springfield` | Google News query for the local section. |
+| `DIGEST_LOCAL_FEED` | unset | Full local feed URL. When set, the local query is not used. |
+| `DIGEST_WEATHER_POINT` | NOAA point for the lat/lon | Override the forecast point URL. |
 | `DIGEST_LOCAL_CITY` | `Springfield` | City name used when filtering chamber events. |
 | `DIGEST_NEIGHBORHOOD_EVENTS_URL` | example neighborhood calendar | Primary events page. |
 | `DIGEST_NEIGHBORHOOD_NAME` | `Neighborhood` | Label for events that match the markers. |
@@ -112,7 +114,7 @@ Copy `.env.example` to `.env`. Empty values fall back to the defaults below. The
 | `DIGEST_LLM_BASE_URL` | `https://api.x.ai/v1` | Chat-completions origin, without `/chat/completions`. |
 | `DIGEST_LLM_API_KEY` | empty | Bearer token. Empty means fallback picker only. |
 | `DIGEST_LLM_MODEL` | `grok-4.7` | Model id. Change this when the provider renames the model. |
-| `DIGEST_LLM_TIMEOUT` | `45` | Seconds, clamped to 5–90. |
+| `DIGEST_LLM_TIMEOUT` | `45` | Seconds for one chat call, clamped to 5–90, and also cut to the time left in the 75s generator budget. A HTTP 400 retry uses that same budget. |
 | `DIGEST_LLM_REASONING_EFFORT` | `low` | `low`, `medium`, `high`, `xhigh`, or `off`. |
 | `DIGEST_CANDIDATES_PER_SECTION` | `16` | Newest feed items considered, clamped to 10–20. |
 | `DIGEST_ITEMS_WITH_BOTS` | `1` | News items per section when bot updates are printed. |
@@ -152,7 +154,7 @@ These failures all fall back to the deterministic picker, and the source file re
 
 The fallback keeps the newest remaining items. It prefers the film terms when the film feed has them, and it still fills the section from the rest of that feed so a quiet keyword list does not leave film blank. A summary that only repeats the headline plus the outlet is replaced with `From {outlet}, {date}.` Google News titles that end in ` - Outlet` use the outlet as the source line instead of `news.google.com`.
 
-The API key is sent only as an `Authorization` header. It is not written into the digest, the history file, or the error strings.
+The API key is sent only as an `Authorization` header. It is not written into the digest, the history file, or the error strings. Stored URLs have any username or password removed. The taste note is sent to the model and is not copied into the source file. Picker failures are stored as a short code.
 
 ## Bot updates
 
@@ -183,7 +185,7 @@ python3 -m unittest discover -v
 
 GitHub Actions runs the same command on `ubuntu-latest` after installing `librsvg2-bin`, `fonts-dejavu-core`, and Pillow (`.github/workflows/test.yml`).
 
-The tests cover the fallback picker, mocked chat-completions responses (including bad JSON and a timeout), the daytime weather choice, cross-day de-dupe, bot-file parsing, and the layout with and without the bot section. They do not call the network.
+The tests cover the fallback picker, mocked chat-completions responses (including bad JSON, a timeout, and a dropped socket), the daytime weather choice (including a split day and the digest timezone), cross-day de-dupe, bot-file parsing (including a bad encoding, a symlink, and an oversized file), layout with and without the bot section, and `print_digest_safe.sh` with fake `lp`, `lpstat`, and a local HTTP server. They do not call the public network.
 
 Regenerate the sample PNGs from the fixture payloads:
 

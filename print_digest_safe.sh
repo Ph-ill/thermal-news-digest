@@ -2,7 +2,12 @@
 # Fixed-input daily news-and-local-events receipt printer bridge.
 set -Eeuo pipefail
 IFS=$'\n\t'
-PATH='/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+# Production keeps a fixed PATH. Tests set DIGEST_TOOL_PATH to fake lp and lpstat.
+if [[ -n "${DIGEST_TOOL_PATH:-}" ]]; then
+  PATH="$DIGEST_TOOL_PATH"
+else
+  PATH='/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+fi
 export PATH
 
 ROOT="${DIGEST_HOME:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)}"
@@ -10,18 +15,21 @@ readonly ROOT
 readonly GENERATOR="$ROOT/digest_generator.py"
 readonly RENDERER="$ROOT/receipt_digest.py"
 readonly OUTPUT_DIR="$ROOT/output"
-readonly SOURCE="$OUTPUT_DIR/digest-source-$(date +%F).json"
+# The edition date follows DIGEST_TZ, matching the generator, not the host zone.
+DIGEST_DATE="$(TZ="${DIGEST_TZ:-America/Chicago}" date +%F)"
+readonly DIGEST_DATE
+readonly SOURCE="$OUTPUT_DIR/digest-source-${DIGEST_DATE}.json"
 readonly STATE="$ROOT/state.json"
 readonly QUEUE="${DIGEST_PRINTER_QUEUE:-receipt}"
 readonly LOCK="$ROOT/print.lock"
 
 usage() {
-  printf 'Usage: %s --dry-run|--submit\n' "$(basename "$0")" >&2
+  printf 'Usage: %s --dry-run|--submit|--reprint\n' "$(basename "$0")" >&2
 }
 
 [[ $# -eq 1 ]] || { usage; exit 2; }
 case "$1" in
-  --dry-run|--submit) readonly MODE="$1" ;;
+  --dry-run|--submit|--reprint) readonly MODE="$1" ;;
   *) usage; exit 2 ;;
 esac
 
@@ -35,12 +43,35 @@ command -v lpstat >/dev/null
 lpstat -p "$QUEUE" >/dev/null
 mkdir -p "$OUTPUT_DIR"
 
+# The child python must not take print.lock again; this flock already holds it.
+export DIGEST_LOCK_HELD=1
 exec flock --exclusive --nonblock "$LOCK" bash -c '
   set -Eeuo pipefail
-  # Freeze one atomic source edition per local date. Repeated button presses
-  # reuse that edition so changing live feeds cannot bypass duplicate protection.
-  if [[ ! -s "$2" ]]; then
-    python3 "$1" --out "$2" >&2
+  export DIGEST_LOCK_HELD=1
+  generator=$1
+  source_path=$2
+  renderer=$3
+  mode=$4
+  output_dir=$5
+  state_path=$6
+  queue=$7
+  generate() {
+    python3 "$generator" --out "$source_path" >&2
+  }
+  # Renderer exit 2 means the source cannot be printed. Anything else is kept.
+  render() {
+    python3 "$renderer" "$mode" --source "$source_path" --output-dir "$output_dir" --state "$state_path" --queue "$queue"
+  }
+  if [[ ! -s "$source_path" ]]; then
+    generate
   fi
-  exec python3 "$3" "$4" --source "$2" --output-dir "$5" --state "$6" --queue "$7"
+  status=0
+  render || status=$?
+  if [[ "$status" -eq 2 ]]; then
+    rm -f -- "$source_path"
+    generate
+    status=0
+    render || status=$?
+  fi
+  exit "$status"
 ' receipt-digest "$GENERATOR" "$SOURCE" "$RENDERER" "$MODE" "$OUTPUT_DIR" "$STATE" "$QUEUE"

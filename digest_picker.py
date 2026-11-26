@@ -6,13 +6,18 @@ must still run when the key is missing, the request times out, or the JSON is ba
 
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
 from email.utils import parsedate_to_datetime
+import errno
+import fcntl
 import json
 import os
 from pathlib import Path
 import re
+import stat
 import tempfile
+import time
 import unicodedata
 import urllib.error
 import urllib.parse
@@ -35,13 +40,22 @@ _OBITUARY = re.compile(
     r"celebration of life)\b|\b(?:dies|died|dead) at \d",
     re.IGNORECASE,
 )
+_DEATH = re.compile(r"\b(?:dies|died|killed)\b|\bdeath of\b", re.IGNORECASE)
+_DIES_AT_SEA = re.compile(r"\bdies at sea\b", re.IGNORECASE)
 _SPAM = re.compile(
     r"last chance to buy|stock alert|penny stocks?|stocks? to buy|shares? to buy|"
     r"buy alert|hot stock tip|buy now|act now|limited[- ]time|you won'?t believe|"
     r"you wont believe|shocking|click here|sponsored content|advertorial|promo code|"
-    r"\d+% off|before it'?s too late|don'?t miss this",
+    r"\d+% off|before it'?s too late|don'?t miss this|"
+    r"stocks?\s+i['’]?m\s+buying|what\s+i['’]?m\s+buying|stocks?\s+to\s+watch|"
+    r"hot\s+tips?|investing\s+alerts?|price\s+targets?|undervalued\s+stocks?|buy\s+the\s+dip",
     re.IGNORECASE,
 )
+HISTORY_MAX_BYTES = 65536
+HISTORY_URL_MAX = 500
+HISTORY_TITLE_MAX = 240
+BOT_MAX_BYTES = 65536
+RESPONSE_MAX_BYTES = 1_000_000
 _LAST_CHANCE = re.compile(r"last chance", re.IGNORECASE)
 _INVESTING_WORD = re.compile(r"\b(?:stock|stocks|shares|invest|investing)\b", re.IGNORECASE)
 _MARKDOWN = re.compile(r"[`#*_]|\[(.*?)\]\(.*?\)")
@@ -60,16 +74,163 @@ class BotUpdatesError(Exception):
         self.code = code
 
 
+def xml_text(value: str) -> str:
+    """Drop characters XML 1.0 cannot carry, so a title cannot break the SVG."""
+    kept: list[str] = []
+    for char in value or "":
+        code = ord(char)
+        if code in (0x9, 0xA, 0xD) or 0x20 <= code <= 0xD7FF or 0xE000 <= code <= 0xFFFD or 0x10000 <= code <= 0x10FFFF:
+            kept.append(char)
+    return "".join(kept)
+
+
 def fold(text: str) -> str:
-    value = unicodedata.normalize("NFKC", text or "")
+    value = unicodedata.normalize("NFKC", xml_text(text or ""))
     value = value.replace("\u2019", "'").replace("\u2018", "'")
     value = value.casefold()
     return re.sub(r"\s+", " ", value).strip()
 
 
 def clean_spaces(text: str) -> str:
-    value = unicodedata.normalize("NFKC", text or "")
+    value = unicodedata.normalize("NFKC", xml_text(text or ""))
     return re.sub(r"\s+", " ", value).strip()
+
+
+def strip_userinfo(url: str) -> str:
+    """Return a URL with any username or password removed."""
+    raw = (url or "").strip()
+    try:
+        parts = urllib.parse.urlsplit(raw)
+    except ValueError:
+        return raw
+    if not parts.scheme or not parts.hostname:
+        return raw
+    host = parts.hostname
+    if ":" in host:
+        host = f"[{host}]"
+    netloc = host
+    if parts.port:
+        netloc = f"{host}:{parts.port}"
+    return urllib.parse.urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
+
+
+class _ChunkDecoder:
+    """Turn one chunked HTTP body into payload bytes, one socket read at a time."""
+
+    def __init__(self) -> None:
+        self.buf = b""
+        self.need: int | None = None
+        self.done = False
+
+    def feed(self, data: bytes) -> bytes:
+        self.buf += data
+        pieces: list[bytes] = []
+        while not self.done:
+            if self.need is None:
+                newline = self.buf.find(b"\n")
+                if newline < 0:
+                    break
+                line = self.buf[:newline].strip()
+                self.buf = self.buf[newline + 1 :]
+                size_text = line.split(b";", 1)[0]
+                try:
+                    size = int(size_text or b"0", 16)
+                except ValueError:
+                    self.done = True
+                    break
+                if size == 0:
+                    self.done = True
+                    break
+                self.need = size
+            if len(self.buf) < self.need:
+                break
+            pieces.append(self.buf[: self.need])
+            self.buf = self.buf[self.need :]
+            if self.buf.startswith(b"\r\n"):
+                self.buf = self.buf[2:]
+            elif self.buf.startswith(b"\n"):
+                self.buf = self.buf[1:]
+            self.need = None
+        return b"".join(pieces)
+
+
+def _read_some(response, size: int) -> bytes:
+    """One socket read. BufferedReader.read(n) would keep going until n bytes arrived."""
+    fp = getattr(response, "fp", None)
+    if fp is not None and hasattr(fp, "read1"):
+        data = fp.read1(size)
+    else:
+        data = response.read(size)
+    if isinstance(data, str):
+        data = data.encode("utf-8", errors="replace")
+    return data or b""
+
+
+def read_bounded(response, limit: int, deadline: float | None) -> bytes:
+    """Read at most ``limit`` bytes, and stop when ``deadline`` (monotonic) passes.
+
+    Each step is a single socket read. A sender that trickles a few bytes just
+    inside the socket timeout cannot stretch the read past the deadline.
+    """
+    sock = _response_socket(response)
+    chunked = getattr(response, "chunked", False) is True
+    remaining_length = None if chunked else getattr(response, "length", None)
+    decoder = _ChunkDecoder() if chunked else None
+    chunks: list[bytes] = []
+    total = 0
+    while total < limit:
+        if deadline is not None:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise TimeoutError("budget")
+            if sock is not None:
+                try:
+                    sock.settimeout(max(0.05, min(1.0, left)))
+                except OSError:
+                    pass
+        want = min(8192, limit - total)
+        if isinstance(remaining_length, int):
+            if remaining_length <= 0:
+                break
+            want = min(want, remaining_length)
+        try:
+            raw = _read_some(response, want)
+        except TimeoutError:
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError("budget")
+            continue
+        if not raw:
+            break
+        if decoder is None:
+            piece = raw
+            if isinstance(remaining_length, int):
+                remaining_length -= len(raw)
+        else:
+            piece = decoder.feed(raw)
+        if piece:
+            chunks.append(piece)
+            total += len(piece)
+        if decoder is not None and decoder.done:
+            break
+    return b"".join(chunks)
+
+
+def _response_socket(response):
+    seen: list[object] = []
+    current = response
+    for _ in range(4):
+        if current is None or current in seen:
+            break
+        seen.append(current)
+        for attr in ("_sock", "sock"):
+            sock = getattr(current, attr, None)
+            if sock is not None and hasattr(sock, "settimeout"):
+                return sock
+        nxt = getattr(current, "raw", None)
+        if nxt is None:
+            nxt = getattr(current, "fp", None)
+        current = nxt
+    return None
 
 
 def host_of(url: str) -> str:
@@ -118,7 +279,14 @@ def title_key(title: str) -> str | None:
 
 
 def is_obituary(text: str) -> bool:
-    return bool(_OBITUARY.search(text or ""))
+    value = text or ""
+    if _OBITUARY.search(value):
+        return True
+    if not _DEATH.search(value):
+        return False
+    # "dies at sea" is a wreck headline, not a death notice. Any other death word still drops it.
+    remainder = _DIES_AT_SEA.sub(" ", value)
+    return bool(_DEATH.search(remainder))
 
 
 def is_spam(text: str) -> bool:
@@ -337,7 +505,7 @@ def _public_item(item: dict) -> dict:
     published = {
         "title": item["title"],
         "summary": item["summary"],
-        "url": item["url"],
+        "url": strip_userinfo(item["url"]),
         "published_at": item.get("published_at"),
         "rationale": item.get("rationale") or "Selected for this section.",
     }
@@ -351,8 +519,8 @@ def _history_record(section_id: str, digest_date: str, item: dict) -> dict:
     return {
         "digest_date": digest_date,
         "section": section_id,
-        "url": normalize_url(item["url"]),
-        "title": normalize_title(item["title"]),
+        "url": normalize_url(item["url"])[:HISTORY_URL_MAX],
+        "title": normalize_title(item["title"])[:HISTORY_TITLE_MAX],
     }
 
 
@@ -533,7 +701,16 @@ def _message_text(payload: dict) -> str:
     raise LLMError("empty_content")
 
 
-def _post_chat(url: str, key: str, body: dict, opener, timeout: float) -> str:
+def _call_timeout(deadline: float | None, cap: float) -> float:
+    if deadline is None:
+        return cap
+    left = deadline - time.monotonic()
+    if left < 0.5:
+        raise LLMError("timeout")
+    return min(cap, left)
+
+
+def _post_chat(url: str, key: str, body: dict, opener, timeout: float, deadline: float | None) -> str:
     request = urllib.request.Request(
         url,
         data=json.dumps(body).encode("utf-8"),
@@ -546,18 +723,22 @@ def _post_chat(url: str, key: str, body: dict, opener, timeout: float) -> str:
     )
     try:
         with opener(request, timeout=timeout) as response:
-            raw = response.read(1_000_000)
+            raw = read_bounded(response, RESPONSE_MAX_BYTES, deadline)
+    except LLMError:
+        raise
     except TimeoutError as exc:
         raise LLMError("timeout") from exc
     except urllib.error.HTTPError as exc:
         raise LLMError(f"http_{exc.code}") from exc
     except urllib.error.URLError as exc:
-        if isinstance(exc.reason, TimeoutError):
+        if isinstance(getattr(exc, "reason", None), TimeoutError):
             raise LLMError("timeout") from exc
+        raise LLMError("network") from exc
+    except Exception as exc:
         raise LLMError("network") from exc
     try:
         payload = json.loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+    except Exception as exc:
         raise LLMError("bad_json") from exc
     return _message_text(payload)
 
@@ -569,6 +750,7 @@ def llm_pick(
     max_chars: int,
     taste: str,
     opener,
+    deadline: float | None = None,
 ) -> list[dict]:
     key = settings.llm_api_key()
     if not key or any(char.isspace() for char in key):
@@ -588,24 +770,38 @@ def llm_pick(
     effort = settings.llm_reasoning_effort()
     if effort:
         full["reasoning_effort"] = effort
-    timeout = settings.llm_timeout()
+    cap = settings.llm_timeout()
     try:
-        content = _post_chat(url, key, full, opener, timeout)
-    except LLMError as exc:
-        # Some compatible servers reject reasoning_effort, temperature, or max_tokens.
-        if exc.code != "http_400":
-            raise
-        minimal = {
-            "model": settings.llm_model(),
-            "response_format": {"type": "json_object"},
-            "messages": messages,
-        }
-        content = _post_chat(url, key, minimal, opener, timeout)
-    return validate_picks(parse_llm_content(content), {title for title, _purpose, _items in groups})
+        try:
+            content = _post_chat(url, key, full, opener, _call_timeout(deadline, cap), deadline)
+        except LLMError as exc:
+            # Some compatible servers reject reasoning_effort, temperature, or max_tokens.
+            # The retry spends only the time still left on the same deadline.
+            if exc.code != "http_400":
+                raise
+            minimal = {
+                "model": settings.llm_model(),
+                "response_format": {"type": "json_object"},
+                "messages": messages,
+            }
+            content = _post_chat(url, key, minimal, opener, _call_timeout(deadline, cap), deadline)
+        return validate_picks(parse_llm_content(content), {title for title, _purpose, _items in groups})
+    except LLMError:
+        raise
+    except Exception as exc:
+        raise LLMError("network") from exc
 
 
 def _default_opener(request, timeout):
     return urllib.request.urlopen(request, timeout=timeout)
+
+
+def _picker_error(code: str) -> dict:
+    return {
+        "section": "PICKER",
+        "url": strip_userinfo(settings.llm_base_url()),
+        "error": f"llm fallback: {code}",
+    }
 
 
 def pick_news(
@@ -618,6 +814,7 @@ def pick_news(
     opener=None,
     item_count: int | None = None,
     summary_chars: int | None = None,
+    deadline: float | None = None,
 ) -> tuple[dict[str, list[dict]], dict, list[dict], list[dict]]:
     """Pick items for each news section.
 
@@ -649,19 +846,18 @@ def pick_news(
                 max_chars=max_chars,
                 taste=taste if taste is not None else settings.taste(),
                 opener=opener,
+                deadline=deadline,
             )
             reason = "ok"
         except LLMError as exc:
             reason = exc.code
             llm_picks = None
             if exc.code != "no_api_key":
-                errors.append(
-                    {
-                        "section": "PICKER",
-                        "url": settings.llm_base_url(),
-                        "error": f"llm fallback: {exc.code}",
-                    }
-                )
+                errors.append(_picker_error(exc.code))
+        except Exception:
+            reason = "network"
+            llm_picks = None
+            errors.append(_picker_error("network"))
 
     picks_by_title: dict[str, list[dict]] = {}
     if llm_picks:
@@ -727,23 +923,21 @@ def pick_news(
         mode = "fallback"
         if reason == "ok":
             reason = "no_accepted_picks"
-            errors.append(
-                {
-                    "section": "PICKER",
-                    "url": settings.llm_base_url(),
-                    "error": "llm fallback: no_accepted_picks",
-                }
-            )
+            errors.append(_picker_error("no_accepted_picks"))
     meta = {"mode": mode, "model": settings.llm_model() if settings.llm_api_key() else None, "reason": reason}
     return items_by_id, meta, errors, records
 
 
 def load_history(path: Path) -> tuple[list[dict], str | None]:
-    if not path.exists():
-        return [], None
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError):
+        if not path.exists():
+            return [], None
+        with path.open("rb") as handle:
+            raw = handle.read(HISTORY_MAX_BYTES + 1)
+        if len(raw) > HISTORY_MAX_BYTES:
+            return [], "history ignored: unreadable"
+        value = json.loads(raw.decode("utf-8"))
+    except Exception:
         return [], "history ignored: unreadable"
     if not isinstance(value, dict) or value.get("version") != 1 or not isinstance(value.get("items"), list):
         return [], "history ignored: invalid"
@@ -757,13 +951,43 @@ def load_history(path: Path) -> tuple[list[dict], str | None]:
         if isinstance(recorded_date, str) and isinstance(url, str) and isinstance(title, str):
             items.append(
                 {
-                    "digest_date": recorded_date,
+                    "digest_date": recorded_date[:32],
                     "section": item.get("section") if isinstance(item.get("section"), str) else "",
-                    "url": url,
-                    "title": title,
+                    "url": strip_userinfo(url)[:HISTORY_URL_MAX],
+                    "title": title[:HISTORY_TITLE_MAX],
                 }
             )
     return items, None
+
+
+def _printer_lock_path() -> Path:
+    raw = os.environ.get("DIGEST_LOCK_PATH", "").strip()
+    if raw:
+        return Path(raw)
+    return settings.project_dir() / "print.lock"
+
+
+@contextlib.contextmanager
+def _printer_lock():
+    """Hold the same print.lock the shell uses, unless this process is already inside it.
+
+    The shell exports DIGEST_LOCK_HELD=1 while flock is held. Taking the lock again
+    from that child would deadlock. A direct second generator blocks here instead.
+    """
+    if os.environ.get("DIGEST_LOCK_HELD") == "1":
+        yield
+        return
+    path = _printer_lock_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
 
 
 def _atomic_json(path: Path, value: dict) -> None:
@@ -783,17 +1007,33 @@ def _atomic_json(path: Path, value: dict) -> None:
             pass
 
 
-def save_history(path: Path, digest_date: str, records: list[dict], keep_days: int | None = None) -> None:
-    previous, _error = load_history(path)
-    days = settings.history_days() if keep_days is None else keep_days
-    cutoff = (dt.date.fromisoformat(digest_date) - dt.timedelta(days=days)).isoformat()
-    kept = [
-        item
-        for item in previous
-        if item["digest_date"] >= cutoff and item["digest_date"] != digest_date
-    ]
-    kept.extend(records)
-    _atomic_json(path, {"version": 1, "items": kept})
+def save_history(path: Path, digest_date: str, records: list[dict], keep_days: int | None = None) -> bool:
+    """Merge today's records. Return False and leave the file untouched when it cannot be read."""
+    with _printer_lock():
+        if path.exists():
+            previous, error = load_history(path)
+            if error:
+                return False
+        else:
+            previous = []
+        days = settings.history_days() if keep_days is None else keep_days
+        cutoff = (dt.date.fromisoformat(digest_date) - dt.timedelta(days=days)).isoformat()
+        kept = [
+            item
+            for item in previous
+            if item["digest_date"] >= cutoff and item["digest_date"] != digest_date
+        ]
+        for record in records:
+            kept.append(
+                {
+                    "digest_date": str(record.get("digest_date") or digest_date)[:32],
+                    "section": str(record.get("section") or "")[:40],
+                    "url": strip_userinfo(str(record.get("url") or ""))[:HISTORY_URL_MAX],
+                    "title": str(record.get("title") or "")[:HISTORY_TITLE_MAX],
+                }
+            )
+        _atomic_json(path, {"version": 1, "items": kept})
+        return True
 
 
 def _parse_generated_at(value: object) -> dt.datetime:
@@ -811,13 +1051,18 @@ def _parse_generated_at(value: object) -> dt.datetime:
     return parsed.astimezone(dt.timezone.utc)
 
 
+def _xml_char(char: str) -> bool:
+    code = ord(char)
+    return code in (0x9, 0xA, 0xD) or 0x20 <= code <= 0xD7FF or 0xE000 <= code <= 0xFFFD or 0x10000 <= code <= 0x10FFFF
+
+
 def _require_line(value: object, minimum: int, maximum: int) -> str:
     if not isinstance(value, str):
         raise BotUpdatesError("invalid_schema")
     text = value.strip()
     if not minimum <= len(text) <= maximum:
         raise BotUpdatesError("invalid_schema")
-    if any(ord(char) < 32 for char in text) or "<" in text or ">" in text:
+    if any(not _xml_char(char) or ord(char) < 32 for char in text) or "<" in text or ">" in text:
         raise BotUpdatesError("invalid_schema")
     return text
 
@@ -867,6 +1112,9 @@ def validate_bot_document(
         if url is not None:
             if not isinstance(url, str) or len(url) > 300 or not url.startswith("https://") or any(char.isspace() for char in url):
                 raise BotUpdatesError("invalid_schema")
+            url = strip_userinfo(url)
+            if not url.startswith("https://") or len(url) > 300:
+                raise BotUpdatesError("invalid_schema")
         title = f"{bot}: {topic}" if audience == "both" else f"{bot}: {topic} ({audience})"
         item = {
             "title": title,
@@ -882,6 +1130,35 @@ def validate_bot_document(
     return items
 
 
+def _read_regular_nofollow(path: Path, limit: int) -> bytes:
+    """Read a regular file, refusing a symlink, and stop after ``limit`` bytes."""
+    try:
+        info = os.lstat(path)
+    except OSError:
+        raise
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        raise OSError(errno.ELOOP, "refusing non-regular bot update file")
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(path, flags)
+    try:
+        opened = os.fstat(fd)
+        if not stat.S_ISREG(opened.st_mode):
+            raise OSError(errno.EINVAL, "bot update file is not regular")
+        chunks: list[bytes] = []
+        remaining = limit
+        while remaining > 0:
+            chunk = os.read(fd, min(65536, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
 def load_bot_updates(
     directory: Path,
     digest_date: str,
@@ -889,9 +1166,20 @@ def load_bot_updates(
 ) -> tuple[list[dict] | None, str | None]:
     """Return receipt items, or None when the section should be left out.
 
-    A missing file is quiet. A stale or invalid file returns an error code and
-    no items, so the other sections can use the space.
+    A missing file is quiet. A stale, invalid, linked, or hostile file returns
+    an error code and no items, so the other sections can use the space.
     """
+    try:
+        return _load_bot_updates(directory, digest_date, now)
+    except Exception:
+        return None, "bot updates ignored: unreadable"
+
+
+def _load_bot_updates(
+    directory: Path,
+    digest_date: str,
+    now: dt.datetime,
+) -> tuple[list[dict] | None, str | None]:
     try:
         if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", digest_date):
             raise ValueError
@@ -900,16 +1188,22 @@ def load_bot_updates(
         return None, "bot updates ignored: invalid date"
     path = directory / f"{digest_date}.json"
     try:
-        if not path.is_file():
-            return None, None
-        if path.stat().st_size > 65536:
-            return None, "bot updates ignored: file is too large"
-        raw = path.read_text(encoding="utf-8")
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return None, None
     except OSError:
         return None, "bot updates ignored: unreadable"
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        return None, "bot updates ignored: unreadable"
     try:
-        value = json.loads(raw)
-    except (UnicodeError, json.JSONDecodeError):
+        raw = _read_regular_nofollow(path, BOT_MAX_BYTES + 1)
+    except OSError:
+        return None, "bot updates ignored: unreadable"
+    if len(raw) > BOT_MAX_BYTES:
+        return None, "bot updates ignored: file is too large"
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except Exception:
         return None, "bot updates ignored: invalid JSON"
     try:
         items = validate_bot_document(value, now=now)
@@ -920,6 +1214,8 @@ def load_bot_updates(
             "invalid_schema": "bot updates ignored: invalid schema",
         }.get(exc.code, "bot updates ignored: invalid schema")
         return None, label
+    except Exception:
+        return None, "bot updates ignored: invalid schema"
     if not items:
         return None, None
     return items, None

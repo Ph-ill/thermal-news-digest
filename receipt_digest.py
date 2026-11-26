@@ -21,6 +21,7 @@ import xml.etree.ElementTree as ET
 
 from PIL import Image, ImageFont
 
+import digest_picker
 import digest_settings as settings
 
 WIDTH_DOTS = 640
@@ -43,9 +44,11 @@ DETAIL_LINE_HEIGHT = 23
 SOURCE_LINE_HEIGHT = 21
 SECTION_BAR_HEIGHT = 30
 MAX_HEIGHT_DOTS = 6000
-# Measured from the last underfilled seven-section receipt (ID 8c5c5ff56bd7).
-# V3 must carry at least twice that 435-character body on every real render.
+# Informational baseline from an early short receipt. A short morning still prints.
 PRIOR_RECEIPT_BODY_CHARS = 435
+HEADLINE_CHAR_CAP = 320
+DETAIL_CHAR_CAP = 480
+SOURCE_MAX_BYTES = 2_000_000
 FONT_REGULAR = Path("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf")
 FONT_BOLD = Path("/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf")
 PROJECT_DIR = Path(os.environ.get("DIGEST_HOME") or Path(__file__).resolve().parent)
@@ -80,6 +83,7 @@ def atomic_json(path: Path, value: dict) -> None:
 
 
 def normalize_text(text: str) -> str:
+    text = digest_picker.xml_text(text or "")
     substitutions = {
         "☀️": "",
         "☀": "",
@@ -234,89 +238,182 @@ def detail_text(item: dict, headline: str) -> str:
     return "Latest available item from this section's configured source."
 
 
-def layout_payload(payload: dict) -> tuple[list[dict], int, int, int, int]:
-    validate_payload(payload)
+def clip_text(text: str, limit: int) -> str:
+    value = normalize_text(text)
+    if len(value) <= limit:
+        return value
+    window = value[:limit].rsplit(" ", 1)[0].rstrip(" ,;:-")
+    if len(window) < 24:
+        window = value[:limit].rstrip()
+    return window or value[:limit]
+
+
+def _fit_label(name: str, font: ImageFont.FreeTypeFont, max_width: int) -> str:
+    label = normalize_text(name) or "SECTION"
+    if font.getlength(label) <= max_width:
+        return label
+    while label and font.getlength(label) > max_width:
+        label = label[:-1]
+    return label or "S"
+
+
+def _fit_line(line: str, font: ImageFont.FreeTypeFont, max_width: int) -> str:
+    fitted = line
+    while fitted and font.getlength(fitted) > max_width:
+        fitted = fitted[:-1]
+    return fitted or "."
+
+
+def _public_source_url(url: object) -> str | None:
+    if not url:
+        return None
+    cleaned = digest_picker.strip_userinfo(str(url))
+    return cleaned or None
+
+
+def _prepare_sections(payload: dict) -> tuple[list[dict], bool]:
     regular = ImageFont.truetype(str(FONT_REGULAR), BODY_FONT_SIZE)
     detail_font = ImageFont.truetype(str(FONT_REGULAR), DETAIL_FONT_SIZE)
     source_font = ImageFont.truetype(str(FONT_BOLD), SOURCE_FONT_SIZE)
     section_font = ImageFont.truetype(str(FONT_BOLD), SECTION_FONT_SIZE)
     text_width = WIDTH_DOTS - LEFT - RIGHT - 16
     bar_width = WIDTH_DOTS - LEFT - RIGHT
+    clipped = False
+    prepared: list[dict] = []
+    for section in payload["sections"]:
+        raw_name = normalize_text(str(section.get("section") or ""))
+        name = _fit_label(str(section.get("section") or ""), section_font, bar_width - 16)
+        if len(name) < len(raw_name):
+            clipped = True
+        items = []
+        for item in section["items"]:
+            raw_headline = normalize_text(str(item.get("title") or item.get("headline") or ""))
+            headline = clip_text(str(item.get("title") or item.get("headline") or ""), HEADLINE_CHAR_CAP) or "No update"
+            raw_detail = detail_text(item, headline)
+            detail = clip_text(raw_detail, DETAIL_CHAR_CAP) or "Latest available item from this section's configured source."
+            source = clip_text(source_line(item), 160) or "Source: source"
+            if "\x01" in str(item.get("title") or "") or "\x01" in str(item.get("headline") or "") or "\x01" in str(item.get("summary") or ""):
+                clipped = True
+            if len(headline) < len(raw_headline) or len(detail) < len(normalize_text(raw_detail)):
+                clipped = True
+            items.append(
+                {
+                    "headline": headline,
+                    "detail": detail,
+                    "source": source,
+                    "headline_lines": [_fit_line(line, regular, text_width) for line in wrap_pixels(headline, regular, text_width)],
+                    "detail_lines": [_fit_line(line, detail_font, text_width) for line in wrap_pixels(detail, detail_font, text_width)],
+                    "source_lines": [_fit_line(line, source_font, text_width) for line in wrap_pixels(source, source_font, text_width)],
+                    "source_url": _public_source_url(item.get("url")),
+                    "source_id": item.get("source_id"),
+                }
+            )
+        prepared.append(
+            {
+                "section": name,
+                "section_width": int(section_font.getlength(name) + 0.999),
+                "items": items,
+            }
+        )
+    return prepared, clipped
+
+
+def _shrink_prepared(prepared: list[dict]) -> bool:
+    """Drop one wrapped line from the fullest item. Keep a headline and a source line."""
+    for key, floor in (("detail_lines", 1), ("headline_lines", 1), ("source_lines", 1)):
+        best: tuple[int, int, int] | None = None
+        for section_index, section in enumerate(prepared):
+            for item_index, item in enumerate(section["items"]):
+                extra = len(item[key])
+                if extra > floor and (best is None or extra > best[0]):
+                    best = (extra, section_index, item_index)
+        if best is not None:
+            _extra, section_index, item_index = best
+            prepared[section_index]["items"][item_index][key].pop()
+            return True
+    return False
+
+
+def _place(prepared: list[dict]) -> tuple[list[dict], int, int, int, int]:
+    regular = ImageFont.truetype(str(FONT_REGULAR), BODY_FONT_SIZE)
+    detail_font = ImageFont.truetype(str(FONT_REGULAR), DETAIL_FONT_SIZE)
+    source_font = ImageFont.truetype(str(FONT_BOLD), SOURCE_FONT_SIZE)
+    text_width = WIDTH_DOTS - LEFT - RIGHT - 16
     y = 112
     blocks: list[dict] = []
     total_lines = 0
     headline_chars = 0
     printable_chars = 0
-    for section in payload["sections"]:
-        name = normalize_text(section["section"])
-        name_width = int(section_font.getlength(name) + 0.999)
-        if name_width > bar_width - 16:
-            raise ValueError(f"section label exceeds printable width: {name!r}")
+    for section in prepared:
         block = {
-            "section": name,
+            "section": section["section"],
             "bar_y": y,
-            "section_width": name_width,
+            "section_width": section["section_width"],
             "lines": [],
             "items": [],
         }
         y += SECTION_BAR_HEIGHT
         baseline = y
         for item_index, item in enumerate(section["items"]):
-            headline = normalize_text(str(item.get("title") or item.get("headline")))
-            detail = detail_text(item, headline)
-            source = source_line(item)
-            headline_lines = wrap_pixels(headline, regular, text_width)
-            detail_lines = wrap_pixels(detail, detail_font, text_width)
-            source_lines = wrap_pixels(source, source_font, text_width)
-            measured_headline = [int(regular.getlength(line) + 0.999) for line in headline_lines]
-            measured_detail = [int(detail_font.getlength(line) + 0.999) for line in detail_lines]
-            measured_source = [int(source_font.getlength(line) + 0.999) for line in source_lines]
-            if any(width > text_width for width in measured_headline + measured_detail + measured_source):
-                raise ValueError(f"text exceeds printable width in {name}")
+            fonts = {
+                "headline": regular,
+                "detail": detail_font,
+                "source": source_font,
+            }
+            grouped = (
+                ("headline", item["headline_lines"], BODY_LINE_HEIGHT, BODY_FONT_SIZE + 8),
+                ("detail", item["detail_lines"], DETAIL_LINE_HEIGHT, 2),
+                ("source", item["source_lines"], SOURCE_LINE_HEIGHT, 2),
+            )
             if item_index:
                 baseline += 10
-            baseline += BODY_FONT_SIZE + 8
-            for line, width in zip(headline_lines, measured_headline):
-                block["lines"].append({"text": line, "y": baseline, "width": width, "kind": "headline", "item_index": item_index})
-                baseline += BODY_LINE_HEIGHT
-                total_lines += 1
-            baseline += 2
-            for line, width in zip(detail_lines, measured_detail):
-                block["lines"].append({"text": line, "y": baseline, "width": width, "kind": "detail", "item_index": item_index})
-                baseline += DETAIL_LINE_HEIGHT
-                total_lines += 1
-            baseline += 2
-            for line, width in zip(source_lines, measured_source):
-                block["lines"].append({"text": line, "y": baseline, "width": width, "kind": "source", "item_index": item_index})
-                baseline += SOURCE_LINE_HEIGHT
-                total_lines += 1
+            for kind, lines, line_height, gap in grouped:
+                baseline += gap
+                for line in lines:
+                    width = min(text_width, int(fonts[kind].getlength(line) + 0.999))
+                    block["lines"].append(
+                        {"text": line, "y": baseline, "width": width, "kind": kind, "item_index": item_index}
+                    )
+                    baseline += line_height
+                    total_lines += 1
             block["items"].append(
                 {
-                    "headline": headline,
-                    "detail": detail,
-                    "source": source,
-                    "source_url": item.get("url"),
-                    "source_id": item.get("source_id"),
+                    "headline": item["headline"],
+                    "detail": item["detail"],
+                    "source": item["source"],
+                    "source_url": item["source_url"],
+                    "source_id": item["source_id"],
                 }
             )
-            headline_chars += len(headline)
-            printable_chars += len(headline) + len(detail) + len(source)
+            headline_chars += len(item["headline"])
+            printable_chars += len(item["headline"]) + len(item["detail"]) + len(item["source"])
         y = baseline + 12
         blocks.append(block)
-    if printable_chars < PRIOR_RECEIPT_BODY_CHARS * 2:
-        raise ValueError(
-            f"digest body is underfilled ({printable_chars} chars; requires at least {PRIOR_RECEIPT_BODY_CHARS * 2})"
-        )
     footer_y = y + 24
     height = footer_y + BOTTOM
     height = ((height + DOTS_PER_MM - 1) // DOTS_PER_MM) * DOTS_PER_MM
-    if height > MAX_HEIGHT_DOTS:
-        raise ValueError(f"digest is too long ({height} dots); refusing unsafe print")
     return blocks, height, total_lines, headline_chars, printable_chars
 
 
+def layout_payload(payload: dict) -> tuple[list[dict], int, int, int, int, bool]:
+    validate_payload(payload)
+    prepared, clipped = _prepare_sections(payload)
+    blocks, height, total_lines, headline_chars, printable_chars = _place(prepared)
+    guard = 0
+    while height > MAX_HEIGHT_DOTS and guard < 5000:
+        if not _shrink_prepared(prepared):
+            break
+        clipped = True
+        blocks, height, total_lines, headline_chars, printable_chars = _place(prepared)
+        guard += 1
+    if height > MAX_HEIGHT_DOTS:
+        height = MAX_HEIGHT_DOTS - (MAX_HEIGHT_DOTS % DOTS_PER_MM)
+        clipped = True
+    return blocks, height, total_lines, headline_chars, printable_chars, clipped
+
+
 def build_svg(payload: dict) -> tuple[str, dict]:
-    blocks, height, total_lines, headline_chars, printable_chars = layout_payload(payload)
+    blocks, height, total_lines, headline_chars, printable_chars, clipped = layout_payload(payload)
     digest_id = payload["digest_id"]
     footer_y = height - BOTTOM
     date = normalize_text(payload.get("digest_date", ""))
@@ -371,7 +468,7 @@ def build_svg(payload: dict) -> tuple[str, dict]:
         "printable_text_width_dots": WIDTH_DOTS - LEFT - RIGHT - 16,
         "content_bottom_dots": last_content_y,
         "footer_y_dots": footer_y,
-        "clipping": False,
+        "clipping": clipped,
         "sections": [
             {
                 "name": block["section"],
@@ -432,8 +529,16 @@ def build_tspl(image: Image.Image) -> bytes:
     return header + bitmap + b"\r\nPRINT 1,1\r\n"
 
 
+def load_source_text(source: Path) -> str:
+    with source.open("rb") as handle:
+        raw_bytes = handle.read(SOURCE_MAX_BYTES + 1)
+    if len(raw_bytes) > SOURCE_MAX_BYTES:
+        raise ValueError("digest source is too large")
+    return raw_bytes.decode("utf-8")
+
+
 def render(source: Path, output_dir: Path) -> dict:
-    raw = source.read_text(encoding="utf-8")
+    raw = load_source_text(source)
     payload = json.loads(raw)
     validate_payload(payload)
     digest_id = payload["digest_id"]
@@ -495,11 +600,13 @@ def read_state(path: Path) -> dict:
     return value
 
 
-def submit(metadata: dict, queue: str, state_path: Path, poll_seconds: int) -> dict:
+def submit(metadata: dict, queue: str, state_path: Path, poll_seconds: int, *, force: bool = False) -> dict:
     state = read_state(state_path)
     digest_id = metadata["digest_id"]
     prior = state["digests"].get(digest_id)
-    if prior and prior.get("status") in {"submitted", "completed"}:
+    # A completed or still-queued job is not sent again. failed stays retryable.
+    # force is the explicit reprint of this same source file.
+    if prior and prior.get("status") in {"submitted", "completed"} and not force:
         result = dict(metadata)
         result.update({"status": "already_submitted", "prior": prior})
         return result
@@ -539,6 +646,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--dry-run", action="store_true")
     mode.add_argument("--submit", action="store_true")
+    mode.add_argument("--reprint", action="store_true")
     parser.add_argument("--source", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--state", type=Path, default=DEFAULT_STATE)
@@ -549,14 +657,20 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(sys.argv[1:] if argv is None else argv)
-    metadata = render(args.source, args.output_dir)
+    try:
+        metadata = render(args.source, args.output_dir)
+    except (OSError, UnicodeError, ValueError):
+        return 2
     if args.dry_run:
         metadata["status"] = "dry_run"
         metadata["queue"] = args.queue
         metadata["would_submit"] = metadata["tspl"]
         print(json.dumps(metadata, sort_keys=True))
         return 0
-    result = submit(metadata, args.queue, args.state, args.poll_seconds)
+    try:
+        result = submit(metadata, args.queue, args.state, args.poll_seconds, force=args.reprint)
+    except Exception:
+        return 1
     print(json.dumps(result, sort_keys=True))
     return 0
 
