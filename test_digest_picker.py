@@ -1140,6 +1140,24 @@ local:
                 "Elgin brewery opens on Main Street",
             )
         )
+        self.assertFalse(
+            dp.titles_similar(
+                "Brewery opens in Bastrop",
+                "Coffee shop beside the old brewery opens in Bastrop",
+            )
+        )
+        self.assertTrue(
+            dp.titles_similar(
+                "Bastrop brewery set to open on Main Street",
+                "Main Street brewery opening in Bastrop, owners say",
+            )
+        )
+        self.assertTrue(
+            dp.titles_similar(
+                "SpaceX launches Starship from Texas",
+                "Starship lifts off from Texas, SpaceX says",
+            )
+        )
         seen = dp.Seen(
             [
                 {
@@ -1243,6 +1261,11 @@ local:
             "summary": "The engines are in stock at the Texas site ahead of the next flight.",
             "topic": "spacex",
         }
+        jumped = {
+            "title": "SpaceX stock jumps after an analyst upgrade",
+            "summary": "The rating moved and the valuation followed the surge.",
+            "topic": "spacex",
+        }
         funeral_service = {
             "title": "Earth Funeral adds a funeral service option",
             "url": "https://example.com/earth-service",
@@ -1251,6 +1274,7 @@ local:
             "published_at": "Thu, 26 Nov 2026 08:00:00 GMT",
         }
         self.assertFalse(dp.keep_company(stock))
+        self.assertFalse(dp.keep_company(jumped))
         self.assertTrue(dp.keep_company(launch))
         self.assertTrue(dp.keep_company(inventory))
         self.assertFalse(dp.keep_company(other))
@@ -1290,7 +1314,7 @@ local:
         self.assertTrue(dp.keep_local(passing, require_place=True))
         self.assertFalse(dp.keep_local(council, require_place=True))
         self.assertFalse(dp.keep_local(crime, require_place=True))
-        self.assertFalse(dp.keep_local(quiet, require_place=True))
+        self.assertTrue(dp.keep_local(quiet, require_place=True))
         self.assertFalse(dp.keep_local(houston, require_place=True))
         self.assertTrue(dp.keep_local(houston, require_place=False))
         with mock.patch.dict(
@@ -1385,6 +1409,111 @@ local:
             notes = [row.get("error") for row in payload["source_errors"]]
             self.assertIn("profile ignored: unreadable", notes)
             self.assertIn("artists file ignored: unreadable", notes)
+
+    def test_local_activity_is_a_nudge_and_civic_or_sports_still_drop(self):
+        survivors = [
+            "New taco truck in Bastrop",
+            "Band plays Saturday night in Bastrop",
+            "Elgin wine tasting this weekend",
+            "Smithville farmers market Saturday",
+            "Bastrop water main is repaired",
+            "Bastrop brewery opens across from city council",
+        ]
+        for title in survivors:
+            self.assertTrue(
+                dp.keep_local({"title": title, "summary": "Details follow for the weekend crowd."}, require_place=True),
+                title,
+            )
+        for title in (
+            "City council opens public comment",
+            "Football team opens the season",
+            "Officials open a new inquiry",
+        ):
+            self.assertFalse(
+                dp.keep_local({"title": title, "summary": "Details follow for the weekend crowd."}, require_place=False),
+                title,
+            )
+        opening = item("Bastrop brewery opens on Main Street", "https://example.com/brewery", LONG)
+        quiet = item("Bastrop water main is repaired", "https://example.com/main", LONG)
+        self.assertGreater(
+            dp.relevance_score(opening, (), (), (), "local"),
+            dp.relevance_score(quiet, (), (), (), "local"),
+        )
+        chosen = dp.fallback_pick([quiet, opening], 1, dp.Seen([], "2026-11-26"), section_id="local")
+        self.assertEqual(chosen[0]["title"], "Bastrop brewery opens on Main Street")
+
+    def test_local_businesses_stay_neutral_and_space_matches_spacex(self):
+        dislikes = ("sports", "politics", "celebrity gossip")
+        for title in (
+            "New coffee shop opens on Main Street",
+            "Community pool reopens for the summer",
+            "Bastrop bakery adds a morning window",
+            "Elgin brewery pours on Friday",
+            "Life coach opens a studio beside the bakery",
+            "Olympic pool hours change at the rec center",
+            "The campaign for the new brewery starts Friday",
+            "A rumor about the coffee shop is denied",
+        ):
+            row = item(title, "https://example.com/neutral", LONG)
+            self.assertEqual(dp.interest_score(row, (), dislikes, ()), 0, title)
+            self.assertEqual(dp.interest_score(row, ("bar",), (), ()), 0, title)
+        spacex = item("SpaceX sets a dawn launch window", "https://example.com/sx", LONG)
+        self.assertGreater(dp.interest_score(spacex, ("space",), (), ()), 0)
+
+    def test_bad_digest_zone_falls_back_to_chicago(self):
+        now = dt.datetime(2026, 11, 26, 18, 0, tzinfo=dt.timezone.utc)
+        with mock.patch.dict(os.environ, {"DIGEST_TZ": "Not/AZone"}):
+            age = dp.published_age_hours("2026-11-26T08:00:00", now)
+        self.assertAlmostEqual(age, 4.0, places=2)
+
+    def test_model_gets_the_section_rubric_and_recent_titles(self):
+        captured = {}
+
+        def opener(request, timeout):
+            captured["body"] = json.loads(request.data.decode("utf-8"))
+            picks = {"picks": [{"section": "BASTROP", "items": []}]}
+            return FakeResponse(json.dumps({"choices": [{"message": {"content": json.dumps(picks)}}]}).encode())
+
+        purpose = settings.section_by_id("local").purpose
+        with mock.patch.dict(os.environ, {"DIGEST_LLM_API_KEY": SECRET}):
+            dp.pick_news(
+                [
+                    {
+                        "section_id": "local",
+                        "title": "BASTROP",
+                        "purpose": purpose,
+                        "feed_url": "https://example.com/local",
+                        "prefer_terms": (),
+                        "candidates": [
+                            item(
+                                "New taco truck in Bastrop",
+                                "https://example.com/taco",
+                                "The truck parks on Main Street on Saturday and serves through the evening. " + LONG,
+                            )
+                        ],
+                    }
+                ],
+                digest_date="2026-11-26",
+                history=[
+                    {
+                        "digest_date": "2026-11-25",
+                        "section": "local",
+                        "url": "https://example.com/old",
+                        "title": "Harbor ferry delayed after storm",
+                    }
+                ],
+                has_bots=False,
+                opener=opener,
+                item_count=1,
+                summary_chars=200,
+            )
+        system = captured["body"]["messages"][0]["content"]
+        user = json.loads(captured["body"]["messages"][1]["content"])
+        self.assertIn("judge of what is relevant", system)
+        self.assertIn("Do not pick a repeat", system)
+        self.assertIn("food trucks", user["sections"][0]["purpose"])
+        self.assertIn("No sports", user["sections"][0]["purpose"])
+        self.assertEqual(user["recent_titles"], ["Harbor ferry delayed after storm"])
 
 
 def _ticketmaster_event(
@@ -1568,26 +1697,38 @@ class ShowTests(unittest.TestCase):
             latitude="31.7619",
             longitude="-106.4850",
         )
-        other_state = _ticketmaster_event(
+        houston = _ticketmaster_event(
             "Sample Band",
             ["Sample Band"],
-            "ny",
+            "houston",
             "2026-12-02",
-            "https://www.ticketmaster.com/event/ny",
-            state="NY",
+            "https://www.ticketmaster.com/event/houston",
+            city="Houston",
+            state="TX",
         )
-        texas = _ticketmaster_event(
+        dallas = _ticketmaster_event(
             "Sample Band",
             ["Sample Band"],
-            "tx",
+            "dallas",
             "2026-12-02",
-            "https://www.ticketmaster.com/event/tx",
+            "https://www.ticketmaster.com/event/dallas",
+            city="Dallas",
+            state="TX",
+        )
+        lockhart = _ticketmaster_event(
+            "Sample Band",
+            ["Sample Band"],
+            "lockhart",
+            "2026-12-02",
+            "https://www.ticketmaster.com/event/lockhart",
+            city="Lockhart",
             state="TX",
         )
         self.assertEqual(len(one(near)), 1)
         self.assertEqual(one(far), [])
-        self.assertEqual(one(other_state), [])
-        self.assertEqual(len(one(texas)), 1)
+        self.assertEqual(one(houston), [])
+        self.assertEqual(one(dallas), [])
+        self.assertEqual(len(one(lockhart)), 1)
         missing = {
             "id": "none",
             "name": "Sample Band",

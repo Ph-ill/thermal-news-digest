@@ -62,44 +62,92 @@ _TITLE_STOP = frozenset(
     "a an the of and to in on for with from by at as is was are were be been or its their "
     "after over into about amid says said".split()
 )
+# Filler and attribution. Stripped before two headlines are compared.
+_TITLE_FILLER = _TITLE_STOP | frozenset(
+    "say says said saying set sets new report reports reported owner owners official officials "
+    "according source sources just also this that old beside".split()
+)
+_NUMBER_WORDS = {
+    "one": "1",
+    "two": "2",
+    "three": "3",
+    "four": "4",
+    "five": "5",
+    "six": "6",
+    "seven": "7",
+    "eight": "8",
+    "nine": "9",
+    "ten": "10",
+}
+_BUSINESS_NOUNS = frozenset(
+    "brewery breweries coffee shop shops cafe bakery bar bars restaurant restaurants truck trucks "
+    "market markets winery distillery taproom taco taqueria band music festival".split()
+)
+_PLACE_NOUNS = frozenset(
+    "bastrop smithville elgin austin houston dallas texas lockhart marcos pflugerville manor "
+    "georgetown kyle buda giddings cedar creek main street".split()
+)
 _LOCAL_PLACE = re.compile(
     r"\bbastrop\b|\bsmithville\b|\belgin\b|\bcedar creek\b|\beast austin\b",
     re.IGNORECASE,
 )
-# Crime and government process. "City council" is handled separately so a passing mention can stay.
-_LOCAL_HARD = re.compile(
-    r"\bschool board\b|\bcommissioners?\b|\bordinance\b|"
-    r"\barrested\b|\bshooting\b|\bhomicide\b|\bmurder(?:ed)?\b|\bobituary\b|"
-    r"\bindicted\b|\bpolice said\b|\blegislature\b|\bgovernment\b|"
-    r"\bschool district\b|\bisd\b|\bcounty judge\b|\bzoning\b",
+# Unambiguous civic process. A passing "across from city council" is not a meeting.
+_CIVIC = re.compile(
+    r"\b(?:school board|school district|isd|commissioners?|ordinance|legislature|county judge|zoning)\b|"
+    r"\bcity council\b.{0,80}\b(?:meeting|meets|vote|votes|voted|adopt|adopts|adopted|budget|"
+    r"public comment|agenda|hearing|session|ordinance)\b|"
+    r"\b(?:meeting|meets|vote|votes|voted|adopt|adopts|adopted|budget|public comment|agenda|hearing|session)\b"
+    r".{0,80}\bcity council\b|"
+    r"\bofficials?\b.{0,60}\b(?:inquiry|investigation|probe)\b|"
+    r"\b(?:inquiry|investigation|probe)\b.{0,60}\bofficials?\b|"
+    r"\bgovernment\b.{0,40}\b(?:meeting|vote|hearing|session)\b",
     re.IGNORECASE,
 )
-_LOCAL_COUNCIL = re.compile(r"\bcity council\b", re.IGNORECASE)
+_CRIME = re.compile(
+    r"\barrested\b|\bshooting\b|\bhomicide\b|\bmurder(?:ed)?\b|\bindicted\b|\bpolice said\b",
+    re.IGNORECASE,
+)
+# Unambiguous sports. "coach" and "olympic" are not here; they also describe ordinary local news.
+_SPORTS_HARD = re.compile(
+    r"\b(?:football|soccer|basketball|baseball|hockey|softball|volleyball|"
+    r"nfl|nba|mlb|nhl|mls|touchdown|playoffs?)\b",
+    re.IGNORECASE,
+)
+# A nudge for the fallback and for the order sent to the model. Not a reason to drop an item.
 _LOCAL_ACTIVITY = re.compile(
     r"\b(?:open(?:s|ed|ing)?|grand opening|restaurant|bar|brewery|breweries|coffee|cafe|café|"
-    r"shop|shops|market|markets|festival|live music|concert|trail|trails|park|parks|outdoor|"
-    r"taproom|bakery|winery|distillery|food truck|hike|hiking|kayak)\b",
+    r"shop|shops|market|markets|farmers|festival|live music|concert|band|plays|playing|"
+    r"trail|trails|park|parks|outdoor|taproom|bakery|winery|distillery|food truck|"
+    r"taco|truck|tasting|wine|hike|hiking|kayak)\b",
     re.IGNORECASE,
 )
-# Price talk, not the noun "stock" (a stock of engines, in stock).
-_STOCK = re.compile(
+# A price phrase, or the words stock/share next to a market move. Not "in stock" or "a stock of".
+_STOCK_PHRASE = re.compile(
     r"\bshares\b|\b(?:share|stock)\s+prices?\b|\bprice targets?\b|"
     r"\bnasdaq\b|\bnyse\b|\bbuy the dip\b|\bmarket cap\b",
     re.IGNORECASE,
 )
+_STOCK_WORD = re.compile(r"\b(?:stocks?|shares?)\b", re.IGNORECASE)
+_STOCK_MOVE = re.compile(
+    r"\b(?:jumps?|jumped|jumping|drops?|dropped|dropping|surges?|surged|surging|"
+    r"downgrades?|downgraded|upgrades?|upgraded|ratings?|analysts?|valuations?|ipos?|ipo)\b",
+    re.IGNORECASE,
+)
+_INVENTORY_STOCK = re.compile(r"\bin stock\b|\bstock of\b", re.IGNORECASE)
 _SPACEX = re.compile(r"\b(?:spacex|starship|falcon|starlink)\b", re.IGNORECASE)
 _LEADING_ARTICLE = {"the", "a", "an"}
 _TRIBUTE = re.compile(r"\b(?:tribute|tributes|cover band|the music of)\b|\bexperience\b", re.IGNORECASE)
+# Single ambiguous words (coach, olympic, campaign, rumor) are left out on purpose.
 _CATEGORY_SYNONYMS = {
     "sports": frozenset(
         "sport sports football soccer basketball baseball hockey nfl nba mlb nhl golf tennis "
-        "cricket touchdown playoff playoffs athlete athletes olympic olympics coach".split()
+        "cricket touchdown playoff playoffs athlete athletes".split()
     ),
     "politics": frozenset(
-        "politics political politician election elections senator congress parliament campaign "
+        "politics political politician election elections senator congress parliament "
         "democrat republican ballot".split()
     ),
-    "celebrity gossip": frozenset("celebrity celebrities gossip rumor rumored".split()),
+    "celebrity gossip": frozenset("celebrity celebrities gossip".split()),
 }
 PROFILE_MAX_BYTES = 65536
 ARTISTS_MAX_BYTES = 65536
@@ -546,24 +594,39 @@ def is_obituary(text: str) -> bool:
     return bool(_DEATH.search(remainder))
 
 
+def is_hard_local_exclude(text: str) -> bool:
+    """Obituaries, crime, civic meetings and votes, school board, and unambiguous sports."""
+    blob = text or ""
+    if is_obituary(blob) or _CRIME.search(blob) or _CIVIC.search(blob) or _SPORTS_HARD.search(blob):
+        return True
+    return False
+
+
 def keep_local(item: dict, *, require_place: bool) -> bool:
+    """Drop only unambiguous local exclusions. An opening word is a score, not a ticket in."""
     blob = f"{item.get('title') or ''} {item.get('summary') or ''}"
-    if _LOCAL_HARD.search(blob) or is_obituary(blob):
-        return False
-    has_activity = bool(_LOCAL_ACTIVITY.search(blob))
-    # A story about city council is out. An opening that mentions the building across the street stays.
-    if _LOCAL_COUNCIL.search(blob) and not has_activity:
-        return False
-    if not has_activity:
+    if is_hard_local_exclude(blob):
         return False
     if require_place and not _LOCAL_PLACE.search(blob):
         return False
     return True
 
 
+def is_stock_chatter(text: str) -> bool:
+    """Share-price talk, or stock/share next to a jump, drop, rating, or IPO.
+
+    "In stock" and "a stock of engines" are inventory, not a price.
+    """
+    blob = text or ""
+    if _STOCK_PHRASE.search(blob):
+        return True
+    cleaned = _INVENTORY_STOCK.sub(" ", blob)
+    return bool(_STOCK_WORD.search(cleaned) and _STOCK_MOVE.search(cleaned))
+
+
 def keep_company(item: dict) -> bool:
     blob = f"{item.get('title') or ''} {item.get('summary') or ''}"
-    if is_spam(blob) or _STOCK.search(blob):
+    if is_spam(blob) or is_stock_chatter(blob):
         return False
     topic = str(item.get("topic") or "")
     if topic == "earth":
@@ -693,7 +756,10 @@ def _digest_zone() -> dt.tzinfo:
     try:
         return ZoneInfo(name)
     except Exception:
-        return dt.timezone.utc
+        try:
+            return ZoneInfo("America/Chicago")
+        except Exception:
+            return dt.timezone.utc
 
 
 def load_profile(path: Path | None) -> tuple[dict, str | None]:
@@ -741,12 +807,19 @@ def profile_brief(profile: dict) -> str:
     return "\n".join(lines)[:2000]
 
 
-def _term_hits(phrase: str, haystack: str) -> bool:
-    """Word or category match. 'sports' catches 'football'; it does not catch 'transport'."""
+def _term_hits(phrase: str, haystack: str, *, prefix: bool) -> bool:
+    """Word or category match.
+
+    Likes also match a prefix of a token, so 'space' matches SpaceX.
+    A short like such as 'bar' does not match 'bakery'. Dislikes do not use that prefix.
+    Category words are whole words. Ambiguous singles (coach, olympic, campaign, rumor) are not listed.
+    """
     folded = phrase.casefold().strip()
     if not folded:
         return False
     if re.search(rf"(?<!\w){re.escape(folded)}(?!\w)", haystack):
+        return True
+    if prefix and len(folded) >= 5 and re.search(rf"(?<!\w){re.escape(folded)}", haystack):
         return True
     extras = _CATEGORY_SYNONYMS.get(folded, ())
     return any(re.search(rf"(?<!\w){re.escape(word)}(?!\w)", haystack) for word in extras)
@@ -758,44 +831,89 @@ def interest_score(item: dict, likes: tuple[str, ...], dislikes: tuple[str, ...]
     if any(term and term.casefold() in haystack for term in prefer_terms):
         score += 3
     for phrase in likes:
-        if phrase and _term_hits(phrase, haystack):
+        if phrase and _term_hits(phrase, haystack, prefix=True):
             score += 2
     for phrase in dislikes:
-        if phrase and _term_hits(phrase, haystack):
+        if phrase and _term_hits(phrase, haystack, prefix=False):
             score -= 3
     return score
 
 
-def significant_tokens(title: str) -> frozenset[str]:
+def relevance_score(
+    item: dict,
+    likes: tuple[str, ...],
+    dislikes: tuple[str, ...],
+    prefer_terms: tuple[str, ...],
+    section_id: str = "",
+) -> int:
+    """Soft nudge. Used to order the fallback and the candidates sent to the model."""
+    score = interest_score(item, likes, dislikes, prefer_terms)
+    if section_id == "local":
+        blob = f"{item.get('title') or ''} {item.get('summary') or ''}"
+        if _LOCAL_ACTIVITY.search(blob):
+            score += 2
+    return score
+
+
+def _stem_token(token: str) -> str:
+    if token.isdigit():
+        return token
+    mapped = _NUMBER_WORDS.get(token)
+    if mapped:
+        return mapped
+    for suffix in ("ing", "ed", "es", "s"):
+        if len(token) > len(suffix) + 3 and token.endswith(suffix):
+            token = token[: -len(suffix)]
+            break
+    return token
+
+
+def story_tokens(title: str) -> frozenset[str]:
+    """Stemmed content words. Filler and attribution are gone. 'lift off' is 'launch'."""
+    text = normalize_title(title)
+    text = re.sub(r"\blift(?:s|ed)? off\b", "launch", text)
+    text = re.sub(r"\bliftoff\b", "launch", text)
     tokens: list[str] = []
-    for token in normalize_title(title).split():
-        # A changed number is a different story. Keep it even when it is short.
-        if token.isdigit():
-            tokens.append(token)
+    for token in text.split():
+        if token in _TITLE_FILLER or (len(token) <= 2 and not token.isdigit()):
             continue
-        if token in _TITLE_STOP or len(token) <= 2:
-            continue
-        for suffix in ("ing", "ed", "es", "s"):
-            if len(token) > len(suffix) + 3 and token.endswith(suffix):
-                token = token[: -len(suffix)]
-                break
-        if token and token not in _TITLE_STOP:
-            tokens.append(token)
+        stemmed = _stem_token(token)
+        if stemmed and stemmed not in _TITLE_FILLER:
+            tokens.append(stemmed)
     return frozenset(tokens)
+
+
+def _named_subset(tokens: frozenset[str], names: frozenset[str]) -> frozenset[str]:
+    return frozenset(token for token in tokens if token in names)
 
 
 def titles_similar(left: str, right: str) -> bool:
     """Same story from two outlets.
 
-    Every significant word of the shorter title, including numbers and place
-    names, has to appear in the longer one. Extra words on the long side are fine.
+    Filler is ignored and verbs are stemmed, so 'set to open' matches 'opening'
+    and 'lifts off' matches 'launches'. A changed number or a different town does not match.
+    Containment merges only when the longer title adds no new business or place.
+    A high stemmed overlap merges the rest.
     """
-    first = significant_tokens(left)
-    second = significant_tokens(right)
+    first = story_tokens(left)
+    second = story_tokens(right)
     if len(first) < 3 or len(second) < 3:
         return False
+    numbers_left = frozenset(token for token in first if token.isdigit())
+    numbers_right = frozenset(token for token in second if token.isdigit())
+    if numbers_left and numbers_right and numbers_left != numbers_right:
+        return False
+    places_left = _named_subset(first, _PLACE_NOUNS)
+    places_right = _named_subset(second, _PLACE_NOUNS)
+    if places_left and places_right and not (places_left <= places_right or places_right <= places_left):
+        return False
     shorter, longer = (first, second) if len(first) <= len(second) else (second, first)
-    return shorter <= longer
+    extras = longer - shorter
+    extra_nouns = _named_subset(extras, _BUSINESS_NOUNS | _PLACE_NOUNS)
+    if shorter <= longer and not extra_nouns:
+        return True
+    shared = first & second
+    return len(shared) / len(first | second) >= 0.72
 
 
 def _strip_accents(text: str) -> str:
@@ -889,8 +1007,34 @@ def _miles_between(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     return 2 * radius * math.asin(min(1.0, math.sqrt(chord)))
 
 
+_NEARBY_CITIES = frozenset(
+    {
+        "bastrop",
+        "austin",
+        "elgin",
+        "smithville",
+        "cedar creek",
+        "lockhart",
+        "san marcos",
+        "round rock",
+        "pflugerville",
+        "manor",
+        "georgetown",
+        "kyle",
+        "buda",
+        "la grange",
+        "giddings",
+    }
+)
+
+
+def _city_is_nearby(name: str) -> bool:
+    folded = re.sub(r"\s+", " ", (name or "").casefold()).strip()
+    return folded in _NEARBY_CITIES
+
+
 def _venue_in_range(venue: dict) -> bool:
-    """Keep a venue inside the show radius, or in Texas when it has no coordinates."""
+    """Keep a venue inside the show radius, or in a nearby city when it has no coordinates."""
     if not isinstance(venue, dict) or not venue:
         return False
     location = venue.get("location") if isinstance(venue.get("location"), dict) else {}
@@ -898,9 +1042,8 @@ def _venue_in_range(venue: dict) -> bool:
     lon = _coord(location.get("longitude"))
     if lat is not None and lon is not None:
         return _miles_between(settings.shows_lat(), settings.shows_lon(), lat, lon) <= settings.shows_radius_miles()
-    state = venue.get("state") if isinstance(venue.get("state"), dict) else {}
-    code = str(state.get("stateCode") or state.get("name") or "").strip().casefold()
-    return code in {"tx", "texas"}
+    city = venue.get("city") if isinstance(venue.get("city"), dict) else {}
+    return _city_is_nearby(str(city.get("name") or ""))
 
 
 def _coord(value: object) -> float | None:
@@ -1244,10 +1387,11 @@ def fallback_from_eligible(
     max_chars: int,
     likes: tuple[str, ...] = (),
     dislikes: tuple[str, ...] = (),
+    section_id: str = "",
 ) -> list[dict]:
     ranked_pairs = sorted(
         enumerate(eligible),
-        key=lambda pair: (-interest_score(pair[1], likes, dislikes, prefer_terms), pair[0]),
+        key=lambda pair: (-relevance_score(pair[1], likes, dislikes, prefer_terms, section_id), pair[0]),
     )
     ranked = [item for _index, item in ranked_pairs]
     company_topics = [item.get("topic") for item in ranked if item.get("topic") in {"spacex", "earth"}]
@@ -1303,9 +1447,12 @@ def fallback_pick(
     feed_url: str = "",
     likes: tuple[str, ...] = (),
     dislikes: tuple[str, ...] = (),
+    section_id: str = "",
 ) -> list[dict]:
     eligible = eligible_candidates(candidates, seen)
-    chosen = fallback_from_eligible(eligible, count, seen, prefer_terms, max_chars, likes, dislikes)
+    chosen = fallback_from_eligible(
+        eligible, count, seen, prefer_terms, max_chars, likes, dislikes, section_id
+    )
     if chosen:
         return [_public_item(item) for item in chosen]
     return [placeholder_item(feed_url or "https://example.invalid/feed")]
@@ -1322,10 +1469,11 @@ def _chat_url() -> str:
 def _system_prompt(count: int, max_chars: int) -> str:
     return (
         "You choose items for a morning news receipt shared by two adults. "
-        "Pick the most newsworthy and interesting candidates. Reject obituaries, "
-        "advertisements, clickbait, and investing spam such as last-chance-to-buy alerts. "
-        "Prefer concrete events over commentary. Follow the taste note, the interests profile, and each section's purpose. "
-        "When the profile dislikes a candidate, do not spend a slot on it if anything else is left. "
+        "You are the judge of what is relevant. Each section purpose is the rubric for that section. "
+        "The interests profile is a nudge: prefer likes and skip a dislike when something else is left. "
+        "Reject obituaries, advertisements, clickbait, and investing spam such as last-chance-to-buy alerts. "
+        "Prefer concrete events over commentary. "
+        "recent_titles are stories already printed. Do not pick a repeat of one of them, even when the headline is reworded. "
         f"Use only the candidate urls, copied exactly. Choose at most {count} items per section "
         "and use each url at most once. Do not invent items. "
         f"Write each summary as one or two sentences in plain words, at most {max_chars} characters, "
@@ -1336,12 +1484,37 @@ def _system_prompt(count: int, max_chars: int) -> str:
     )
 
 
+def recent_history_titles(history: list[dict], digest_date: str, keep_days: int = 7) -> list[str]:
+    """Titles printed on earlier days inside the history window."""
+    try:
+        cutoff = (dt.date.fromisoformat(digest_date) - dt.timedelta(days=keep_days)).isoformat()
+    except ValueError:
+        cutoff = ""
+    titles: list[str] = []
+    seen: set[str] = set()
+    for record in history:
+        if not isinstance(record, dict):
+            continue
+        recorded = str(record.get("digest_date") or "")
+        if not recorded or recorded == digest_date or recorded < cutoff:
+            continue
+        title = str(record.get("title") or "").strip()
+        if not title or title in seen:
+            continue
+        seen.add(title)
+        titles.append(title[:240])
+        if len(titles) >= 40:
+            break
+    return titles
+
+
 def _user_payload(
     groups: list[tuple[str, str, list[dict]]],
     taste: str,
     count: int,
     max_chars: int,
     interests: str = "",
+    recent_titles: list[str] | None = None,
 ) -> str:
     sections = []
     for title, purpose, eligible in groups:
@@ -1361,6 +1534,7 @@ def _user_payload(
         {
             "taste": taste,
             "interests": interests,
+            "recent_titles": recent_titles or [],
             "items_per_section": count,
             "summary_max_chars": max_chars,
             "sections": sections,
@@ -1493,6 +1667,7 @@ def llm_pick(
     opener,
     deadline: float | None = None,
     interests: str = "",
+    recent_titles: list[str] | None = None,
 ) -> list[dict]:
     key = settings.llm_api_key()
     if not key or any(char.isspace() for char in key):
@@ -1500,7 +1675,7 @@ def llm_pick(
     url = _chat_url()
     messages = [
         {"role": "system", "content": _system_prompt(count, max_chars)},
-        {"role": "user", "content": _user_payload(groups, taste, count, max_chars, interests)},
+        {"role": "user", "content": _user_payload(groups, taste, count, max_chars, interests, recent_titles)},
     ]
     full = {
         "model": settings.llm_model(),
@@ -1571,9 +1746,29 @@ def pick_news(
     profile = profile or empty_profile()
     interests = profile_brief(profile)
     seen = Seen(history, digest_date, settings.history_days())
+    printed = recent_history_titles(history, digest_date, settings.history_days())
     prepared: list[tuple[dict, list[dict]]] = []
     for request in requests:
-        prepared.append((request, eligible_candidates(request.get("candidates") or [], seen)))
+        section_id = str(request.get("section_id") or "")
+        likes, dislikes = profile_terms(profile, section_id)
+        eligible = eligible_candidates(request.get("candidates") or [], seen)
+        eligible = [
+            item
+            for _index, item in sorted(
+                enumerate(eligible),
+                key=lambda pair: (
+                    -relevance_score(
+                        pair[1],
+                        likes,
+                        dislikes,
+                        tuple(request.get("prefer_terms") or ()),
+                        section_id,
+                    ),
+                    pair[0],
+                ),
+            )
+        ]
+        prepared.append((request, eligible))
 
     opener = opener or _default_opener
     llm_picks = None
@@ -1594,6 +1789,7 @@ def pick_news(
                 opener=opener,
                 deadline=deadline,
                 interests=interests,
+                recent_titles=printed,
             )
             reason = "ok"
         except LLMError as exc:
@@ -1649,6 +1845,7 @@ def pick_news(
                 max_chars,
                 likes,
                 dislikes,
+                str(request.get("section_id") or ""),
             )
             if extra:
                 if llm_picks is not None:

@@ -53,15 +53,23 @@ SECTION_KINDS = {
 
 PURPOSES = {
     "weather": "Daytime forecast for Bastrop, Texas.",
-    "global": "World news that will still matter by tonight. Prefer reported events over columns. Follow the interests profile.",
+    "global": (
+        "World news that will still matter by tonight. Prefer reported events over columns. "
+        "Follow the interests profile. You decide what is relevant. A dislike is a nudge, not a ban, "
+        "except for obituaries."
+    ),
     "local": (
-        "New openings and things to do in Bastrop and nearby: restaurants, bars, breweries, "
-        "coffee shops, shops, markets, live music, and outdoor activities in Bastrop, Smithville, "
-        "Elgin, Cedar Creek, or east Austin. Skip city council, government, school board, crime, and obituaries."
+        "Bastrop and nearby, for a childless couple in their early 30s. "
+        "Want new openings, food trucks, bars, tastings, live music, markets, and outdoor things to do "
+        "in Bastrop, Smithville, Elgin, Cedar Creek, and east Austin. "
+        "No sports. No civic items: city council meetings and votes, government meetings, school board, "
+        "crime, or obituaries. A story that only mentions city council in passing can stay."
     ),
     "companies": (
         "Company news about SpaceX and about Earth Funeral, the human-composting company. "
-        "Prefer launches, milestones, facilities, and press. Skip stock prices and market chatter. "
+        "Prefer launches, milestones, facilities, and press. Skip share prices, stock prices, and "
+        "market chatter such as a stock that jumps, drops, or is upgraded. "
+        "A stock of engines, or something that is in stock, is not market chatter. "
         "If one company has no real story, leave it out. Do not fill the gap with unrelated items."
     ),
     "shows": "Upcoming concerts by the configured artists within about an hour of Bastrop.",
