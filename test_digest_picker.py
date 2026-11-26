@@ -123,6 +123,24 @@ class PickerTests(unittest.TestCase):
         self.assertTrue(dp.is_obituary("Mayor dies in a crash"))
         self.assertTrue(dp.is_obituary("Death of a long-serving clerk shocks the town"))
         self.assertTrue(dp.is_obituary("Driver killed in a downtown collision"))
+        self.assertFalse(dp.is_obituary("Senate killed the bill"))
+        self.assertTrue(dp.is_obituary("The clerk was killed overnight"))
+        self.assertTrue(dp.is_obituary("A guard killed by an intruder"))
+        kept = dp.fallback_pick(
+            [
+                item(
+                    "Senate killed the bill",
+                    "https://example.com/bill",
+                    "Lawmakers voted the package down before the recess and the sponsor said the chamber will try again next month.",
+                    "Thu, 26 Nov 2026 08:00:00 GMT",
+                )
+            ],
+            1,
+            dp.Seen([], "2026-11-26"),
+            max_chars=300,
+            feed_url="https://example.com/feed",
+        )
+        self.assertEqual(kept[0]["title"], "Senate killed the bill")
         self.assertTrue(dp.is_spam("Stocks I'm buying this week"))
         self.assertTrue(dp.is_spam("Stocks to watch before the open"))
 

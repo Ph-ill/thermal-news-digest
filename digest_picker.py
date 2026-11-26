@@ -11,12 +11,16 @@ import datetime as dt
 from email.utils import parsedate_to_datetime
 import errno
 import fcntl
+import http.client
 import json
 import os
 from pathlib import Path
 import re
+import socket
 import stat
+import sys
 import tempfile
+import threading
 import time
 import unicodedata
 import urllib.error
@@ -40,7 +44,11 @@ _OBITUARY = re.compile(
     r"celebration of life)\b|\b(?:dies|died|dead) at \d",
     re.IGNORECASE,
 )
-_DEATH = re.compile(r"\b(?:dies|died|killed)\b|\bdeath of\b", re.IGNORECASE)
+# Person-death phrasing only. "Senate killed the bill" is legislation, not an obituary.
+_DEATH = re.compile(
+    r"\b(?:dies|died)\b|\bdeath of\b|\bkilled in\b|\bwas killed\b|\bkilled by\b",
+    re.IGNORECASE,
+)
 _DIES_AT_SEA = re.compile(r"\bdies at sea\b", re.IGNORECASE)
 _SPAM = re.compile(
     r"last chance to buy|stock alert|penny stocks?|stocks? to buy|shares? to buy|"
@@ -114,111 +122,302 @@ def strip_userinfo(url: str) -> str:
     return urllib.parse.urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
 
 
-class _ChunkDecoder:
-    """Turn one chunked HTTP body into payload bytes, one socket read at a time."""
+class _DeadlineWatch:
+    """Close the request socket when an absolute monotonic deadline passes.
 
-    def __init__(self) -> None:
-        self.buf = b""
-        self.need: int | None = None
-        self.done = False
+    ``urlopen``'s timeout is an idle timer: a byte of status line, header, or
+    body resets it. This watchdog holds a duplicate of every socket the
+    connection creates and shuts that connection down at ``deadline``, covering
+    connect, headers, and body. DNS is bounded separately, before a socket exists.
+    """
 
-    def feed(self, data: bytes) -> bytes:
-        self.buf += data
-        pieces: list[bytes] = []
-        while not self.done:
-            if self.need is None:
-                newline = self.buf.find(b"\n")
-                if newline < 0:
-                    break
-                line = self.buf[:newline].strip()
-                self.buf = self.buf[newline + 1 :]
-                size_text = line.split(b";", 1)[0]
-                try:
-                    size = int(size_text or b"0", 16)
-                except ValueError:
-                    self.done = True
-                    break
-                if size == 0:
-                    self.done = True
-                    break
-                self.need = size
-            if len(self.buf) < self.need:
-                break
-            pieces.append(self.buf[: self.need])
-            self.buf = self.buf[self.need :]
-            if self.buf.startswith(b"\r\n"):
-                self.buf = self.buf[2:]
-            elif self.buf.startswith(b"\n"):
-                self.buf = self.buf[1:]
-            self.need = None
-        return b"".join(pieces)
+    def __init__(self, deadline: float | None):
+        self.deadline = deadline
+        self._lock = threading.Lock()
+        self._socks: list[socket.socket] = []
+        self._stop = threading.Event()
+        self._fired = False
+        if deadline is not None:
+            threading.Thread(target=self._run, name="digest-deadline", daemon=True).start()
+
+    def arm(self, sock: socket.socket) -> None:
+        try:
+            duped = socket.socket(fileno=os.dup(sock.fileno()))
+        except OSError:
+            return
+        with self._lock:
+            expired = self._fired or self._stop.is_set() or (
+                self.deadline is not None and time.monotonic() >= self.deadline
+            )
+            if expired:
+                self._fired = True
+            else:
+                self._socks.append(duped)
+        if expired:
+            _abort_socket(duped)
+
+    def disarm(self) -> None:
+        """The request finished in time. Drop the duplicates without shutting it down."""
+        with self._lock:
+            self._stop.set()
+            if self._fired:
+                return
+            socks = list(self._socks)
+            self._socks.clear()
+        for duped in socks:
+            try:
+                duped.close()
+            except OSError:
+                pass
+
+    def _run(self) -> None:
+        delay = 0.0 if self.deadline is None else self.deadline - time.monotonic()
+        if delay > 0 and self._stop.wait(delay):
+            return
+        with self._lock:
+            if self._stop.is_set():
+                return
+            self._fired = True
+            socks = list(self._socks)
+            self._socks.clear()
+        for duped in socks:
+            _abort_socket(duped)
 
 
-def _read_some(response, size: int) -> bytes:
-    """One socket read. BufferedReader.read(n) would keep going until n bytes arrived."""
-    fp = getattr(response, "fp", None)
-    if fp is not None and hasattr(fp, "read1"):
-        data = fp.read1(size)
+def _abort_socket(sock: socket.socket) -> None:
+    try:
+        sock.shutdown(socket.SHUT_RDWR)
+    except OSError:
+        pass
+    try:
+        sock.close()
+    except OSError:
+        pass
+
+
+def _getaddrinfo(host: str, port: int, deadline: float | None):
+    """Resolve ``host`` and give up at ``deadline``. ``getaddrinfo`` has no timeout of its own."""
+    if deadline is None:
+        return socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)
+    if time.monotonic() >= deadline:
+        raise TimeoutError("budget")
+    box: dict = {}
+
+    def resolve() -> None:
+        try:
+            box["result"] = socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)
+        except Exception as exc:
+            box["error"] = exc
+
+    thread = threading.Thread(target=resolve, name="digest-dns", daemon=True)
+    thread.start()
+    thread.join(max(0.0, deadline - time.monotonic()))
+    if thread.is_alive():
+        raise TimeoutError("budget")
+    if "error" in box:
+        raise box["error"]
+    return box.get("result") or []
+
+
+def _open_deadline_socket(host: str, port: int, timeout, source_address, watch: _DeadlineWatch | None):
+    deadline = None if watch is None else watch.deadline
+    if deadline is not None and time.monotonic() >= deadline:
+        raise TimeoutError("budget")
+    infos = _getaddrinfo(host, port, deadline)
+    last_error: OSError | None = None
+    for af, socktype, proto, _canon, sa in infos:
+        sock = socket.socket(af, socktype, proto)
+        try:
+            _apply_idle_timeout(sock, timeout, deadline)
+            if source_address:
+                sock.bind(source_address)
+            try:
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            except OSError as exc:
+                if exc.errno != errno.ENOPROTOOPT:
+                    raise
+            if watch is not None:
+                watch.arm(sock)
+            sock.connect(sa)
+            return sock
+        except TimeoutError:
+            sock.close()
+            raise
+        except OSError as exc:
+            last_error = exc
+            try:
+                sock.close()
+            except OSError:
+                pass
+    if last_error is not None:
+        raise last_error
+    raise OSError(f"no address for {host}")
+
+
+def _apply_idle_timeout(sock: socket.socket, timeout, deadline: float | None) -> None:
+    """Idle backstop. A trickle still has to be cut off by the watchdog."""
+    if timeout is None or timeout is socket._GLOBAL_DEFAULT_TIMEOUT:
+        idle = None
     else:
-        data = response.read(size)
-    if isinstance(data, str):
-        data = data.encode("utf-8", errors="replace")
-    return data or b""
+        idle = float(timeout)
+    if deadline is not None:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise TimeoutError("budget")
+        idle = left if idle is None else min(idle, left)
+    if idle is not None:
+        sock.settimeout(max(0.05, idle))
+
+
+class _DeadlineHTTPConnection(http.client.HTTPConnection):
+    def __init__(self, host, port=None, timeout=socket._GLOBAL_DEFAULT_TIMEOUT, source_address=None, *, blocksize=8192, watch=None):
+        self._watch = watch
+        super().__init__(host, port, timeout, source_address, blocksize=blocksize)
+
+    def connect(self):
+        sys.audit("http.client.connect", self, self.host, self.port)
+        self.sock = _open_deadline_socket(self.host, self.port, self.timeout, self.source_address, self._watch)
+        if self._tunnel_host:
+            self._tunnel()
+
+
+class _DeadlineHTTPSConnection(_DeadlineHTTPConnection):
+    default_port = http.client.HTTPS_PORT
+
+    def __init__(
+        self,
+        host,
+        port=None,
+        timeout=socket._GLOBAL_DEFAULT_TIMEOUT,
+        source_address=None,
+        *,
+        context=None,
+        blocksize=8192,
+        watch=None,
+    ):
+        super().__init__(host, port, timeout, source_address, blocksize=blocksize, watch=watch)
+        if context is None:
+            context = http.client._create_https_context(http.client.HTTPSConnection._http_vsn)
+        self._context = context
+
+    def connect(self):
+        super().connect()
+        wrapped = self._context.wrap_socket(self.sock, server_hostname=self._tunnel_host or self.host)
+        self.sock = wrapped
+        if self._watch is not None:
+            self._watch.arm(wrapped)
+
+
+class _BudgetHTTPHandler(urllib.request.HTTPHandler):
+    def __init__(self, watch: _DeadlineWatch):
+        super().__init__()
+        self._watch = watch
+
+    def http_open(self, req):
+        watch = self._watch
+
+        def factory(host, timeout=socket._GLOBAL_DEFAULT_TIMEOUT, source_address=None, **_kwargs):
+            return _DeadlineHTTPConnection(host, timeout=timeout, source_address=source_address, watch=watch)
+
+        return self.do_open(factory, req)
+
+
+class _BudgetHTTPSHandler(urllib.request.HTTPSHandler):
+    def __init__(self, watch: _DeadlineWatch):
+        super().__init__()
+        self._watch = watch
+
+    def https_open(self, req):
+        watch = self._watch
+        context = self._context
+
+        def factory(host, timeout=socket._GLOBAL_DEFAULT_TIMEOUT, source_address=None, context=None, **_kwargs):
+            return _DeadlineHTTPSConnection(
+                host,
+                timeout=timeout,
+                source_address=source_address,
+                context=context or self._context,
+                watch=watch,
+            )
+
+        return self.do_open(factory, req, context=context)
+
+
+class _WatchedResponse:
+    def __init__(self, response, watch: _DeadlineWatch):
+        self._response = response
+        self._watch = watch
+
+    def __enter__(self):
+        return self._response
+
+    def __exit__(self, *_exc):
+        try:
+            self._response.close()
+        finally:
+            self._watch.disarm()
+
+
+def open_bounded(request, timeout: float, deadline: float | None):
+    """Open ``request``. When ``deadline`` is set, a watchdog closes the socket at that instant."""
+    if deadline is None:
+        return urllib.request.urlopen(request, timeout=timeout)
+    watch = _DeadlineWatch(deadline)
+    opener = urllib.request.build_opener(_BudgetHTTPHandler(watch), _BudgetHTTPSHandler(watch))
+    try:
+        response = opener.open(request, timeout=timeout)
+    except BaseException:
+        watch.disarm()
+        raise
+    return _WatchedResponse(response, watch)
 
 
 def read_bounded(response, limit: int, deadline: float | None) -> bytes:
-    """Read at most ``limit`` bytes, and stop when ``deadline`` (monotonic) passes.
+    """Read at most ``limit`` decoded body bytes, and stop when ``deadline`` passes.
 
-    Each step is a single socket read. A sender that trickles a few bytes just
-    inside the socket timeout cannot stretch the read past the deadline.
+    Chunk framing is ``http.client``'s. The deadline is enforced by the watchdog
+    started in ``open_bounded`` (a blocked ``read`` is cut off by closing the
+    socket) and by the idle timeout already set on the connection.
     """
     sock = _response_socket(response)
-    chunked = getattr(response, "chunked", False) is True
-    remaining_length = None if chunked else getattr(response, "length", None)
-    decoder = _ChunkDecoder() if chunked else None
+    if deadline is not None and sock is not None:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise TimeoutError("budget")
+        try:
+            current = sock.gettimeout()
+            if current is None or current > left:
+                sock.settimeout(max(0.05, left))
+        except OSError:
+            pass
     chunks: list[bytes] = []
     total = 0
     while total < limit:
-        if deadline is not None:
-            left = deadline - time.monotonic()
-            if left <= 0:
-                raise TimeoutError("budget")
-            if sock is not None:
-                try:
-                    sock.settimeout(max(0.05, min(1.0, left)))
-                except OSError:
-                    pass
-        want = min(8192, limit - total)
-        if isinstance(remaining_length, int):
-            if remaining_length <= 0:
-                break
-            want = min(want, remaining_length)
+        if deadline is not None and time.monotonic() >= deadline:
+            raise TimeoutError("budget")
         try:
-            raw = _read_some(response, want)
-        except TimeoutError:
+            piece = response.read(min(8192, limit - total))
+        except TimeoutError as exc:
+            raise TimeoutError("budget") from exc
+        except Exception as exc:
             if deadline is not None and time.monotonic() >= deadline:
-                raise TimeoutError("budget")
-            continue
-        if not raw:
+                raise TimeoutError("budget") from exc
+            raise
+        if isinstance(piece, str):
+            piece = piece.encode("utf-8", errors="replace")
+        if deadline is not None and time.monotonic() >= deadline:
+            raise TimeoutError("budget")
+        if not piece:
             break
-        if decoder is None:
-            piece = raw
-            if isinstance(remaining_length, int):
-                remaining_length -= len(raw)
-        else:
-            piece = decoder.feed(raw)
-        if piece:
-            chunks.append(piece)
-            total += len(piece)
-        if decoder is not None and decoder.done:
-            break
+        chunks.append(piece)
+        total += len(piece)
     return b"".join(chunks)
 
 
 def _response_socket(response):
     seen: list[object] = []
     current = response
-    for _ in range(4):
+    for _ in range(6):
         if current is None or current in seen:
             break
         seen.append(current)
@@ -722,7 +921,12 @@ def _post_chat(url: str, key: str, body: dict, opener, timeout: float, deadline:
         method="POST",
     )
     try:
-        with opener(request, timeout=timeout) as response:
+        opened = (
+            open_bounded(request, timeout, deadline)
+            if opener is _default_opener
+            else opener(request, timeout=timeout)
+        )
+        with opened as response:
             raw = read_bounded(response, RESPONSE_MAX_BYTES, deadline)
     except LLMError:
         raise

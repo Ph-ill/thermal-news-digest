@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Failure cases that must still put a receipt on paper."""
 
-from email.message import Message
+import contextlib
 import datetime as dt
+from email.message import Message
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import io
 import json
 import os
 from pathlib import Path
@@ -620,6 +622,60 @@ class ShellEndToEndTests(unittest.TestCase):
                 thread.join(2)
 
 
+def _accept_one(handler):
+    sock = socket.socket()
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind(("127.0.0.1", 0))
+    sock.listen(1)
+    port = sock.getsockname()[1]
+
+    def serve():
+        try:
+            conn, _addr = sock.accept()
+        except OSError:
+            return
+        try:
+            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            conn.settimeout(5)
+            handler(conn)
+        except OSError:
+            pass
+        finally:
+            try:
+                conn.close()
+            except OSError:
+                pass
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    return sock, port, thread
+
+
+def _read_request(conn) -> None:
+    data = b""
+    while b"\r\n\r\n" not in data and len(data) < 65536:
+        piece = conn.recv(4096)
+        if not piece:
+            break
+        data += piece
+
+
+def _send_split_chunks(conn, body: bytes) -> None:
+    """Flush after 40 payload bytes, leaving the chunk's trailing CRLF for the next write."""
+    _read_request(conn)
+    first, rest = body[:40], body[40:]
+    conn.sendall(
+        b"HTTP/1.1 200 OK\r\n"
+        b"Transfer-Encoding: chunked\r\n"
+        b"Connection: close\r\n"
+        b"\r\n"
+        + f"{len(first):X}\r\n".encode()
+        + first
+    )
+    time.sleep(0.3)
+    conn.sendall(b"\r\n" + f"{len(rest):X}\r\n".encode() + rest + b"\r\n0\r\n\r\n")
+
+
 class FetchBudgetTests(unittest.TestCase):
     def test_trickling_body_cannot_hold_the_budget(self):
         sock = socket.socket()
@@ -656,6 +712,198 @@ class FetchBudgetTests(unittest.TestCase):
             sock.close()
         self.assertLess(time.monotonic() - started, 4.0)
         thread.join(2)
+
+    def test_trickling_headers_cannot_hold_the_budget(self):
+        """A byte of status line every 0.25s must not run past a 1s deadline."""
+
+        def serve(conn):
+            _read_request(conn)
+            payload = b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\nConnection: close\r\n\r\nx"
+            for index in range(len(payload)):
+                conn.sendall(payload[index : index + 1])
+                time.sleep(0.25)
+
+        sock, port, thread = _accept_one(serve)
+        token = dg._budget_var.set(dg.Budget(1.0))
+        started = time.monotonic()
+        try:
+            with self.assertRaises((TimeoutError, OSError)):
+                dg.fetch(f"http://127.0.0.1:{port}/headers")
+        finally:
+            dg._budget_var.reset(token)
+            sock.close()
+        elapsed = time.monotonic() - started
+        self.assertGreaterEqual(elapsed, 0.75)
+        self.assertLess(elapsed, 4.0)
+        thread.join(2)
+
+    def test_chunk_split_at_the_boundary_returns_the_whole_feed(self):
+        body = (
+            b"<?xml version='1.0'?><rss version='2.0'><channel><item>"
+            b"<title>Council funds the harbor reading room</title>"
+            b"<link>https://example.com/harbor-room</link>"
+            b"<description>The council funded the reading room and posted the weekend hours for residents.</description>"
+            b"</item></channel></rss>"
+        )
+        self.assertGreater(len(body), 40)
+        sock, port, thread = _accept_one(lambda conn: _send_split_chunks(conn, body))
+        token = dg._budget_var.set(dg.Budget(10.0))
+        try:
+            raw = dg.fetch(f"http://127.0.0.1:{port}/rss")
+        finally:
+            dg._budget_var.reset(token)
+            sock.close()
+            thread.join(2)
+        self.assertEqual(raw, body)
+        items = dg.rss_items(raw, limit=5)
+        self.assertEqual(items[0]["title"], "Council funds the harbor reading room")
+
+    def test_chunk_split_at_the_boundary_returns_the_whole_model_response(self):
+        content = json.dumps(
+            {
+                "picks": [
+                    {
+                        "section": "GLOBAL",
+                        "items": [
+                            {
+                                "url": "https://example.com/harbor",
+                                "summary": "Mediators finished a written ceasefire before dawn.",
+                            }
+                        ],
+                    }
+                ]
+            }
+        )
+        body = json.dumps({"choices": [{"message": {"content": content}}]}).encode()
+        self.assertGreater(len(body), 40)
+        sock, port, thread = _accept_one(lambda conn: _send_split_chunks(conn, body))
+        try:
+            text = dp._post_chat(
+                f"http://127.0.0.1:{port}/v1/chat/completions",
+                "test-key",
+                {"model": "test"},
+                dp._default_opener,
+                8,
+                time.monotonic() + 10,
+            )
+        finally:
+            sock.close()
+            thread.join(2)
+        self.assertEqual(text, content)
+        self.assertGreater(len(text.encode()), 40)
+
+
+class StateRecoveryTests(unittest.TestCase):
+    def test_broken_state_is_set_aside_and_submit_continues(self):
+        if shutil.which("rsvg-convert") is None:
+            self.skipTest("rsvg-convert is not installed")
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            bindir = root / "bin"
+            bindir.mkdir()
+            (bindir / "lp").write_text(
+                "#!/bin/sh\necho 'request id is receipt-9 (1 file(s))'\n",
+                encoding="utf-8",
+            )
+            (bindir / "lpstat").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            os.chmod(bindir / "lp", 0o755)
+            os.chmod(bindir / "lpstat", 0o755)
+            source = root / "source.json"
+            value = fixtures.payload()
+            source.write_text(json.dumps(value), encoding="utf-8")
+            state = root / "state.json"
+            state.write_text("{", encoding="utf-8")
+            output = root / "output"
+            stdout = io.StringIO()
+            with mock.patch.dict(os.environ, {"PATH": str(bindir) + os.pathsep + os.environ.get("PATH", "")}):
+                with contextlib.redirect_stdout(stdout):
+                    code = rd.main(
+                        [
+                            "--submit",
+                            "--source",
+                            str(source),
+                            "--output-dir",
+                            str(output),
+                            "--state",
+                            str(state),
+                            "--queue",
+                            "receipt",
+                            "--poll-seconds",
+                            "1",
+                        ]
+                    )
+            self.assertEqual(code, 0)
+            self.assertEqual(json.loads(stdout.getvalue())["status"], "completed")
+            kept = list(root.glob("state.json.corrupt-*"))
+            self.assertEqual(len(kept), 1)
+            self.assertEqual(kept[0].read_text(encoding="utf-8"), "{")
+            saved = json.loads(state.read_text(encoding="utf-8"))
+            self.assertEqual(saved["version"], 1)
+            self.assertIn(value["digest_id"], saved["digests"])
+            self.assertIn(saved["digests"][value["digest_id"]]["status"], {"submitted", "completed"})
+
+            huge = root / "huge.json"
+            huge.write_bytes(b"{" + b" " * rd.STATE_MAX_BYTES)
+            self.assertEqual(rd.read_state(huge), {"version": 1, "digests": {}})
+            self.assertFalse(huge.exists())
+            quarantined = list(root.glob("huge.json.corrupt-*"))
+            self.assertEqual(len(quarantined), 1)
+            self.assertGreater(quarantined[0].stat().st_size, rd.STATE_MAX_BYTES)
+
+            shaped = root / "shape.json"
+            shaped.write_text('{"version": 2, "digests": {}}', encoding="utf-8")
+            self.assertEqual(rd.read_state(shaped), {"version": 1, "digests": {}})
+            self.assertFalse(shaped.exists())
+            self.assertEqual(len(list(root.glob("shape.json.corrupt-*"))), 1)
+
+
+class SourceUrlTests(unittest.TestCase):
+    def test_event_and_forecast_urls_drop_userinfo(self):
+        secret = "forecast-userinfo-secret"
+        start = dt.datetime(2026, 11, 26, 12, 0, tzinfo=ZoneInfo("America/Chicago"))
+        event = dg._event_item(
+            {
+                "start": start,
+                "end": None,
+                "is_today": True,
+                "time_listed": True,
+                "location": "Library",
+                "scope": "Neighborhood",
+                "name": "Reading night",
+                "url": f"https://user:{secret}@neighborhood.example.org/events/reading?day=1",
+                "source_id": "neighborhood.example.org:mec:9",
+                "rationale": "Official calendar event",
+            }
+        )
+        self.assertEqual(event["url"], "https://neighborhood.example.org/events/reading?day=1")
+        self.assertNotIn(secret, json.dumps(event))
+
+        forecast = f"https://user:{secret}@api.weather.gov/gridpoints/TOP/31,80/forecast"
+        day = {
+            "name": "Thursday",
+            "isDaytime": True,
+            "startTime": start.isoformat(),
+            "temperature": 64,
+            "temperatureUnit": "F",
+            "shortForecast": "Fair",
+            "detailedForecast": "Fair during the afternoon with a light breeze.",
+        }
+        formatted = dg.format_weather_item(day, None, forecast)
+        self.assertEqual(formatted["url"], "https://api.weather.gov/gridpoints/TOP/31,80/forecast")
+        self.assertNotIn(secret, json.dumps(formatted))
+
+        seen = []
+
+        def fetcher(url):
+            seen.append(url)
+            if url == dg.WEATHER_POINT:
+                return json.dumps({"properties": {"forecast": forecast}}).encode()
+            return json.dumps({"properties": {"periods": [day]}}).encode()
+
+        weather_item = dg.weather(fetcher, "2026-11-26")
+        self.assertEqual(seen[1], "https://api.weather.gov/gridpoints/TOP/31,80/forecast")
+        self.assertNotIn(secret, json.dumps(weather_item))
+        self.assertNotIn(secret, " ".join(seen))
 
 
 if __name__ == "__main__":

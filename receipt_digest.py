@@ -55,6 +55,7 @@ PROJECT_DIR = Path(os.environ.get("DIGEST_HOME") or Path(__file__).resolve().par
 DEFAULT_OUTPUT_DIR = PROJECT_DIR / "output"
 DEFAULT_STATE = PROJECT_DIR / "state.json"
 DEFAULT_QUEUE = os.environ.get("DIGEST_PRINTER_QUEUE", "receipt")
+STATE_MAX_BYTES = 1_048_576
 # Required titles in the default order, captured at import for existing callers.
 # validate_payload reads the live ordered list so optional sections can be absent
 # and a deployment can rename headers without editing this file.
@@ -591,13 +592,41 @@ def render(source: Path, output_dir: Path) -> dict:
     return metadata
 
 
+def _blank_state() -> dict:
+    return {"version": 1, "digests": {}}
+
+
+def _quarantine_state(path: Path) -> None:
+    """Move a state file aside so a later submit can start clean without deleting the evidence."""
+    stamp = time.time_ns()
+    dest = path.with_name(f"{path.name}.corrupt-{stamp}")
+    counter = 0
+    while dest.exists():
+        counter += 1
+        dest = path.with_name(f"{path.name}.corrupt-{stamp}-{counter}")
+    os.replace(path, dest)
+
+
 def read_state(path: Path) -> dict:
+    """Load print state. An unreadable or wrongly shaped file is set aside and replaced with a fresh one."""
     if not path.exists():
-        return {"version": 1, "digests": {}}
-    value = json.loads(path.read_text(encoding="utf-8"))
-    if value.get("version") != 1 or not isinstance(value.get("digests"), dict):
-        raise ValueError(f"invalid state file: {path}")
-    return value
+        return _blank_state()
+    try:
+        with path.open("rb") as handle:
+            raw = handle.read(STATE_MAX_BYTES + 1)
+        if len(raw) > STATE_MAX_BYTES:
+            raise ValueError("state too large")
+        value = json.loads(raw.decode("utf-8"))
+        if not isinstance(value, dict) or value.get("version") != 1 or not isinstance(value.get("digests"), dict):
+            raise ValueError("invalid state")
+        return value
+    except Exception:
+        try:
+            if path.exists():
+                _quarantine_state(path)
+        except OSError:
+            pass
+        return _blank_state()
 
 
 def submit(metadata: dict, queue: str, state_path: Path, poll_seconds: int, *, force: bool = False) -> dict:

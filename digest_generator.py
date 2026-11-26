@@ -104,8 +104,16 @@ def fetch(url: str) -> bytes:
             raise TimeoutError("budget")
         deadline = budget.deadline
     request = urllib.request.Request(url, headers={"User-Agent": "daily-digest/2.0"})
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        return digest_picker.read_bounded(response, FETCH_READ_CAP, deadline)
+    try:
+        with digest_picker.open_bounded(request, timeout, deadline) as response:
+            return digest_picker.read_bounded(response, FETCH_READ_CAP, deadline)
+    except TimeoutError:
+        raise TimeoutError("budget")
+    except Exception as exc:
+        # Header and connect failures surface after the watchdog closes the socket.
+        if deadline is not None and time.monotonic() >= deadline:
+            raise TimeoutError("budget") from exc
+        raise
 
 
 def clean(value: str) -> str:
@@ -196,7 +204,7 @@ def _event_item(event: dict) -> dict:
     return {
         "title": f"{date_label} · {time_label} · {clean(event['name'])}",
         "summary": f"{location} · {scope}",
-        "url": event["url"],
+        "url": digest_picker.strip_userinfo(event["url"]),
         "published_at": start.isoformat(),
         "event_start": start.isoformat(),
         "event_end": end.isoformat() if end else None,
@@ -564,6 +572,7 @@ def _trim_words(text: str, limit: int) -> str:
 
 
 def format_weather_item(day: dict, night: dict | None, forecast_url: str) -> dict:
+    forecast_url = digest_picker.strip_userinfo(forecast_url)
     high = _temperature_text(day)
     if high is None:
         raise KeyError("daytime temperature")
@@ -595,7 +604,7 @@ def format_weather_item(day: dict, night: dict | None, forecast_url: str) -> dic
 
 def weather(fetcher: Callable[[str], bytes], digest_date: str) -> dict:
     point = json.loads(fetcher(WEATHER_POINT))
-    forecast_url = point["properties"]["forecast"]
+    forecast_url = digest_picker.strip_userinfo(str(point["properties"]["forecast"]))
     forecast = json.loads(fetcher(forecast_url))
     periods = forecast["properties"]["periods"]
     try:
