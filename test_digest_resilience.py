@@ -19,6 +19,8 @@ import threading
 import time
 import unittest
 import urllib.error
+import urllib.parse
+import urllib.request
 from unittest import mock
 from zoneinfo import ZoneInfo
 
@@ -1183,6 +1185,264 @@ class SourceUrlTests(unittest.TestCase):
         self.assertEqual(seen[1], "https://api.weather.gov/gridpoints/TOP/31,80/forecast")
         self.assertNotIn(secret, json.dumps(weather_item))
         self.assertNotIn(secret, " ".join(seen))
+
+
+class TriggerJournalTests(unittest.TestCase):
+    def test_journal_keeps_the_decision_and_drops_secrets(self):
+        secret = "sk-journal-secret-value"
+        ticket = "tm-journal-secret-value"
+        short = (
+            f"DIGEST_LLM_API_KEY={secret}\n"
+            f"Authorization: Bearer {secret}\n"
+            f"https://app.ticketmaster.com/discovery/v2/events.json?apikey={ticket}\n"
+            "picker mode=picks reason=ok\n"
+        )
+        env = {"DIGEST_LLM_API_KEY": secret, "DIGEST_TICKETMASTER_KEY": ticket}
+        with mock.patch.dict(os.environ, env):
+            cleaned_short = trigger.prepare_journal(short)
+            cleaned = trigger.prepare_journal(short + ("A" * 9000) + "\n" + short)
+        self.assertNotIn(secret, cleaned_short)
+        self.assertNotIn(ticket, cleaned_short)
+        self.assertIn("[redacted]", cleaned_short)
+        self.assertNotIn("truncated", cleaned_short)
+        self.assertIn("picker mode=picks reason=ok", cleaned_short)
+        self.assertNotIn(secret, cleaned)
+        self.assertNotIn(ticket, cleaned)
+        self.assertIn("[redacted]", cleaned)
+        self.assertIn("picker mode=picks reason=ok", cleaned)
+        self.assertIn("truncated", cleaned)
+        self.assertLess(cleaned.count("A"), 9000)
+        self.assertLessEqual(len(cleaned), trigger.JOURNAL_MAX_CHARS + 32)
+        self.assertNotIn("os.environ", cleaned)
+
+    def test_post_logs_stderr_and_keeps_it_off_the_response(self):
+        secret = "sk-journal-secret-value"
+        seen = []
+
+        def fake(mode, timeout=None, bridge=None):
+            seen.append(mode)
+            return subprocess.CompletedProcess(
+                ["bridge", mode],
+                0,
+                json.dumps({"status": "dry_run", "digest_id": "abc"}),
+                f"picker mode=fallback reason=no_api_key\nDIGEST_LLM_API_KEY={secret}\n",
+            )
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), trigger.Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        port = server.server_address[1]
+        try:
+            stderr = io.StringIO()
+            with mock.patch.object(trigger, "run_bridge", fake), mock.patch.dict(
+                os.environ, {"DIGEST_LLM_API_KEY": secret}
+            ):
+                with contextlib.redirect_stderr(stderr):
+                    for path in ("/v1/digest/dry-run", "/v1/digest/rebuild"):
+                        request = urllib.request.Request(
+                            f"http://127.0.0.1:{port}{path}",
+                            data=b"",
+                            method="POST",
+                        )
+                        with urllib.request.urlopen(request, timeout=5) as response:
+                            body = json.loads(response.read().decode("utf-8"))
+                        self.assertEqual(response.status, 200)
+                        self.assertNotIn("stderr", body)
+                        self.assertNotIn(secret, json.dumps(body))
+                        self.assertEqual(body["result"]["digest_id"], "abc")
+            logged = stderr.getvalue()
+            self.assertIn("picker mode=fallback reason=no_api_key", logged)
+            self.assertIn("receipt-digest-trigger:", logged)
+            self.assertNotIn(secret, logged)
+            self.assertIn("[redacted]", logged)
+            self.assertEqual(seen, ["--dry-run", "--rebuild"])
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(2)
+
+    def test_journal_redacts_feed_query_tokens_userinfo_and_encoded_secrets(self):
+        feed_secret = "feed-secret-value"
+        password = "p@ss/word"
+        encoded = urllib.parse.quote(password, safe="")
+        text = (
+            f"DIGEST_LOCAL_FEED=https://news.example/rss?apikey={feed_secret}&hl=en\n"
+            f"https://user:{password}@feeds.example/local.xml\n"
+            f"https://feeds.example/q?api_key={encoded}&token={feed_secret}&key={feed_secret}"
+            f"&secret={feed_secret}&password={password}&access_token={feed_secret}&sig={feed_secret}\n"
+            f"copy {encoded}\n"
+        )
+        env = {
+            "DIGEST_LLM_API_KEY": password,
+            "DIGEST_LOCAL_FEED": f"https://news.example/rss?apikey={feed_secret}",
+        }
+        with mock.patch.dict(os.environ, env):
+            cleaned = trigger.prepare_journal(text)
+        self.assertNotIn(feed_secret, cleaned)
+        self.assertNotIn(password, cleaned)
+        self.assertNotIn(encoded, cleaned)
+        self.assertNotIn("user:", cleaned)
+        self.assertIn("[redacted]", cleaned)
+        self.assertIn("DIGEST_LOCAL_FEED=", cleaned)
+        self.assertIn("hl=en", cleaned)
+
+    def test_printed_source_errors_drop_feed_secrets(self):
+        feed_secret = "feed-secret-value"
+        password = "p@ss/word"
+        encoded = urllib.parse.quote(password, safe="")
+        payload = {
+            "digest_id": "abc",
+            "picker": {"mode": "fallback", "source": "fallback"},
+            "sections": [],
+            "source_errors": [
+                {
+                    "section": "BASTROP",
+                    "url": f"https://user:{password}@news.example/rss?apikey={feed_secret}&hl=en",
+                    "error": f"timeout https://news.example/rss?token={encoded}&sig={feed_secret}",
+                }
+            ],
+        }
+        with tempfile.TemporaryDirectory() as temp:
+            out = Path(temp) / "source.json"
+            stdout = io.StringIO()
+            with mock.patch.object(dg, "make_payload", return_value=payload), mock.patch.object(dp, "save_history"):
+                with contextlib.redirect_stdout(stdout):
+                    code = dg.main(["--out", str(out), "--date", "2026-11-26"])
+        self.assertEqual(code, 0)
+        printed = stdout.getvalue()
+        self.assertNotIn(feed_secret, printed)
+        self.assertNotIn(password, printed)
+        self.assertNotIn(encoded, printed)
+        self.assertNotIn("user:", printed)
+        self.assertIn("[redacted]", printed)
+        self.assertIn("hl=en", printed)
+
+
+class RebuildSourceTests(unittest.TestCase):
+    def test_rebuild_keeps_the_old_source_and_prints_a_new_one(self):
+        for tool in ("flock", "date", "bash", "rm", "mkdir", "mv", "rsvg-convert"):
+            if shutil.which(tool) is None:
+                self.skipTest(f"{tool} is not installed")
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            bindir = root / "bin"
+            bindir.mkdir()
+            call_log = root / "calls.log"
+            gen_count = root / "gen.count"
+            for name in ("flock", "rsvg-convert", "date", "bash", "rm", "mkdir", "mv"):
+                os.symlink(shutil.which(name), bindir / name)
+            (bindir / "lp").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            (bindir / "lpstat").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            (bindir / "python3").write_text(
+                "#!/bin/bash\n"
+                'printf "%s\\n" "$*" >> "$CALL_LOG"\n'
+                'case "$1" in\n'
+                "  *digest_generator.py)\n"
+                "    out=\n"
+                "    prev=\n"
+                '    for arg in "$@"; do\n'
+                '      if [[ "$prev" == "--out" ]]; then out=$arg; fi\n'
+                "      prev=$arg\n"
+                "    done\n"
+                "    count=0\n"
+                '    if [[ -f "$GEN_COUNT" ]]; then read -r count < "$GEN_COUNT"; fi\n'
+                "    count=$((count + 1))\n"
+                '    printf "%s\\n" "$count" > "$GEN_COUNT"\n'
+                '    if [[ "${FAIL_GEN:-}" == "1" ]]; then\n'
+                '      printf "partial\\n" > "$out"\n'
+                '      printf "generation failed\\n" >&2\n'
+                "      exit 1\n"
+                "    fi\n"
+                '    printf "{\\"n\\":%s}\\n" "$count" > "$out"\n'
+                '    printf "picker mode=picks reason=ok\\n" >&2\n'
+                "    exit 0\n"
+                "    ;;\n"
+                "esac\n"
+                'printf "%s\\n" "{\\"status\\":\\"submitted\\",\\"digest_id\\":\\"abc\\"}"\n'
+                "exit 0\n",
+                encoding="utf-8",
+            )
+            os.chmod(bindir / "lp", 0o755)
+            os.chmod(bindir / "lpstat", 0o755)
+            os.chmod(bindir / "python3", 0o755)
+            repo = Path(__file__).resolve().parent
+            for name in ("digest_generator.py", "receipt_digest.py", "print_digest_safe.sh"):
+                os.symlink(repo / name, root / name)
+            zone = ZoneInfo("America/Chicago")
+            today = dt.datetime.now(zone).date().isoformat()
+            output = root / "output"
+            output.mkdir()
+            source = output / f"digest-source-{today}.json"
+            source.write_text('{"frozen":"morning"}\n', encoding="utf-8")
+            env = os.environ.copy()
+            env.update(
+                {
+                    "DIGEST_HOME": str(root),
+                    "DIGEST_TOOL_PATH": str(bindir),
+                    "DIGEST_TZ": "America/Chicago",
+                    "DIGEST_PRINTER_QUEUE": "receipt",
+                    "CALL_LOG": str(call_log),
+                    "GEN_COUNT": str(gen_count),
+                }
+            )
+            script = root / "print_digest_safe.sh"
+
+            def run(mode: str) -> subprocess.CompletedProcess:
+                return subprocess.run(
+                    ["bash", str(script), mode],
+                    cwd=root,
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    timeout=20,
+                    check=False,
+                )
+
+            first = run("--rebuild")
+            self.assertEqual(first.returncode, 0, first.stderr[-2000:])
+            archived = output / f"digest-source-{today}.v1.json"
+            self.assertEqual(archived.read_text(encoding="utf-8"), '{"frozen":"morning"}\n')
+            self.assertEqual(json.loads(source.read_text(encoding="utf-8"))["n"], 1)
+            self.assertIn("--reprint", call_log.read_text(encoding="utf-8"))
+            self.assertIn("picker mode=picks reason=ok", first.stderr)
+            printed = json.loads(first.stdout)
+            self.assertEqual(printed["status"], "submitted")
+
+            second = run("--rebuild")
+            self.assertEqual(second.returncode, 0, second.stderr[-2000:])
+            self.assertEqual(archived.read_text(encoding="utf-8"), '{"frozen":"morning"}\n')
+            second_archive = output / f"digest-source-{today}.v2.json"
+            self.assertEqual(json.loads(second_archive.read_text(encoding="utf-8"))["n"], 1)
+            self.assertEqual(json.loads(source.read_text(encoding="utf-8"))["n"], 2)
+            self.assertFalse((output / f"digest-source-{today}.v3.json").exists())
+
+            calls_before = call_log.read_text(encoding="utf-8").count("digest_generator.py")
+            reprint = run("--reprint")
+            self.assertEqual(reprint.returncode, 0, reprint.stderr[-2000:])
+            calls_after = call_log.read_text(encoding="utf-8").count("digest_generator.py")
+            self.assertEqual(calls_after, calls_before)
+            self.assertFalse((output / f"digest-source-{today}.v3.json").exists())
+            self.assertEqual(json.loads(source.read_text(encoding="utf-8"))["n"], 2)
+
+            original = '{"frozen":"before-failed-rebuild"}\n'
+            source.write_text(original, encoding="utf-8")
+            env["FAIL_GEN"] = "1"
+            failed = run("--rebuild")
+            self.assertNotEqual(failed.returncode, 0, failed.stderr[-2000:])
+            self.assertEqual(source.read_text(encoding="utf-8"), original)
+            self.assertFalse((output / f"digest-source-{today}.v3.json").exists())
+            self.assertIn("Restored previous source", failed.stderr)
+            env.pop("FAIL_GEN", None)
+
+            source.unlink()
+            link_target = output / "elsewhere.json"
+            link_target.write_text("{}\n", encoding="utf-8")
+            source.symlink_to(link_target)
+            refused = run("--rebuild")
+            self.assertNotEqual(refused.returncode, 0)
+            self.assertTrue(source.is_symlink())
+            self.assertEqual(link_target.read_text(encoding="utf-8"), "{}\n")
+            self.assertIn("symlink", refused.stderr.casefold())
 
 
 if __name__ == "__main__":

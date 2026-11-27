@@ -313,6 +313,11 @@ def fresh_hours() -> int:
     return env_int("DIGEST_FRESH_HOURS", 36, 6, 168)
 
 
+def local_fresh_hours() -> int:
+    """BASTROP window. Same 6–168 cap as DIGEST_FRESH_HOURS, default one week."""
+    return env_int("DIGEST_LOCAL_FRESH_HOURS", 168, 6, 168)
+
+
 def company_stale_hours() -> int:
     """How old a company story may be when that company has nothing newer."""
     return env_int("DIGEST_COMPANY_STALE_HOURS", 24 * 14, 36, 24 * 60)

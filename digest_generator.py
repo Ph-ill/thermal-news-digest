@@ -33,6 +33,7 @@ from zoneinfo import ZoneInfo
 import digest_picker
 import digest_settings as settings
 import receipt_art
+import receipt_digest_trigger
 
 # Place defaults are the public city center of Bastrop, Texas. Not a street address.
 def _env(name: str, default: str) -> str:
@@ -837,7 +838,7 @@ def _emergency_payload(digest_date: str, moment: dt.datetime) -> dict:
 
 def make_payload(
     digest_date: str,
-    fetcher: Callable[[str], bytes] = fetch,
+    fetcher: Callable[[str], bytes] | None = None,
     *,
     opener: Callable | None = None,
     now: dt.datetime | None = None,
@@ -850,6 +851,8 @@ def make_payload(
     candidates_directory: Path | None = None,
     export_only: bool = False,
 ) -> dict:
+    if fetcher is None:
+        fetcher = fetch
     moment = now or dt.datetime.now(dt.timezone.utc)
     if moment.tzinfo is None:
         moment = moment.replace(tzinfo=dt.timezone.utc)
@@ -1224,14 +1227,170 @@ def atomic_json(path: Path, value: dict) -> None:
             pass
 
 
+def _item_heading(item: dict) -> str:
+    return str(item.get("title") or item.get("headline") or "")
+
+
+_UNAVAILABLE_HEADINGS = frozenset(
+    {
+        "no new update today (source unavailable)",
+        "no new update today (weather source unavailable)",
+        "forecast unavailable",
+        "forecast not fetched",
+        "forecast timed out",
+        "feed not fetched",
+        "feed timed out",
+    }
+)
+
+
+def _item_source_unavailable(item: dict) -> bool:
+    heading = _item_heading(item).strip().casefold()
+    if heading in _UNAVAILABLE_HEADINGS:
+        return True
+    rationale = str(item.get("rationale") or "").casefold()
+    return rationale in {"not fetched", "timed out"} or rationale.startswith(
+        ("source unavailable", "weather unavailable")
+    )
+
+
+def _section_source_unavailable(section: dict) -> bool:
+    if str(section.get("source_feed") or "") == "unavailable":
+        return True
+    items = [item for item in (section.get("items") or []) if isinstance(item, dict)]
+    if not items:
+        return False
+    return all(_item_source_unavailable(item) for item in items)
+
+
+def _every_source_unavailable(payload: dict) -> bool:
+    """True when every news and weather section is an outage line.
+
+    Bot notes are not a feed. A section that printed a real story, including a
+    quiet "No new update today", means a source was reached.
+    """
+    sources = []
+    for section in payload.get("sections") or []:
+        if not isinstance(section, dict):
+            continue
+        if section.get("source_feed") == "bot-updates":
+            continue
+        sources.append(section)
+    if not sources:
+        return False
+    return all(_section_source_unavailable(section) for section in sources)
+
+
+def _public_source_errors(errors: list) -> list:
+    """The stdout copy of source errors, with feed credentials removed."""
+    cleaned = []
+    for row in errors or []:
+        if not isinstance(row, dict):
+            cleaned.append(row)
+            continue
+        copy = dict(row)
+        for field in ("url", "error"):
+            if isinstance(copy.get(field), str):
+                copy[field] = receipt_digest_trigger.redact_secrets(copy[field])
+        cleaned.append(copy)
+    return cleaned
+
+
+def _item_is_offline(title: str) -> bool:
+    return title == digest_picker.LOCAL_OFFLINE_TITLE
+
+
+def _item_is_fallback(item: dict, title: str) -> bool:
+    if title in {
+        digest_picker.LOCAL_OFFLINE_TITLE,
+        digest_picker.LOCAL_EMPTY_TITLE,
+        digest_picker.PLACEHOLDER_TITLE,
+    }:
+        return True
+    return str(item.get("rationale") or "").startswith("Fallback pick")
+
+
+def check_report(payload: dict) -> tuple[dict, int]:
+    """JSON summary of a payload built the way the 05:00 run would build it.
+
+    Exit 1 when a section uses the offline line, the picks file was ignored, the
+    payload is the emergency edition (``generator_error``), or every news and
+    weather source is unavailable.
+    """
+    sections: list[dict] = []
+    offline_used = False
+    fallback_used = False
+    bot_updates = 0
+    for section in payload.get("sections") or []:
+        if not isinstance(section, dict):
+            continue
+        items = [item for item in (section.get("items") or []) if isinstance(item, dict)]
+        titles = [_item_heading(item) for item in items]
+        section_offline = any(_item_is_offline(title) for title in titles)
+        section_fallback = any(_item_is_fallback(item, title) for item, title in zip(items, titles))
+        offline_used = offline_used or section_offline
+        fallback_used = fallback_used or section_fallback
+        if section.get("source_feed") == "bot-updates":
+            bot_updates += len(items)
+        sections.append(
+            {
+                "section": section.get("section"),
+                "count": len(items),
+                "titles": titles,
+                "fallback": section_fallback,
+                "offline": section_offline,
+            }
+        )
+    picks_ignored = any(
+        isinstance(row, dict) and str(row.get("error") or "").startswith("picks ignored")
+        for row in (payload.get("source_errors") or [])
+    )
+    picker = payload.get("picker") if isinstance(payload.get("picker"), dict) else {}
+    summary = {
+        "digest_date": payload.get("digest_date"),
+        "picker": {
+            "mode": picker.get("mode"),
+            "reason": picker.get("reason"),
+            "source": picker.get("source"),
+        },
+        "sections": sections,
+        "fallback_used": fallback_used,
+        "offline_used": offline_used,
+        "bot_updates": bot_updates,
+        "picks_ignored": picks_ignored,
+        "sources_unavailable": False,
+    }
+    generator_error = str(picker.get("reason") or "") == "generator_error"
+    sources_unavailable = _every_source_unavailable(payload)
+    summary["sources_unavailable"] = sources_unavailable
+    code = 1 if offline_used or picks_ignored or generator_error or sources_unavailable else 0
+    return summary, code
+
+
+def _run_check(day: str, moment: dt.datetime) -> int:
+    """Build today's payload and print a summary. Write nothing."""
+    try:
+        payload = make_payload(day, now=moment, persist_history=False)
+    except Exception:
+        payload = _emergency_payload(day, moment)
+    summary, code = check_report(payload)
+    print(json.dumps(summary, sort_keys=True))
+    return code
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--date", default=None)
     parser.add_argument("--out", type=Path)
     parser.add_argument("--export-candidates", nargs="?", const="", default=None)
+    parser.add_argument("--check", action="store_true")
     args = parser.parse_args(argv)
     day = args.date or digest_date()
     moment = dt.datetime.now(dt.timezone.utc)
+    if args.check and (args.export_candidates is not None or args.out is not None):
+        parser.error("--check writes nothing and cannot be combined with --out or --export-candidates")
+    if args.check:
+        return _run_check(day, moment)
     if args.export_candidates is not None:
         destination = settings.candidates_path(day) if args.export_candidates == "" else Path(args.export_candidates)
         document = make_payload(day, now=moment, persist_history=False, export_only=True)
@@ -1262,7 +1421,7 @@ def main(argv: list[str] | None = None) -> int:
         digest_picker.save_history(settings.history_path(), day, records)
     except Exception:
         pass
-    print(json.dumps({"digest_id": payload["digest_id"], "picker": payload.get("picker", {}).get("mode"), "source": payload.get("picker", {}).get("source"), "sections": len(payload["sections"]), "source_errors": payload["source_errors"], "output": str(args.out.resolve())}, sort_keys=True))
+    print(json.dumps({"digest_id": payload["digest_id"], "picker": payload.get("picker", {}).get("mode"), "source": payload.get("picker", {}).get("source"), "sections": len(payload["sections"]), "source_errors": _public_source_errors(payload.get("source_errors") or []), "output": str(args.out.resolve())}, sort_keys=True))
     return 0
 
 

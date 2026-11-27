@@ -24,12 +24,12 @@ readonly QUEUE="${DIGEST_PRINTER_QUEUE:-receipt}"
 readonly LOCK="$ROOT/print.lock"
 
 usage() {
-  printf 'Usage: %s --dry-run|--submit|--reprint\n' "$(basename "$0")" >&2
+  printf 'Usage: %s --dry-run|--submit|--reprint|--rebuild\n' "$(basename "$0")" >&2
 }
 
 [[ $# -eq 1 ]] || { usage; exit 2; }
 case "$1" in
-  --dry-run|--submit|--reprint) readonly MODE="$1" ;;
+  --dry-run|--submit|--reprint|--rebuild) readonly MODE="$1" ;;
   *) usage; exit 2 ;;
 esac
 
@@ -55,23 +55,67 @@ exec flock --exclusive --nonblock "$LOCK" bash -c '
   output_dir=$5
   state_path=$6
   queue=$7
+  rotated_to=""
   generate() {
     python3 "$generator" --out "$source_path" >&2
   }
+  restore_rotated() {
+    if [[ -n "$rotated_to" && -e "$rotated_to" ]]; then
+      rm -f -- "$source_path"
+      mv -- "$rotated_to" "$source_path"
+      printf "Restored previous source after generation failed\n" >&2
+    fi
+  }
+  generate_or_restore() {
+    generate && return 0
+    status=$?
+    restore_rotated
+    exit "$status"
+  }
+  # Keep the frozen source as digest-source-DATE.vN.json, then write a new one.
+  # A failed generate moves that archive back, so the canonical file is never missing.
+  rotate_source() {
+    if [[ ! -e "$source_path" ]]; then
+      return 0
+    fi
+    if [[ -L "$source_path" ]]; then
+      printf "Refusing to rotate a symlink: %s\n" "$source_path" >&2
+      exit 1
+    fi
+    local n=1 dest
+    while [[ "$n" -le 99 ]]; do
+      dest="${source_path%.json}.v${n}.json"
+      if [[ -e "$dest" ]]; then
+        n=$((n + 1))
+        continue
+      fi
+      mv -- "$source_path" "$dest"
+      rotated_to=$dest
+      printf "Kept previous source as %s\n" "$dest" >&2
+      return 0
+    done
+    printf "Too many archived source files for %s\n" "$source_path" >&2
+    exit 1
+  }
   # Renderer exit 2 means the source cannot be printed. Anything else is kept.
   render() {
-    python3 "$renderer" "$mode" --source "$source_path" --output-dir "$output_dir" --state "$state_path" --queue "$queue"
+    python3 "$renderer" "$1" --source "$source_path" --output-dir "$output_dir" --state "$state_path" --queue "$queue"
   }
+  render_mode=$mode
+  if [[ "$mode" == "--rebuild" ]]; then
+    rotate_source
+    render_mode=--reprint
+  fi
   if [[ ! -s "$source_path" ]]; then
-    generate
+    generate_or_restore
   fi
   status=0
-  render || status=$?
+  render "$render_mode" || status=$?
   if [[ "$status" -eq 2 ]]; then
     rm -f -- "$source_path"
-    generate
+    generate_or_restore
     status=0
-    render || status=$?
+    render "$render_mode" || status=$?
   fi
   exit "$status"
 ' receipt-digest "$GENERATOR" "$SOURCE" "$RENDERER" "$MODE" "$OUTPUT_DIR" "$STATE" "$QUEUE"
