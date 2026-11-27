@@ -14,6 +14,7 @@ for _name in list(os.environ):
         "DIGEST_READER_IDS",
         "DIGEST_SECTION_ORDER",
         "DIGEST_BOT_UPDATES_DIR",
+        "DIGEST_BOT_UPDATES_STYLE",
         "DIGEST_HISTORY_PATH",
     }:
         os.environ.pop(_name, None)
@@ -26,7 +27,7 @@ os.environ.update(
 
 import digest_generator as dg
 import receipt_digest as rd
-from PIL import Image
+from PIL import Image, ImageDraw
 
 
 def payload(headline_suffix: str = "") -> dict:
@@ -181,7 +182,7 @@ class ReceiptDigestTests(unittest.TestCase):
             with_bots = payload()
             with_bots["sections"].append(
                 {
-                    "section": "BOT UPDATES",
+                    "section": "GROK BOT UPDATES",
                     "source_feed": "bot-updates",
                     "items": [
                         {
@@ -207,7 +208,7 @@ class ReceiptDigestTests(unittest.TestCase):
             self.assertGreater(rendered["geometry"]["height_dots"], without["geometry"]["height_dots"])
             self.assertLessEqual(rendered["geometry"]["height_dots"], rd.MAX_HEIGHT_DOTS)
             bot = rendered["geometry"]["sections"][-1]
-            self.assertEqual(bot["name"], "BOT UPDATES")
+            self.assertEqual(bot["name"], "GROK BOT UPDATES")
             self.assertEqual(bot["items"][0]["source"], "Source: Popcorn")
             self.assertIsNone(bot["items"][0]["source_url"])
             self.assertEqual(bot["items"][1]["source"], "Source: Listener")
@@ -273,6 +274,12 @@ class ReceiptDigestTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"DIGEST_SECTION_TITLE_COMPANIES": "COMPANIES"}):
             rd.validate_payload(renamed)
             self.assertEqual(rd.settings.section_by_id("companies").title, "COMPANIES")
+
+    def test_weather_section_still_prints_an_icon(self):
+        with tempfile.TemporaryDirectory() as temp:
+            metadata = self.render_payload(sample_payload(bots=False), Path(temp))
+        icons = [mark for mark in metadata["geometry"]["art"] if mark["type"] == "weather"]
+        self.assertEqual(len(icons), 1)
 
 
 def sample_story(section: str, index: int) -> dict:
@@ -361,19 +368,21 @@ def sample_payload(*, bots: bool) -> dict:
     if bots:
         sections.append(
             {
-                "section": "BOT UPDATES",
+                "section": "GROK BOT UPDATES",
                 "source_feed": "bot-updates",
                 "items": [
                     {
                         "title": "Popcorn: Film picks",
-                        "summary": "A quiet anime about a night courier opens Friday. The review is the one worth making time for.",
+                        "summary": "I found a quiet anime about a night courier. It opens Friday, and I think the review is the one worth your time.",
                         "source_label": "Popcorn",
+                        "avatar": "popcorn",
                         "published_at": "2026-11-26T04:40:00-06:00",
                     },
                     {
                         "title": "Listener: Morning queue (reader-a)",
-                        "summary": "Three new songs from the usual corner of the shelf, none of them loud.",
+                        "summary": "I queued three new songs from the usual corner of the shelf. None of them are loud.",
                         "source_label": "Listener",
+                        "avatar": "listener",
                         "published_at": "2026-11-26T04:40:00-06:00",
                     },
                 ],
@@ -393,18 +402,125 @@ def sample_payload(*, bots: bool) -> dict:
     return result
 
 
+def portrait(path: Path, rgb: tuple[int, int, int]) -> None:
+    """Light blob on a clear background, with about 12% padding so the ring shows."""
+    image = Image.new("RGBA", (160, 160), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(image)
+    tint = tuple(min(255, 180 + channel // 4) for channel in rgb)
+    draw.ellipse((20, 20, 140, 140), fill=tint + (255,))
+    draw.ellipse((58, 64, 76, 82), fill=(20, 20, 20, 255))
+    draw.ellipse((96, 64, 114, 82), fill=(20, 20, 20, 255))
+    draw.arc((66, 90, 106, 122), 20, 160, fill=(30, 20, 20, 255), width=4)
+    image.save(path, format="PNG")
+
+
 def write_sample_pngs(directory: Path) -> dict[str, Path]:
     directory.mkdir(parents=True, exist_ok=True)
     written = {}
     with tempfile.TemporaryDirectory() as temp:
         root = Path(temp)
+        avatars = root / "avatars"
+        avatars.mkdir()
+        portrait(avatars / "popcorn.png", (220, 140, 60))
         for bots, name in ((False, "without-bot-updates"), (True, "with-bot-updates")):
             source = root / f"{name}.json"
             source.write_text(json.dumps(sample_payload(bots=bots), indent=2), encoding="utf-8")
-            metadata = rd.render(source, root / name)
+            with mock.patch.dict(os.environ, {"DIGEST_AVATARS_DIR": str(avatars)}):
+                metadata = rd.render(source, root / name)
             target = directory / f"{name}.png"
             target.write_bytes(Path(metadata["png"]).read_bytes())
             written[name] = target
+    return written
+
+
+def showcase_payload(weather_icon: str, headline: str, summary: str) -> dict:
+    """Full receipt: four bot notes, one of them with no picture, and one weather icon.
+
+    News sections stay at one item, the same crowding rule a real morning uses
+    when bot notes are present.
+    """
+    value = sample_payload(bots=True)
+    weather = value["sections"][0]["items"][0]
+    weather["headline"] = headline
+    weather["summary"] = summary
+    weather["weather_icon"] = weather_icon
+    value["sections"] = [section for section in value["sections"] if section["section"] != "GROK BOT UPDATES"]
+    value["sections"].append(
+        {
+            "section": "GROK BOT UPDATES",
+            "source_feed": "bot-updates",
+            "items": [
+                {
+                    "title": "Popcorn: Film picks",
+                    "summary": "I found a quiet anime about a night courier. It opens Friday, and I think the review is the one worth your time.",
+                    "source_label": "Popcorn",
+                    "avatar": "popcorn",
+                },
+                {
+                    "title": "Listener: Morning queue (reader-a)",
+                    "summary": "I queued three new songs from the usual corner of the shelf. None of them are loud, and I left them ready before the day starts.",
+                    "source_label": "Listener",
+                    "avatar": "listener",
+                },
+                {
+                    "title": "Scout: Night watch",
+                    "summary": "I walked the long way home and the street was empty. I will check the gate again after dark if you want me to.",
+                    "source_label": "Scout",
+                    "avatar": "scout",
+                },
+                {
+                    "title": "Garden: Seedlings",
+                    "summary": (
+                        "I started the basil and the tomatoes on the kitchen sill. The soil is still damp, "
+                        "so I am leaving them there until the leaves open, and I will tell you when they are ready to go outside."
+                    ),
+                    "source_label": "Garden",
+                    "avatar": "garden",
+                },
+            ],
+        }
+    )
+    value["digest_id"] = rd.payload_digest_id(value)
+    return value
+
+
+def write_showcase_pngs(directory: Path) -> dict[str, Path]:
+    """Two full strips: a sunny day and a night storm, each with four bot notes."""
+    directory.mkdir(parents=True, exist_ok=True)
+    written = {}
+    forecasts = (
+        (
+            "receipt-sunny-four-bots",
+            "sun",
+            "Thursday: high 70°F, low 48°F. Sunny",
+            "Clear and mild through the afternoon, with a light breeze and no rain.",
+        ),
+        (
+            "receipt-night-storm-four-bots",
+            "night-storm",
+            "Thursday night: low 55°F. Thunderstorms",
+            "Storms move in after dark. Lightning is likely before midnight.",
+        ),
+    )
+    with tempfile.TemporaryDirectory() as temp:
+        root = Path(temp)
+        avatars = root / "avatars"
+        avatars.mkdir()
+        portrait(avatars / "popcorn.png", (220, 140, 60))
+        portrait(avatars / "listener.png", (70, 120, 190))
+        portrait(avatars / "garden.png", (70, 150, 80))
+        for name, icon, headline, summary in forecasts:
+            source = root / f"{name}.json"
+            source.write_text(json.dumps(showcase_payload(icon, headline, summary), indent=2), encoding="utf-8")
+            for style, suffix in (("plain", ""), ("bubble", "-bubble")):
+                with mock.patch.dict(
+                    os.environ,
+                    {"DIGEST_AVATARS_DIR": str(avatars), "DIGEST_BOT_UPDATES_STYLE": style},
+                ):
+                    metadata = rd.render(source, root / f"{name}{suffix}")
+                target = directory / f"{name}{suffix}.png"
+                target.write_bytes(Path(metadata["png"]).read_bytes())
+                written[f"{name}{suffix}"] = target
     return written
 
 

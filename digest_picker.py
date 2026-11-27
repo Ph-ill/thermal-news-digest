@@ -40,6 +40,7 @@ PLACEHOLDER_SUMMARY = (
 LOCAL_OFFLINE_TITLE = "Local picks unavailable today (AI offline)."
 LOCAL_OFFLINE_SUMMARY = "BASTROP is skipped until the model is back."
 BOT_TEXT_MAX = 360
+AVATAR_SLUG = re.compile(r"^[a-z0-9][a-z0-9-]{0,39}$")
 _ABBREV = re.compile(
     r"\b(?:Mr|Mrs|Ms|Dr|Prof|Sr|Jr|St|vs|etc|U\.S|U\.K|a\.m|p\.m|e\.g|i\.e)\.",
     re.IGNORECASE,
@@ -2805,6 +2806,23 @@ def _xml_char(char: str) -> bool:
     return code in (0x9, 0xA, 0xD) or 0x20 <= code <= 0xD7FF or 0xE000 <= code <= 0xFFFD or 0x10000 <= code <= 0x10FFFF
 
 
+def slugify_bot(name: str) -> str:
+    """File stem for a bot picture. Not a path."""
+    text = re.sub(r"[^a-z0-9]+", "-", name.casefold()).strip("-")
+    text = re.sub(r"-{2,}", "-", text)[:40].strip("-")
+    if AVATAR_SLUG.fullmatch(text):
+        return text
+    return "bot"
+
+
+def _avatar_slug(value: object, bot: str) -> str:
+    if value is None:
+        return slugify_bot(bot)
+    if not isinstance(value, str) or not AVATAR_SLUG.fullmatch(value.strip()):
+        raise BotUpdatesError("invalid_schema")
+    return value.strip()
+
+
 def _require_line(value: object, minimum: int, maximum: int) -> str:
     if not isinstance(value, str):
         raise BotUpdatesError("invalid_schema")
@@ -2849,11 +2867,12 @@ def validate_bot_document(
         if not isinstance(update, dict):
             raise BotUpdatesError("invalid_schema")
         keys = set(update)
-        if not {"bot", "topic", "text", "for"} <= keys <= {"bot", "topic", "text", "for", "url"}:
+        if not {"bot", "topic", "text", "for"} <= keys <= {"bot", "topic", "text", "for", "url", "avatar"}:
             raise BotUpdatesError("invalid_schema")
         bot = _require_line(update["bot"], 1, 40)
         topic = _require_line(update["topic"], 1, 48)
         text = _require_line(update["text"], 8, BOT_TEXT_MAX)
+        avatar = _avatar_slug(update.get("avatar"), bot)
         audience = update["for"]
         if not isinstance(audience, str) or audience not in allowed:
             raise BotUpdatesError("invalid_schema")
@@ -2871,6 +2890,7 @@ def validate_bot_document(
             "source_label": bot,
             "published_at": value["generated_at"].strip(),
             "audience": audience,
+            "avatar": avatar,
             "rationale": "Bot update dropped off for this digest date.",
         }
         if isinstance(url, str):
