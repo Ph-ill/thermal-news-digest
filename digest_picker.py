@@ -36,9 +36,13 @@ PLACEHOLDER_TITLE = "No new update today"
 PLACEHOLDER_SUMMARY = (
     "No current item passed the obituary, spam, and duplicate checks for this section."
 )
-# Printed for BASTROP when the model is unavailable. Not a story, and not recorded in history.
+# Printed for BASTROP only when there is no picks file and the model was not called.
+# Not a story, and not recorded in history.
 LOCAL_OFFLINE_TITLE = "Local picks unavailable today (AI offline)."
 LOCAL_OFFLINE_SUMMARY = "BASTROP is skipped until the model is back."
+# Printed when a picks file left BASTROP empty and no local candidate qualifies.
+LOCAL_EMPTY_TITLE = "No new Bastrop picks today."
+LOCAL_EMPTY_SUMMARY = "No Bastrop story passed the home-town check."
 BOT_TEXT_MAX = 360
 AVATAR_SLUG = re.compile(r"^[a-z0-9][a-z0-9-]{0,39}$")
 _ABBREV = re.compile(
@@ -230,6 +234,11 @@ _KNOWN_EVENT = re.compile(
     r"\bwatch\s+part(?:y|ies)\b|"
     r"\b(?:sports?|soccer|football)\s+bars?\b|"
     r"\bphoto\s+shooting\b|\bphoto\s+shoots?\b",
+    re.IGNORECASE,
+)
+# The other Bastrop is in Louisiana. A home-town word alone does not make that listing local.
+_LOUISIANA = re.compile(
+    r"\blouisiana\b|\bmorehouse\s+parish\b|\bbastrop\s*,\s*la\b|\bbastrop\s+la\b",
     re.IGNORECASE,
 )
 # Not home. Used for the local section only. Shows keep their own radius and city list.
@@ -932,9 +941,15 @@ def gate_feed_item(item: dict, *, section_id: str, feed) -> dict | None:
 
 
 def apply_section_freshness(items: list[dict], *, section_id: str, now: dt.datetime) -> list[dict]:
-    """The freshness cut a live fetch uses, including the per-company window."""
+    """The freshness cut a live fetch and a candidate export both use.
+
+    BASTROP uses DIGEST_LOCAL_FRESH_HOURS. Other sections use DIGEST_FRESH_HOURS.
+    Digest history is not applied here; eligible_candidates still drops printed stories.
+    """
     if section_id == "companies":
         return select_company_fresh(items, now, settings.fresh_hours(), settings.company_stale_hours())
+    if section_id == "local":
+        return select_fresh(items, now, hours=settings.local_fresh_hours())
     return select_fresh(items, now, hours=settings.fresh_hours())
 
 
@@ -1991,6 +2006,68 @@ def local_offline_item(feed_url: str) -> dict:
     }
 
 
+def local_empty_item(feed_url: str) -> dict:
+    return {
+        "title": LOCAL_EMPTY_TITLE,
+        "summary": LOCAL_EMPTY_SUMMARY,
+        "url": feed_url or "https://example.invalid/feed",
+        "published_at": None,
+        "rationale": LOCAL_EMPTY_SUMMARY,
+    }
+
+
+def local_candidate_ok(item: dict) -> bool:
+    """Home town, Texas rather than Louisiana, and the usual local excludes.
+
+    The picks-file fallback uses this. A Google News row can name Bastrop, Louisiana
+    and still pass the wider feed gate, because that gate does not require a place
+    when the query already names the towns.
+    """
+    if not keep_local(item, require_place=True):
+        return False
+    blob = f"{item.get('title') or ''} {item.get('summary') or ''}"
+    if _LOUISIANA.search(blob):
+        return False
+    if fallback_blocks(item):
+        return False
+    return True
+
+
+def local_fallback_from_eligible(
+    eligible: list[dict],
+    count: int,
+    seen: Seen,
+    max_chars: int,
+) -> list[dict]:
+    """Newest local items that name a home town and are not a Louisiana listing."""
+    ranked_pairs = sorted(
+        enumerate(eligible),
+        key=lambda pair: (
+            _published_stamp(pair[1].get("published_at")) is None,
+            -(_published_stamp(pair[1].get("published_at")) or 0.0),
+            pair[0],
+        ),
+    )
+    chosen: list[dict] = []
+    for _index, item in ranked_pairs:
+        if not local_candidate_ok(item) or seen.repeat(item):
+            continue
+        summary = fit_summary(item["title"], item.get("summary") or "", max_chars)
+        if summary is None:
+            summary = fallback_blurb(item)
+        picked = dict(item)
+        picked["summary"] = summary
+        picked["rationale"] = (
+            "Fallback pick: newest local item that passed the home-town check and was not a repeat."
+        )
+        picked["record_history"] = True
+        seen.mark(picked)
+        chosen.append(picked)
+        if len(chosen) >= count:
+            break
+    return chosen
+
+
 def placeholder_item(feed_url: str) -> dict:
     return _public_item(
         {
@@ -2602,10 +2679,18 @@ def pick_news(
             )
             if chosen:
                 used_llm = True
-        if section_id == "local" and not chosen and (model_called is False) and (file_mode or llm_picks is None):
-            items_by_id[section_id] = [_public_item(local_offline_item(request["feed_url"]))]
-            if file_mode:
+        if section_id == "local" and not chosen and file_mode:
+            # A picks file left BASTROP empty. Do not claim the model is offline.
+            extra = local_fallback_from_eligible(eligible, section_count, seen, max_chars)
+            if extra:
                 used_fallback = True
+                chosen.extend(extra)
+            else:
+                items_by_id[section_id] = [_public_item(local_empty_item(request["feed_url"]))]
+                used_fallback = True
+                continue
+        elif section_id == "local" and not chosen and llm_picks is None and not model_called:
+            items_by_id[section_id] = [_public_item(local_offline_item(request["feed_url"]))]
             continue
         if section_id != "local" and len(chosen) < section_count:
             likes, dislikes = profile_terms(profile, section_id)

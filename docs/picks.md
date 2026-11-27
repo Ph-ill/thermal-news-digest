@@ -18,6 +18,8 @@ python3 digest_generator.py --export-candidates output/candidates-YYYY-MM-DD.jso
 
 `--date` is optional. When it is omitted, the date is today in `DIGEST_TZ`. The command fetches the news feeds, writes one JSON file, and exits. It does not call a model, and it does not update `digest-history.json`. The 05:00 run reads the default path, so leave the file there.
 
+BASTROP candidates use `DIGEST_LOCAL_FRESH_HOURS` (default 168, clamped to 6–168). Every other section uses `DIGEST_FRESH_HOURS` (default 36, same cap). A story already in `digest-history.json` is left out of both. The wider local window is what keeps a thin news day from collapsing to a single leftover listing.
+
 The file is what the model would have been shown:
 
 | Field | Meaning |
@@ -76,7 +78,7 @@ $DIGEST_PICKS_DIR/YYYY-MM-DD.json
 
 A picked URL must be one of today's candidates. The comparison uses the raw string and `normalize_url`, so a `utm_*` parameter, a `www` host, or a trailing slash still matches. The same checks the model path uses then apply: hard excludes and de-dupe against history. A summary longer than the print budget is clipped at a sentence boundary, or at a word boundary when the sentence does not fit. It is not dropped for length alone. An unoffered URL is skipped. The other picks in the file are kept.
 
-A section whose picks are all rejected is sent to the model when `DIGEST_LLM_API_KEY` is set. Otherwise that section uses the deterministic fallback, including the fixed BASTROP line when the model is not called. The section does not stop on the empty placeholder while one of those can still choose a story. Sections the file did fill are not sent to the model.
+A section whose picks are all rejected is sent to the model when `DIGEST_LLM_API_KEY` is set. Otherwise that section uses the deterministic fallback. BASTROP's fallback is the newest candidate that names a home town (Bastrop, Smithville, Elgin, Cedar Creek, McDade, Paige, Red Rock, Del Valle, or east Austin), is not already in the digest history, and is not a Louisiana listing. When none qualify, BASTROP prints `No new Bastrop picks today.` The line `Local picks unavailable today (AI offline).` is used only when there is no picks file and the model is not called. The section does not stop on the empty placeholder while one of those can still choose a story. Sections the file did fill are not sent to the model.
 
 At 05:00 the generator reuses `$DIGEST_CANDIDATES_DIR/YYYY-MM-DD.json` when it is a regular file, UTF-8, at most 256 KiB, not a symlink, its `digest_date` is the edition date, and its modification time is less than 3 hours old. News feeds are not fetched again, so a Google News token or the 16-item cap cannot drop a URL the bot was shown. Weather is still fetched. Ticketmaster is still fetched when a key is set. A missing file is quiet and the feeds are fetched. A stale, symlinked, or invalid export is ignored and the feeds are fetched.
 
@@ -118,6 +120,37 @@ A missing picks file is quiet. A symlink, a non-UTF-8 file, a file over 64 KiB, 
   ]
 }
 ```
+
+## Check
+
+After the picks file is in place, run the same build the 05:00 job will run. This writes nothing: no `digest-history.json`, no `output/digest-source-*`, no `state.json`, and no print.
+
+```bash
+python3 digest_generator.py --check --date YYYY-MM-DD
+```
+
+`--date` is optional. When it is omitted, the date is today in `DIGEST_TZ`. The command reads the same picks file, bot-updates file, digest history, and freshness windows as the morning run.
+
+Stdout is one JSON object:
+
+| Field | Meaning |
+| --- | --- |
+| `picker.mode`, `picker.reason` | What the morning run would record |
+| `sections` | Each section's item count and titles, plus `fallback` and `offline` |
+| `fallback_used` | A section used a fallback line or a newest-item fallback |
+| `offline_used` | A section used `Local picks unavailable today (AI offline).` |
+| `bot_updates` | How many bot notes would print |
+| `picks_ignored` | The picks file was present and rejected |
+
+Exit 0 means the picks file was accepted and no section would print the offline line. Exit 1 means the offline line would print, or the picks file was ignored (stale, unreadable, or invalid). A missing picks file is not "ignored"; with no model it exits 1 because BASTROP would print the offline line.
+
+If today's source file already froze a bad BASTROP line, regenerate it from the current picks and print:
+
+```bash
+./print_digest_safe.sh --rebuild
+```
+
+That moves `output/digest-source-YYYY-MM-DD.json` to `output/digest-source-YYYY-MM-DD.vN.json` and prints the new file. `POST /v1/digest/rebuild` does the same through the trigger.
 
 ## Shows
 
