@@ -10,6 +10,7 @@ import signal
 import subprocess
 import sys
 import threading
+import urllib.parse
 
 BRIDGE = str(Path(__file__).resolve().parent / "print_digest_safe.sh")
 BIND = "127.0.0.1"
@@ -22,6 +23,10 @@ _SECRET_ENV = re.compile(r"(?:KEY|TOKEN|SECRET|PASSWORD|AUTHORIZATION)", re.IGNO
 _BEARER = re.compile(r"(?i)(authorization\s*:\s*bearer\s+)\S+")
 _ENV_ASSIGNMENT = re.compile(
     r"(?im)^([A-Za-z_][A-Za-z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|AUTHORIZATION)[A-Za-z0-9_]*)=.*$"
+)
+_URL_IN_TEXT = re.compile(r"https?://[^\s\"'<>]+", re.IGNORECASE)
+_URL_SECRET_QUERY = frozenset(
+    {"apikey", "api_key", "key", "token", "secret", "password", "access_token", "sig"}
 )
 
 
@@ -44,13 +49,58 @@ def kill_process_group(proc: subprocess.Popen) -> None:
         proc.wait(timeout=5)
 
 
+def _secret_forms(value: str) -> list[str]:
+    """The secret and the percent-encoded copies a URL or a log line might carry."""
+    forms: list[str] = []
+    for form in (
+        value,
+        urllib.parse.quote(value, safe=""),
+        urllib.parse.quote_plus(value),
+    ):
+        if form and len(form) >= 8 and form not in forms:
+            forms.append(form)
+    return forms
+
+
+def redact_logged_url(raw: str) -> str:
+    """Drop userinfo and the values of credential query keys. Leave the rest of the URL."""
+    trimmed = raw.rstrip(").,;")
+    suffix = raw[len(trimmed) :]
+    try:
+        parts = urllib.parse.urlsplit(trimmed)
+    except ValueError:
+        return raw
+    if not parts.scheme or not parts.hostname:
+        return raw
+    host = parts.hostname
+    if ":" in host:
+        host = f"[{host}]"
+    netloc = host if parts.port is None else f"{host}:{parts.port}"
+    pairs = urllib.parse.parse_qsl(parts.query, keep_blank_values=True)
+    rebuilt = []
+    for key, value in pairs:
+        shown = "[redacted]" if key.casefold() in _URL_SECRET_QUERY else urllib.parse.quote(value, safe="")
+        rebuilt.append(f"{urllib.parse.quote(key, safe='')}={shown}")
+    query = "&".join(rebuilt)
+    cleaned = urllib.parse.urlunsplit((parts.scheme, netloc, parts.path, query, parts.fragment))
+    return cleaned + suffix
+
+
 def redact_secrets(text: str) -> str:
-    """Drop secret env values and credential assignments. Never log the environment itself."""
-    redacted = text
+    """Drop secret env values, URL credentials, and credential assignments.
+
+    Feed URLs often carry ``apikey`` (or a percent-encoded copy of a known secret)
+    without the variable name itself matching KEY or TOKEN. Userinfo is removed
+    from every URL. Never log the environment itself.
+    """
+    redacted = _URL_IN_TEXT.sub(lambda match: redact_logged_url(match.group(0)), text or "")
+    forms: list[str] = []
     for name, value in os.environ.items():
         if not value or len(value) < 8 or not _SECRET_ENV.search(name):
             continue
-        redacted = redacted.replace(value, "[redacted]")
+        forms.extend(_secret_forms(value))
+    for form in sorted(set(forms), key=len, reverse=True):
+        redacted = redacted.replace(form, "[redacted]")
     redacted = _BEARER.sub(r"\1[redacted]", redacted)
     redacted = _ENV_ASSIGNMENT.sub(r"\1=[redacted]", redacted)
     return redacted

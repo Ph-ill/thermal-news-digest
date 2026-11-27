@@ -193,9 +193,9 @@ _HOME_TOWN = re.compile(
     r"\b(?:" + "|".join(re.escape(town) for town in _HOME_TOWNS) + r")\b",
     re.IGNORECASE,
 )
-# "in/at/from <town>" and "opens in <town>" place the event. A passing mention does not.
+# "in/at <town>" and "opens in <town>" place the event. "from <town>" is origin, not the venue.
 _HOME_PLACEMENT = re.compile(
-    r"\b(?:opens\s+in|in|at|from)\s+(?:the\s+)?(?:"
+    r"\b(?:opens\s+in|in|at)\s+(?:the\s+)?(?:"
     + "|".join(re.escape(town) for town in _HOME_TOWNS)
     + r")\b",
     re.IGNORECASE,
@@ -237,8 +237,14 @@ _KNOWN_EVENT = re.compile(
     re.IGNORECASE,
 )
 # The other Bastrop is in Louisiana. A home-town word alone does not make that listing local.
+# "Morehouse" is the parish even when the word Parish is absent. The daily paper and its host are too.
 _LOUISIANA = re.compile(
-    r"\blouisiana\b|\bmorehouse\s+parish\b|\bbastrop\s*,\s*la\b|\bbastrop\s+la\b",
+    r"\blouisiana\b"
+    r"|\bmorehouse\b"
+    r"|\bbastrop\s+daily\s+enterprise\b"
+    r"|\bbastrop\s*,\s*la\b"
+    r"|\bbastrop\s+la\b"
+    r"|\bbastrop\s*\(\s*la\.?\s*\)",
     re.IGNORECASE,
 )
 # Not home. Used for the local section only. Shows keep their own radius and city list.
@@ -821,8 +827,9 @@ def _open_counts(text: str) -> bool:
 def _summary_places_home(summary: str) -> bool:
     """True when the summary puts the event in a home town.
 
-    "in/at/from <town>" and "opens in <town>" count. "also runs", "regulars",
-    and "favorite of" are a passing mention of the town, not the location.
+    "in/at <town>" and "opens in <town>" count. "from <town>" names where someone
+    is from, not where the event is. "also runs", "regulars", and "favorite of"
+    are a passing mention of the town, not the location.
     """
     for match in _HOME_PLACEMENT.finditer(summary or ""):
         window = summary[max(0, match.start() - 48) : match.end()]
@@ -916,11 +923,35 @@ def keep_company(item: dict) -> bool:
     return True
 
 
+def is_louisiana_listing(item: dict) -> bool:
+    """True when the row is the Louisiana Bastrop, not the Texas one.
+
+    Checked on the raw title, the display title, the summary, the outlet label,
+    and the URL host. Google News moves "Bastrop Daily Enterprise" into
+    ``source_label`` after the title is split, so the label and the host have
+    to count here, before a candidate is exported or shown to the model.
+    """
+    parts = []
+    for key in ("raw_title", "title", "summary", "source_label"):
+        value = item.get(key)
+        if isinstance(value, str) and value.strip():
+            parts.append(value)
+    blob = " ".join(parts)
+    if _LOUISIANA.search(blob):
+        return True
+    compact = re.sub(r"[^a-z0-9]+", "", blob.casefold())
+    if "bastropenterprise" in compact:
+        return True
+    host = re.sub(r"[^a-z0-9]+", "", host_of(str(item.get("url") or "")))
+    return "bastropenterprise" in host
+
+
 def gate_feed_item(item: dict, *, section_id: str, feed) -> dict | None:
     """The per-item gates a live fetch uses. The reuse path calls this same function.
 
     ``feed`` is a configured feed: its topic, required phrases, and require_place
     win over anything stored in an export row. Obituary and spam checks run here.
+    Louisiana rows are dropped here, before export, the model, or the fallback.
     History is applied later by ``eligible_candidates``, which both paths call.
     """
     row = dict(item)
@@ -930,6 +961,8 @@ def gate_feed_item(item: dict, *, section_id: str, feed) -> dict | None:
     blob = f"{title} {summary}"
     required = tuple(getattr(feed, "required", ()) or ())
     if required and not any(term in blob.casefold() for term in required):
+        return None
+    if section_id == "local" and is_louisiana_listing(row):
         return None
     if section_id == "local" and not keep_local(row, require_place=bool(getattr(feed, "require_place", False))):
         return None
@@ -943,13 +976,16 @@ def gate_feed_item(item: dict, *, section_id: str, feed) -> dict | None:
 def apply_section_freshness(items: list[dict], *, section_id: str, now: dt.datetime) -> list[dict]:
     """The freshness cut a live fetch and a candidate export both use.
 
-    BASTROP uses DIGEST_LOCAL_FRESH_HOURS. Other sections use DIGEST_FRESH_HOURS.
+    BASTROP uses DIGEST_LOCAL_FRESH_HOURS as a hard cutoff: a story older than the
+    window is dropped even when nothing newer is in the feed. Other sections use
+    DIGEST_FRESH_HOURS and still keep older rows when nothing is inside that window.
     Digest history is not applied here; eligible_candidates still drops printed stories.
     """
     if section_id == "companies":
         return select_company_fresh(items, now, settings.fresh_hours(), settings.company_stale_hours())
     if section_id == "local":
-        return select_fresh(items, now, hours=settings.local_fresh_hours())
+        hours = settings.local_fresh_hours()
+        return select_fresh(items, now, hours=hours, outer_hours=hours)
     return select_fresh(items, now, hours=settings.fresh_hours())
 
 
@@ -2019,14 +2055,12 @@ def local_empty_item(feed_url: str) -> dict:
 def local_candidate_ok(item: dict) -> bool:
     """Home town, Texas rather than Louisiana, and the usual local excludes.
 
-    The picks-file fallback uses this. A Google News row can name Bastrop, Louisiana
-    and still pass the wider feed gate, because that gate does not require a place
-    when the query already names the towns.
+    The picks-file fallback uses this. ``gate_feed_item`` already drops Louisiana
+    rows, including the outlet label and the host, before a candidate is exported.
     """
     if not keep_local(item, require_place=True):
         return False
-    blob = f"{item.get('title') or ''} {item.get('summary') or ''}"
-    if _LOUISIANA.search(blob):
+    if is_louisiana_listing(item):
         return False
     if fallback_blocks(item):
         return False

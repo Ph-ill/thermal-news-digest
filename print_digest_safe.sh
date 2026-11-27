@@ -55,10 +55,25 @@ exec flock --exclusive --nonblock "$LOCK" bash -c '
   output_dir=$5
   state_path=$6
   queue=$7
+  rotated_to=""
   generate() {
     python3 "$generator" --out "$source_path" >&2
   }
+  restore_rotated() {
+    if [[ -n "$rotated_to" && -e "$rotated_to" ]]; then
+      rm -f -- "$source_path"
+      mv -- "$rotated_to" "$source_path"
+      printf "Restored previous source after generation failed\n" >&2
+    fi
+  }
+  generate_or_restore() {
+    generate && return 0
+    status=$?
+    restore_rotated
+    exit "$status"
+  }
   # Keep the frozen source as digest-source-DATE.vN.json, then write a new one.
+  # A failed generate moves that archive back, so the canonical file is never missing.
   rotate_source() {
     if [[ ! -e "$source_path" ]]; then
       return 0
@@ -75,6 +90,7 @@ exec flock --exclusive --nonblock "$LOCK" bash -c '
         continue
       fi
       mv -- "$source_path" "$dest"
+      rotated_to=$dest
       printf "Kept previous source as %s\n" "$dest" >&2
       return 0
     done
@@ -91,13 +107,13 @@ exec flock --exclusive --nonblock "$LOCK" bash -c '
     render_mode=--reprint
   fi
   if [[ ! -s "$source_path" ]]; then
-    generate
+    generate_or_restore
   fi
   status=0
   render "$render_mode" || status=$?
   if [[ "$status" -eq 2 ]]; then
     rm -f -- "$source_path"
-    generate
+    generate_or_restore
     status=0
     render "$render_mode" || status=$?
   fi

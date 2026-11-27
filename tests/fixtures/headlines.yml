@@ -431,7 +431,17 @@ headlines:
   - title: "Lakeway kayak rentals this month"
     summary: "They launch from Bastrop on weekends."
     section: local
-    expect: fallback-prints
+    expect: exclude
+  - title: "Chef opens a second kitchen"
+    summary: "The owner is from Bastrop."
+    section: local
+    require_place: true
+    expect: exclude
+  - title: "Chef opens a second kitchen downtown"
+    summary: "The kitchen opens in Bastrop on Friday."
+    section: local
+    require_place: true
+    expect: keep
   - title: "Captain dies at sea off the coast"
     summary: "The notice names the officer."
     section: global

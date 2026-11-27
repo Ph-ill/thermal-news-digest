@@ -1421,6 +1421,24 @@ local:
         self.assertTrue(dp.keep_local(quiet, require_place=True))
         self.assertFalse(dp.keep_local(houston, require_place=True))
         self.assertTrue(dp.keep_local(houston, require_place=False))
+        from_town = {
+            "title": "Chef opens a second kitchen",
+            "summary": "The owner is from Bastrop.",
+        }
+        self.assertFalse(dp._summary_places_home("The owner is from Bastrop."))
+        self.assertFalse(dp._summary_places_home("A chef from Bastrop visited the kitchen."))
+        self.assertFalse(dp.keep_local(from_town, require_place=True))
+        self.assertTrue(dp._summary_places_home("The kitchen opens in Bastrop on Friday."))
+        self.assertTrue(dp._summary_places_home("The band plays at Bastrop on Friday."))
+        self.assertTrue(
+            dp.keep_local(
+                {
+                    "title": "Chef opens a second kitchen",
+                    "summary": "The kitchen opens in Bastrop on Friday.",
+                },
+                require_place=True,
+            )
+        )
         with mock.patch.dict(
             os.environ,
             {"DIGEST_LOCAL_FEED": "", "DIGEST_LOCAL_FEEDS": "", "DIGEST_LOCAL_NEWS_QUERY": ""},
@@ -3106,12 +3124,24 @@ class LocalWindowAndCheckTests(unittest.TestCase):
     def test_local_window_keeps_a_week_of_bastrop_and_global_stays_at_36(self):
         now = dt.datetime(2026, 11, 26, 12, 0, tzinfo=dt.timezone.utc)
         recent = item("Recent harbor note", "https://example.com/recent", LONG, "Thu, 26 Nov 2026 07:00:00 GMT")
-        week = item("Week-old harbor note", "https://example.com/week", LONG, "Tue, 24 Nov 2026 10:00:00 GMT")
+        hours_72 = item("Three-day harbor note", "https://example.com/72h", LONG, "Mon, 23 Nov 2026 12:00:00 GMT")
+        hours_200 = item("Old harbor note", "https://example.com/200h", LONG, "Wed, 18 Nov 2026 04:00:00 GMT")
         with mock.patch.dict(os.environ, {"DIGEST_FRESH_HOURS": "36", "DIGEST_LOCAL_FRESH_HOURS": "168"}):
-            local = dp.apply_section_freshness([week, recent], section_id="local", now=now)
-            world = dp.apply_section_freshness([week, recent], section_id="global", now=now)
-        self.assertEqual([row["url"] for row in local], ["https://example.com/week", "https://example.com/recent"])
+            local = dp.apply_section_freshness([hours_72, recent], section_id="local", now=now)
+            world = dp.apply_section_freshness([hours_72, recent], section_id="global", now=now)
+            local_old = dp.apply_section_freshness([hours_200], section_id="local", now=now)
+            world_old = dp.apply_section_freshness([hours_200], section_id="global", now=now)
+            local_week = dp.apply_section_freshness([hours_72], section_id="local", now=now)
+            world_week = dp.apply_section_freshness([hours_72], section_id="global", now=now)
+        self.assertEqual(
+            [row["url"] for row in local],
+            ["https://example.com/72h", "https://example.com/recent"],
+        )
         self.assertEqual([row["url"] for row in world], ["https://example.com/recent"])
+        self.assertEqual(local_old, [])
+        self.assertEqual([row["url"] for row in world_old], ["https://example.com/200h"])
+        self.assertEqual([row["url"] for row in local_week], ["https://example.com/72h"])
+        self.assertEqual([row["url"] for row in world_week], ["https://example.com/72h"])
 
     def test_export_and_generation_use_the_local_window_and_still_skip_history(self):
         now = dt.datetime(2026, 11, 26, 12, 0, tzinfo=dt.timezone.utc)
@@ -3298,7 +3328,7 @@ class LocalWindowAndCheckTests(unittest.TestCase):
         world_urls = [row["url"] for row in world["candidates"]]
         self.assertIn("https://example.com/taco", local_urls)
         self.assertIn("https://example.com/coffee", local_urls)
-        self.assertIn("https://example.com/louisiana", local_urls)
+        self.assertNotIn("https://example.com/louisiana", local_urls)
         self.assertNotIn("https://example.com/market", local_urls)
         self.assertNotIn("https://example.com/brewery", local_urls)
         self.assertIn("https://example.com/harbor", world_urls)
@@ -3580,6 +3610,7 @@ class LocalWindowAndCheckTests(unittest.TestCase):
         self.assertEqual(code, 0, summary)
         self.assertFalse(summary["offline_used"])
         self.assertFalse(summary["picks_ignored"])
+        self.assertFalse(summary["sources_unavailable"])
         self.assertTrue(summary["fallback_used"])
         self.assertEqual(summary["bot_updates"], 1)
         self.assertEqual(summary["picker"]["mode"], "mixed")
@@ -3624,6 +3655,453 @@ class LocalWindowAndCheckTests(unittest.TestCase):
                     dg.main(["--check", "--out", str(out), "--date", today])
             self.assertEqual(caught.exception.code, 2)
             self.assertFalse(out.exists())
+
+    def test_gate_drops_louisiana_before_the_model_or_the_fallback(self):
+        feed = settings.FeedSpec("https://example.com/local.xml")
+        leaks = [
+            {
+                "title": "Cafe opens in Bastrop, LA",
+                "summary": "The cafe is in Bastrop, Louisiana and is not the Texas town.",
+                "url": "https://example.com/louisiana",
+            },
+            {
+                "title": "Festival returns downtown",
+                "raw_title": "Festival returns to Bastrop (LA)",
+                "summary": "The festival runs all weekend.",
+                "url": "https://example.com/parens",
+            },
+            {
+                "title": "Fair adds a weekend market",
+                "summary": "The fair is in Morehouse this weekend.",
+                "url": "https://example.com/morehouse",
+            },
+            {
+                "title": "Downtown cafe adds a patio",
+                "summary": "The patio opens Friday and stays open through the evening.",
+                "source_label": "Bastrop Daily Enterprise",
+                "url": "https://news.google.com/rss/articles/enterprise",
+            },
+            {
+                "title": "Cafe opens in Bastrop",
+                "summary": "The cafe opens Friday on Main Street and pours until nine.",
+                "url": "https://www.bastropenterprise.com/story",
+            },
+        ]
+        for row in leaks:
+            self.assertIsNone(dp.gate_feed_item(row, section_id="local", feed=feed), row["url"])
+        texas = dp.gate_feed_item(
+            {
+                "title": "Bastrop taco truck parks on Main Street",
+                "summary": "The truck parks on Main Street on Friday and serves through the evening.",
+                "url": "https://example.com/taco",
+            },
+            section_id="local",
+            feed=feed,
+        )
+        self.assertIsNotNone(texas)
+
+        now = dt.datetime(2026, 11, 26, 12, 0, tzinfo=dt.timezone.utc)
+        local_rows = [
+            {
+                "title": "Cafe opens in Bastrop, LA",
+                "url": "https://example.com/louisiana",
+                "date": "Thu, 26 Nov 2026 11:30:00 GMT",
+                "summary": "The cafe is in Bastrop, Louisiana and is not the Texas town.",
+            },
+            {
+                "title": "Festival returns to Bastrop (LA)",
+                "url": "https://example.com/parens",
+                "date": "Thu, 26 Nov 2026 11:20:00 GMT",
+                "summary": "The festival runs all weekend in Bastrop (LA).",
+            },
+            {
+                "title": "Morehouse fair adds a weekend market",
+                "url": "https://example.com/morehouse",
+                "date": "Thu, 26 Nov 2026 11:10:00 GMT",
+                "summary": "The fair is in Morehouse this weekend and stays through Sunday.",
+            },
+            {
+                "title": "Downtown cafe adds a patio - Bastrop Daily Enterprise",
+                "url": "https://news.google.com/rss/articles/enterprise",
+                "date": "Thu, 26 Nov 2026 11:00:00 GMT",
+                "summary": "The patio opens Friday and stays open through the evening.",
+            },
+            {
+                "title": "Cafe opens in Bastrop",
+                "url": "https://www.bastropenterprise.com/story",
+                "date": "Thu, 26 Nov 2026 10:30:00 GMT",
+                "summary": "The cafe opens Friday on Main Street and pours until nine.",
+            },
+            {
+                "title": "Bastrop taco truck parks on Main Street",
+                "url": "https://example.com/taco",
+                "date": "Thu, 26 Nov 2026 06:00:00 GMT",
+                "summary": "The truck parks on Main Street on Friday and serves through the evening.",
+            },
+        ]
+        feeds = {
+            "https://example.com/global.xml": rss(
+                [
+                    {
+                        "title": HARBOR,
+                        "url": "https://example.com/harbor",
+                        "date": "Thu, 26 Nov 2026 02:00:00 GMT",
+                        "summary": "Mediators said both sides signed the text before dawn and set Friday for the first aid ship.",
+                    }
+                ]
+            ),
+            "https://example.com/local.xml": rss(local_rows),
+            "https://example.com/companies.xml": rss(
+                [
+                    {
+                        "title": "SpaceX sets a dawn Starship launch window",
+                        "url": "https://example.com/company",
+                        "date": "Thu, 26 Nov 2026 08:00:00 GMT",
+                        "summary": "The window opens at sunrise and the company said the flight is a fueling test.",
+                    }
+                ]
+            ),
+        }
+        forecast_url = "https://api.weather.gov/gridpoints/EXAMPLE/1,1/forecast"
+
+        def fetcher(url):
+            if url == dg.WEATHER_POINT:
+                return json.dumps({"properties": {"forecast": forecast_url}}).encode()
+            if url == forecast_url:
+                return json.dumps(
+                    {
+                        "properties": {
+                            "periods": [
+                                {
+                                    "name": "Today",
+                                    "isDaytime": True,
+                                    "startTime": "2026-11-26T12:00:00-06:00",
+                                    "temperature": 64,
+                                    "temperatureUnit": "F",
+                                    "shortForecast": "Sunny",
+                                    "detailedForecast": "Sunny during the afternoon.",
+                                    "probabilityOfPrecipitation": {"value": 0},
+                                }
+                            ]
+                        }
+                    }
+                ).encode()
+            if url in feeds:
+                return feeds[url]
+            raise AssertionError(url)
+
+        seen = {}
+
+        def opener(request, timeout):
+            body = json.loads(request.data.decode())
+            seen["user"] = body["messages"][1]["content"]
+            content = json.dumps(
+                {
+                    "picks": [
+                        {"section": "GLOBAL", "items": [{"url": "https://example.com/harbor", "summary": HARBOR_SUMMARY}]},
+                        {
+                            "section": "BASTROP",
+                            "items": [
+                                {
+                                    "url": "https://example.com/louisiana",
+                                    "summary": "The cafe opens in Bastrop, LA on Friday and serves through the evening.",
+                                }
+                            ],
+                        },
+                        {
+                            "section": "SPACEX & EARTH FUNERAL",
+                            "items": [
+                                {
+                                    "url": "https://example.com/company",
+                                    "summary": "The window opens at sunrise and the company said the flight is a fueling test.",
+                                }
+                            ],
+                        },
+                    ]
+                }
+            )
+            return FakeResponse(json.dumps({"choices": [{"message": {"content": content}}]}).encode())
+
+        env = {
+            "DIGEST_GLOBAL_FEED": "https://example.com/global.xml",
+            "DIGEST_LOCAL_FEED": "https://example.com/local.xml",
+            "DIGEST_LOCAL_FEEDS": "",
+            "DIGEST_LOCAL_NEWS_QUERY": "",
+            "DIGEST_COMPANIES_FEED": "https://example.com/companies.xml",
+            "DIGEST_COMPANIES_FEEDS": "",
+            "DIGEST_SPACEX_FEED": "",
+            "DIGEST_EARTH_FUNERAL_FEED": "",
+            "DIGEST_TICKETMASTER_KEY": "",
+            "DIGEST_PROFILE_FILE": "",
+            "DIGEST_FRESH_HOURS": "36",
+            "DIGEST_LOCAL_FRESH_HOURS": "168",
+            "DIGEST_LLM_API_KEY": SECRET,
+            "DIGEST_SECTION_ORDER": "weather,global,local,companies,shows,bot_updates",
+        }
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            with mock.patch.dict(os.environ, env):
+                generated = dg.make_payload(
+                    "2026-11-26",
+                    fetcher,
+                    now=now,
+                    history_file=root / "history.json",
+                    bot_directory=root / "bots",
+                    picks_directory=root / "no-picks",
+                    candidates_directory=root / "no-export",
+                    persist_history=False,
+                    opener=opener,
+                )
+        prompt = seen["user"]
+        for needle in (
+            "https://example.com/louisiana",
+            "https://example.com/parens",
+            "https://example.com/morehouse",
+            "https://news.google.com/rss/articles/enterprise",
+            "bastropenterprise.com",
+            "Cafe opens in Bastrop, LA",
+            "Cafe opens in Bastrop",
+            "Bastrop (LA)",
+            "Bastrop Daily Enterprise",
+            "Downtown cafe adds a patio",
+            "Morehouse",
+        ):
+            self.assertNotIn(needle, prompt, needle)
+        self.assertIn("https://example.com/taco", prompt)
+        printed = next(section for section in generated["sections"] if section["section"] == "BASTROP")
+        blob = json.dumps(printed)
+        self.assertNotIn("Cafe opens in Bastrop, LA", blob)
+        self.assertNotIn("bastropenterprise", blob.casefold())
+        self.assertNotIn("Morehouse", blob)
+        self.assertNotIn("Bastrop (LA)", blob)
+        self.assertEqual(printed["items"][0]["title"], dp.PLACEHOLDER_TITLE)
+
+    def test_empty_local_week_prints_the_honest_empty_line(self):
+        now = dt.datetime(2026, 11, 26, 12, 0, tzinfo=dt.timezone.utc)
+        feeds = {
+            "https://example.com/global.xml": rss(
+                [
+                    {
+                        "title": HARBOR,
+                        "url": "https://example.com/harbor",
+                        "date": "Thu, 26 Nov 2026 02:00:00 GMT",
+                        "summary": "Mediators said both sides signed the text before dawn and set Friday for the first aid ship.",
+                    }
+                ]
+            ),
+            "https://example.com/local.xml": rss(
+                [
+                    {
+                        "title": "Bastrop brewery opens on Main Street",
+                        "url": "https://example.com/brewery",
+                        "date": "Wed, 18 Nov 2026 04:00:00 GMT",
+                        "summary": "The new taproom pours on Friday and keeps a small kitchen open until nine.",
+                    }
+                ]
+            ),
+            "https://example.com/companies.xml": rss(
+                [
+                    {
+                        "title": "SpaceX sets a dawn Starship launch window",
+                        "url": "https://example.com/company",
+                        "date": "Thu, 26 Nov 2026 08:00:00 GMT",
+                        "summary": "The window opens at sunrise and the company said the flight is a fueling test.",
+                    }
+                ]
+            ),
+        }
+        forecast_url = "https://api.weather.gov/gridpoints/EXAMPLE/1,1/forecast"
+
+        def fetcher(url):
+            if url == dg.WEATHER_POINT:
+                return json.dumps({"properties": {"forecast": forecast_url}}).encode()
+            if url == forecast_url:
+                return json.dumps(
+                    {
+                        "properties": {
+                            "periods": [
+                                {
+                                    "name": "Today",
+                                    "isDaytime": True,
+                                    "startTime": "2026-11-26T12:00:00-06:00",
+                                    "temperature": 64,
+                                    "temperatureUnit": "F",
+                                    "shortForecast": "Sunny",
+                                    "detailedForecast": "Sunny during the afternoon.",
+                                    "probabilityOfPrecipitation": {"value": 0},
+                                }
+                            ]
+                        }
+                    }
+                ).encode()
+            if url in feeds:
+                return feeds[url]
+            raise AssertionError(url)
+
+        env = {
+            "DIGEST_GLOBAL_FEED": "https://example.com/global.xml",
+            "DIGEST_LOCAL_FEED": "https://example.com/local.xml",
+            "DIGEST_LOCAL_FEEDS": "",
+            "DIGEST_LOCAL_NEWS_QUERY": "",
+            "DIGEST_COMPANIES_FEED": "https://example.com/companies.xml",
+            "DIGEST_COMPANIES_FEEDS": "",
+            "DIGEST_SPACEX_FEED": "",
+            "DIGEST_EARTH_FUNERAL_FEED": "",
+            "DIGEST_TICKETMASTER_KEY": "",
+            "DIGEST_PROFILE_FILE": "",
+            "DIGEST_FRESH_HOURS": "36",
+            "DIGEST_LOCAL_FRESH_HOURS": "168",
+            "DIGEST_LLM_API_KEY": "",
+            "DIGEST_SECTION_ORDER": "weather,global,local,companies,shows,bot_updates",
+        }
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            picks = root / "picks"
+            picks.mkdir()
+            (picks / "2026-11-26.json").write_text(
+                json.dumps(
+                    {
+                        "generated_at": "2026-11-26T04:40:00-06:00",
+                        "picks": [
+                            {"section": "GLOBAL", "items": [{"url": "https://example.com/harbor", "summary": HARBOR_SUMMARY}]},
+                            {"section": "BASTROP", "items": []},
+                            {
+                                "section": "SPACEX & EARTH FUNERAL",
+                                "items": [
+                                    {
+                                        "url": "https://example.com/company",
+                                        "summary": "The window opens at sunrise and the company said the flight is a fueling test.",
+                                    }
+                                ],
+                            },
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with mock.patch.dict(os.environ, env):
+                generated = dg.make_payload(
+                    "2026-11-26",
+                    fetcher,
+                    now=now,
+                    history_file=root / "history.json",
+                    bot_directory=root / "bots",
+                    picks_directory=picks,
+                    candidates_directory=root / "no-export",
+                    persist_history=False,
+                )
+        printed = next(section for section in generated["sections"] if section["section"] == "BASTROP")
+        self.assertEqual(printed["items"][0]["title"], dp.LOCAL_EMPTY_TITLE)
+        self.assertNotIn("https://example.com/brewery", json.dumps(printed))
+
+    def test_check_fails_on_an_emergency_or_when_every_source_is_down(self):
+        moment = dt.datetime(2026, 11, 26, 12, 0, tzinfo=dt.timezone.utc)
+        summary, code = dg.check_report(dg._emergency_payload("2026-11-26", moment))
+        self.assertEqual(code, 1)
+        self.assertEqual(summary["picker"]["reason"], "generator_error")
+        self.assertTrue(summary["sources_unavailable"])
+
+        down = {
+            "digest_date": "2026-11-26",
+            "picker": {"mode": "fallback", "reason": "no_api_key", "source": "fallback"},
+            "sections": [
+                {
+                    "section": "WEATHER",
+                    "source_feed": "https://api.weather.gov/x",
+                    "items": [{"headline": "Forecast unavailable", "summary": "The forecast could not be built."}],
+                },
+                {
+                    "section": "GLOBAL",
+                    "source_feed": "https://example.com/g",
+                    "items": [
+                        {
+                            "title": "No new update today (source unavailable)",
+                            "summary": "The configured source could not be reached.",
+                        }
+                    ],
+                },
+                {
+                    "section": "BASTROP",
+                    "source_feed": "https://example.com/l",
+                    "items": [{"title": "Feed not fetched", "summary": "This feed was not requested."}],
+                },
+                {
+                    "section": "SPACEX & EARTH FUNERAL",
+                    "source_feed": "https://example.com/c",
+                    "items": [{"title": "Feed timed out", "summary": "This feed was requested and did not finish."}],
+                },
+            ],
+            "source_errors": [],
+        }
+        summary, code = dg.check_report(down)
+        self.assertEqual(code, 1)
+        self.assertTrue(summary["sources_unavailable"])
+        self.assertFalse(summary["offline_used"])
+        self.assertFalse(summary["picks_ignored"])
+        self.assertNotEqual(summary["picker"]["reason"], "generator_error")
+
+        mixed = {
+            "digest_date": down["digest_date"],
+            "picker": down["picker"],
+            "source_errors": [],
+            "sections": [
+                down["sections"][0],
+                {
+                    "section": "GLOBAL",
+                    "source_feed": "https://example.com/g",
+                    "items": [{"title": HARBOR, "summary": HARBOR_SUMMARY}],
+                },
+                down["sections"][2],
+                down["sections"][3],
+            ],
+        }
+        summary, code = dg.check_report(mixed)
+        self.assertEqual(code, 0, summary)
+        self.assertFalse(summary["sources_unavailable"])
+
+        stdout = io.StringIO()
+        with mock.patch.object(dg, "make_payload", side_effect=RuntimeError("boom")):
+            with contextlib.redirect_stdout(stdout):
+                code = dg.main(["--check", "--date", "2026-11-26"])
+        summary = json.loads(stdout.getvalue())
+        self.assertEqual(code, 1)
+        self.assertEqual(summary["picker"]["reason"], "generator_error")
+
+        def fetcher(url):
+            raise TimeoutError("down")
+
+        zone = ZoneInfo("America/Chicago")
+        today = dt.datetime.now(dt.timezone.utc).astimezone(zone).date().isoformat()
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            env = {
+                "DIGEST_HOME": str(root),
+                "DIGEST_GLOBAL_FEED": "https://example.com/global.xml",
+                "DIGEST_LOCAL_FEED": "https://example.com/local.xml",
+                "DIGEST_LOCAL_FEEDS": "",
+                "DIGEST_LOCAL_NEWS_QUERY": "",
+                "DIGEST_COMPANIES_FEED": "https://example.com/companies.xml",
+                "DIGEST_COMPANIES_FEEDS": "",
+                "DIGEST_SPACEX_FEED": "",
+                "DIGEST_EARTH_FUNERAL_FEED": "",
+                "DIGEST_TICKETMASTER_KEY": "",
+                "DIGEST_PROFILE_FILE": "",
+                "DIGEST_LLM_API_KEY": "",
+                "DIGEST_PICKS_DIR": str(root / "picks"),
+                "DIGEST_BOT_UPDATES_DIR": str(root / "bots"),
+                "DIGEST_CANDIDATES_DIR": str(root / "candidates"),
+                "DIGEST_HISTORY_PATH": str(root / "history.json"),
+            }
+            stdout = io.StringIO()
+            with mock.patch.dict(os.environ, env), mock.patch.object(dg, "fetch", fetcher):
+                with contextlib.redirect_stdout(stdout):
+                    code = dg.main(["--check", "--date", today])
+        summary = json.loads(stdout.getvalue())
+        self.assertEqual(code, 1, summary)
+        self.assertTrue(summary["sources_unavailable"])
+        self.assertNotEqual(summary["picker"]["reason"], "generator_error")
+        self.assertFalse(summary["offline_used"])
+        self.assertFalse(summary["picks_ignored"])
 
 
 if __name__ == "__main__":

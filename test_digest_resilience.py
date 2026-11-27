@@ -19,6 +19,7 @@ import threading
 import time
 import unittest
 import urllib.error
+import urllib.parse
 import urllib.request
 from unittest import mock
 from zoneinfo import ZoneInfo
@@ -1260,6 +1261,62 @@ class TriggerJournalTests(unittest.TestCase):
             server.server_close()
             thread.join(2)
 
+    def test_journal_redacts_feed_query_tokens_userinfo_and_encoded_secrets(self):
+        feed_secret = "feed-secret-value"
+        password = "p@ss/word"
+        encoded = urllib.parse.quote(password, safe="")
+        text = (
+            f"DIGEST_LOCAL_FEED=https://news.example/rss?apikey={feed_secret}&hl=en\n"
+            f"https://user:{password}@feeds.example/local.xml\n"
+            f"https://feeds.example/q?api_key={encoded}&token={feed_secret}&key={feed_secret}"
+            f"&secret={feed_secret}&password={password}&access_token={feed_secret}&sig={feed_secret}\n"
+            f"copy {encoded}\n"
+        )
+        env = {
+            "DIGEST_LLM_API_KEY": password,
+            "DIGEST_LOCAL_FEED": f"https://news.example/rss?apikey={feed_secret}",
+        }
+        with mock.patch.dict(os.environ, env):
+            cleaned = trigger.prepare_journal(text)
+        self.assertNotIn(feed_secret, cleaned)
+        self.assertNotIn(password, cleaned)
+        self.assertNotIn(encoded, cleaned)
+        self.assertNotIn("user:", cleaned)
+        self.assertIn("[redacted]", cleaned)
+        self.assertIn("DIGEST_LOCAL_FEED=", cleaned)
+        self.assertIn("hl=en", cleaned)
+
+    def test_printed_source_errors_drop_feed_secrets(self):
+        feed_secret = "feed-secret-value"
+        password = "p@ss/word"
+        encoded = urllib.parse.quote(password, safe="")
+        payload = {
+            "digest_id": "abc",
+            "picker": {"mode": "fallback", "source": "fallback"},
+            "sections": [],
+            "source_errors": [
+                {
+                    "section": "BASTROP",
+                    "url": f"https://user:{password}@news.example/rss?apikey={feed_secret}&hl=en",
+                    "error": f"timeout https://news.example/rss?token={encoded}&sig={feed_secret}",
+                }
+            ],
+        }
+        with tempfile.TemporaryDirectory() as temp:
+            out = Path(temp) / "source.json"
+            stdout = io.StringIO()
+            with mock.patch.object(dg, "make_payload", return_value=payload), mock.patch.object(dp, "save_history"):
+                with contextlib.redirect_stdout(stdout):
+                    code = dg.main(["--out", str(out), "--date", "2026-11-26"])
+        self.assertEqual(code, 0)
+        printed = stdout.getvalue()
+        self.assertNotIn(feed_secret, printed)
+        self.assertNotIn(password, printed)
+        self.assertNotIn(encoded, printed)
+        self.assertNotIn("user:", printed)
+        self.assertIn("[redacted]", printed)
+        self.assertIn("hl=en", printed)
+
 
 class RebuildSourceTests(unittest.TestCase):
     def test_rebuild_keeps_the_old_source_and_prints_a_new_one(self):
@@ -1291,6 +1348,11 @@ class RebuildSourceTests(unittest.TestCase):
                 '    if [[ -f "$GEN_COUNT" ]]; then read -r count < "$GEN_COUNT"; fi\n'
                 "    count=$((count + 1))\n"
                 '    printf "%s\\n" "$count" > "$GEN_COUNT"\n'
+                '    if [[ "${FAIL_GEN:-}" == "1" ]]; then\n'
+                '      printf "partial\\n" > "$out"\n'
+                '      printf "generation failed\\n" >&2\n'
+                "      exit 1\n"
+                "    fi\n"
                 '    printf "{\\"n\\":%s}\\n" "$count" > "$out"\n'
                 '    printf "picker mode=picks reason=ok\\n" >&2\n'
                 "    exit 0\n"
@@ -1361,6 +1423,16 @@ class RebuildSourceTests(unittest.TestCase):
             self.assertEqual(calls_after, calls_before)
             self.assertFalse((output / f"digest-source-{today}.v3.json").exists())
             self.assertEqual(json.loads(source.read_text(encoding="utf-8"))["n"], 2)
+
+            original = '{"frozen":"before-failed-rebuild"}\n'
+            source.write_text(original, encoding="utf-8")
+            env["FAIL_GEN"] = "1"
+            failed = run("--rebuild")
+            self.assertNotEqual(failed.returncode, 0, failed.stderr[-2000:])
+            self.assertEqual(source.read_text(encoding="utf-8"), original)
+            self.assertFalse((output / f"digest-source-{today}.v3.json").exists())
+            self.assertIn("Restored previous source", failed.stderr)
+            env.pop("FAIL_GEN", None)
 
             source.unlink()
             link_target = output / "elsewhere.json"

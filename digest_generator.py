@@ -33,6 +33,7 @@ from zoneinfo import ZoneInfo
 import digest_picker
 import digest_settings as settings
 import receipt_art
+import receipt_digest_trigger
 
 # Place defaults are the public city center of Bastrop, Texas. Not a street address.
 def _env(name: str, default: str) -> str:
@@ -1230,6 +1231,71 @@ def _item_heading(item: dict) -> str:
     return str(item.get("title") or item.get("headline") or "")
 
 
+_UNAVAILABLE_HEADINGS = frozenset(
+    {
+        "no new update today (source unavailable)",
+        "no new update today (weather source unavailable)",
+        "forecast unavailable",
+        "forecast not fetched",
+        "forecast timed out",
+        "feed not fetched",
+        "feed timed out",
+    }
+)
+
+
+def _item_source_unavailable(item: dict) -> bool:
+    heading = _item_heading(item).strip().casefold()
+    if heading in _UNAVAILABLE_HEADINGS:
+        return True
+    rationale = str(item.get("rationale") or "").casefold()
+    return rationale in {"not fetched", "timed out"} or rationale.startswith(
+        ("source unavailable", "weather unavailable")
+    )
+
+
+def _section_source_unavailable(section: dict) -> bool:
+    if str(section.get("source_feed") or "") == "unavailable":
+        return True
+    items = [item for item in (section.get("items") or []) if isinstance(item, dict)]
+    if not items:
+        return False
+    return all(_item_source_unavailable(item) for item in items)
+
+
+def _every_source_unavailable(payload: dict) -> bool:
+    """True when every news and weather section is an outage line.
+
+    Bot notes are not a feed. A section that printed a real story, including a
+    quiet "No new update today", means a source was reached.
+    """
+    sources = []
+    for section in payload.get("sections") or []:
+        if not isinstance(section, dict):
+            continue
+        if section.get("source_feed") == "bot-updates":
+            continue
+        sources.append(section)
+    if not sources:
+        return False
+    return all(_section_source_unavailable(section) for section in sources)
+
+
+def _public_source_errors(errors: list) -> list:
+    """The stdout copy of source errors, with feed credentials removed."""
+    cleaned = []
+    for row in errors or []:
+        if not isinstance(row, dict):
+            cleaned.append(row)
+            continue
+        copy = dict(row)
+        for field in ("url", "error"):
+            if isinstance(copy.get(field), str):
+                copy[field] = receipt_digest_trigger.redact_secrets(copy[field])
+        cleaned.append(copy)
+    return cleaned
+
+
 def _item_is_offline(title: str) -> bool:
     return title == digest_picker.LOCAL_OFFLINE_TITLE
 
@@ -1247,7 +1313,9 @@ def _item_is_fallback(item: dict, title: str) -> bool:
 def check_report(payload: dict) -> tuple[dict, int]:
     """JSON summary of a payload built the way the 05:00 run would build it.
 
-    Exit 1 when any section uses the offline line or the picks file was ignored.
+    Exit 1 when a section uses the offline line, the picks file was ignored, the
+    payload is the emergency edition (``generator_error``), or every news and
+    weather source is unavailable.
     """
     sections: list[dict] = []
     offline_used = False
@@ -1290,8 +1358,12 @@ def check_report(payload: dict) -> tuple[dict, int]:
         "offline_used": offline_used,
         "bot_updates": bot_updates,
         "picks_ignored": picks_ignored,
+        "sources_unavailable": False,
     }
-    code = 1 if offline_used or picks_ignored else 0
+    generator_error = str(picker.get("reason") or "") == "generator_error"
+    sources_unavailable = _every_source_unavailable(payload)
+    summary["sources_unavailable"] = sources_unavailable
+    code = 1 if offline_used or picks_ignored or generator_error or sources_unavailable else 0
     return summary, code
 
 
@@ -1349,7 +1421,7 @@ def main(argv: list[str] | None = None) -> int:
         digest_picker.save_history(settings.history_path(), day, records)
     except Exception:
         pass
-    print(json.dumps({"digest_id": payload["digest_id"], "picker": payload.get("picker", {}).get("mode"), "source": payload.get("picker", {}).get("source"), "sections": len(payload["sections"]), "source_errors": payload["source_errors"], "output": str(args.out.resolve())}, sort_keys=True))
+    print(json.dumps({"digest_id": payload["digest_id"], "picker": payload.get("picker", {}).get("mode"), "source": payload.get("picker", {}).get("source"), "sections": len(payload["sections"]), "source_errors": _public_source_errors(payload.get("source_errors") or []), "output": str(args.out.resolve())}, sort_keys=True))
     return 0
 
 
